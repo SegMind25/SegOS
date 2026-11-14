@@ -24,6 +24,9 @@ impl mount::FsInfo for Ext4Info {
     fn stats(&self) -> (u64, u64, u64, u64, u64) {
         self.0.stats()
     }
+    fn read_only(&self) -> bool {
+        !self.0.writable()
+    }
 }
 
 /// Mounts the FAT12/16/32 file system on `dev`.
@@ -42,6 +45,7 @@ pub fn mount_root() -> Option<alloc::string::String> {
         let Ok((root, info)) = mount_ext4(dev.clone()) else {
             continue;
         };
+        let read_only = info.as_ref().is_none_or(|i| i.read_only());
         if root.lookup("init").is_err() {
             continue;
         }
@@ -52,19 +56,22 @@ pub fn mount_root() -> Option<alloc::string::String> {
             &source,
             "ext4",
             "/",
-            true,
+            read_only,
             info,
         )
         .is_err()
         {
             continue;
         }
-        let extra: [(&str, &str, Arc<dyn Inode>); 4] = [
+        let mut extra: alloc::vec::Vec<(&str, &str, Arc<dyn Inode>)> = alloc::vec![
             ("dev", "devtmpfs", super::dev_dir()),
             ("proc", "proc", super::procfs::root(&root)),
             ("tmp", "tmpfs", super::tmpfs::Dir::new_root(0o1777)),
-            ("root", "tmpfs", super::tmpfs::Dir::new_root(0o700)),
         ];
+        if read_only {
+            // Somewhere to write a shell history and the like.
+            extra.push(("root", "tmpfs", super::tmpfs::Dir::new_root(0o700)));
+        }
         for (dir, fstype, fsroot) in extra {
             match root.lookup(dir) {
                 Ok(point) => {

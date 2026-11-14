@@ -1,13 +1,15 @@
 # SegOS: a from-scratch operating system in Rust (plan)
 
-Status: **Phase 3 done**. SegOS boots on UEFI with its own bootloader,
-segboot, starts every CPU, and runs Ubuntu's statically linked BusyBox,
-unmodified, as an interactive shell on the console: `ls | grep | wc`
-works, and so do job control, `^C`, `ps`, `free` and `poweroff`. Three
-conformance tests print byte for byte what they print on Linux; 26 kernel
-tests pass in QEMU on 4 CPUs (debug and release, with and without
-SMEP/SMAP); CI also types commands into the shell over the serial port.
-No third-party crates. Next: Phase 4, real disks.
+Status: **Phase 4 done**. SegOS boots on UEFI with its own bootloader,
+segboot, starts every CPU, finds its disks (virtio, NVMe, SATA), and
+mounts a **read-write ext4 root file system** from disk, on which
+Ubuntu's statically linked BusyBox runs unmodified as an interactive
+shell. FAT32, mounts, a block cache and a page cache with shared file
+mappings are in; Linux's `e2fsck` passes what SegOS writes. Four
+conformance tests print byte for byte what they print on Linux; 26
+kernel tests pass in QEMU on 4 CPUs (debug and release); CI also types
+commands into the shell over the serial port. No third-party crates.
+Next: Phase 5, the full (glibc, dynamically linked) Linux userland.
 
 ## 1. The goal, stated precisely
 
@@ -251,22 +253,73 @@ which would have corrupted a glibc program's stack; and naming a process
 after its resolved executable instead of the path it was started by,
 which stops BusyBox (it checks for "exe") from naming its applets.
 
-## 10. Next concrete steps (Phase 4: real storage)
+## 10. Phase 4, as built
 
-The demo: SegOS boots from a disk with a full root file system (not only
-the initramfs), on QEMU's virtio and NVMe disks and on a real PC's SATA or
-NVMe drive.
+The demo: SegOS boots from a disk holding a full root file system. When a
+partition has ext4 with `/init` on it, the kernel mounts it on `/` (as
+Linux does with `root=`), adds `/dev`, `/proc` and a tmpfs `/tmp`, and
+starts `/init` from the disk; the initramfs is only the fallback. `cargo
+xtask` builds that disk (GPT, ext4 made by e2fsprogs' `mke2fs` from the
+same tree as the initramfs) and every test run boots from it.
 
-1. **PCI(e)**: find the configuration space (ACPI MCFG, ECAM), enumerate
-   buses, read BARs, map them; MSI/MSI-X interrupts.
-2. **A block layer and page cache**: requests, a cache of file pages
-   shared by `read`/`write` and `mmap` (finally real `MAP_SHARED` file
-   mappings), write-back.
-3. **Drivers**: virtio-blk first (simplest, in QEMU), then NVMe, then
-   AHCI (SATA).
-4. **Partitions and file systems**: GPT; ext4 read-only, then read-write
-   (journal replay first); FAT32 for the EFI partition.
-5. **Mounts**: a mount table, `mount`/`umount`, `/proc/mounts` from it,
-   `pivot_root`/`switch_root` from the initramfs to the disk.
-6. **Tests**: file system tests recorded on Linux (on an ext4 image xtask
-   builds), and a CI boot from a disk image with a full BusyBox root.
+- **PCI** (`drivers/pci.rs`): every bus, device and function through the
+  configuration ports; BARs sized and mapped uncached into a device
+  window; bus mastering. (ECAM and MSI-X come with interrupt-driven I/O.)
+- **Drivers**, polled, one request at a time, data through bounce pages:
+  **virtio-blk** (virtio 1.x over PCI), **NVMe** (admin and one I/O queue
+  pair, PRP lists, 512-byte and 4 KiB LBA namespaces), **AHCI** (SATA,
+  READ/WRITE DMA EXT, FLUSH CACHE EXT).
+- **Block layer** (`block/`): one interface for disks and partitions,
+  `/dev` nodes with Linux's device numbers (`vda1`, `nvme0n1p1`, `sda1`),
+  **GPT** partitions, and a **write-back block cache** under every disk
+  (4 KiB blocks, LRU, merged writes), flushed by `sync`, `fsync`,
+  `umount`, power-off and every 5 seconds.
+- **File systems**: **ext2/3/4** (`fs/ext4/`): extents, indirect maps,
+  64-bit, flex_bg, meta_bg, htree directories read linearly, inline
+  data, fast and slow symlinks, devices and FIFOs; checked file by file
+  against 21 `mke2fs` images. And **read-write**: block and inode
+  allocation (bitmaps, group and superblock counts, uninitialised
+  groups), extent trees grown and split, indirect maps, truncate, hard
+  and symbolic links, rename, `chmod`, timestamps, checksums under
+  `metadata_csum` or `gdt_csum`, the orphan list, and **jbd2 journal
+  replay** at mount. Writes go in place with the journal kept empty, and
+  leave a file system Linux's `e2fsck -fn` passes. A file system with a
+  feature the writer does not handle mounts read-only. **FAT12/16/32**
+  (`fs/fat.rs`), read-write with long names, checked with `fsck.fat` and
+  `mtools`.
+- **Mounts** (`fs/mount.rs`): a mount table crossed by path lookup in
+  both directions, `mount` (tmpfs, proc, devtmpfs, ext2/3/4, vfat, bind,
+  `--move`, read-only remount), `umount2`, `/proc/mounts`, `statfs`/`df`
+  from the mounted file system, EXDEV across file systems, EROFS and
+  EEXIST as Linux orders them.
+- **Page cache** (`fs/pagecache.rs`): real **`MAP_SHARED`** file mappings.
+  Pages are shared by every mapping, `read` and `write`, kept shared by
+  `fork`, and written back on `msync`, `munmap`, `fsync`, `sync` and by
+  the periodic flush. Shared anonymous memory is shared across `fork`.
+- **Tests**: `userland/tests/mapping.c` (shared mappings, fork, msync,
+  coherence), recorded on Linux like the others; the kernel tests and the
+  serial-port shell session now run on the ext4 root.
+
+## 11. Next concrete steps (Phase 5: the full Linux userland)
+
+The demo: an unmodified Debian or Artix root (glibc, dynamically linked)
+boots from disk; bash, coreutils, python3 and gcc work, and gcc compiles
+and runs a program on SegOS.
+
+1. **Dynamic linking**: `PT_INTERP`, loading `ld-linux-x86-64.so.2`,
+   file-backed private mappings paged in on demand from the page cache
+   (instead of copied at `mmap`).
+2. **Threads**: `clone` with `CLONE_THREAD | CLONE_VM | CLONE_SETTLS |
+   CLONE_CHILD_CLEARTID…`, thread groups, `exit_group`, `set_robust_list`,
+   a complete `futex` (wait, wake, requeue, bitset, PI later), `tgkill`.
+3. **Event interfaces**: `epoll`, `eventfd`, `timerfd`, `signalfd`,
+   `inotify` (enough for coreutils and python).
+4. **Files and processes**: `openat2`, `statx`, `getdents64` on every
+   file system, `*xattr` (ext4 user/security attributes), `fallocate`,
+   per-process root (`chroot`, `pivot_root`), resource limits, `/proc`
+   and `/sys` files glibc and python read.
+5. **Interrupt-driven I/O**: MSI-X for NVMe and virtio, several requests
+   in flight, so disk waits sleep instead of polling.
+6. **Tests**: conformance tests for threads and futexes recorded on Linux,
+   and a CI boot of a glibc root that runs a script with bash, python3
+   and gcc.

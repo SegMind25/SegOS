@@ -17,6 +17,11 @@ pub trait FsInfo: Send + Sync {
     fn magic(&self) -> u64;
     /// (block size, blocks, free blocks, inodes, free inodes)
     fn stats(&self) -> (u64, u64, u64, u64, u64);
+    /// Whether the file system can only be read (unsupported features,
+    /// read-only media).
+    fn read_only(&self) -> bool {
+        false
+    }
 }
 
 /// A mounted file system: its root, and statfs info for disk file systems.

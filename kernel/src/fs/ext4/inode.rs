@@ -1,30 +1,28 @@
-//! On-disk inodes and the mapping of file blocks to device blocks
-//! (extent trees, indirect block maps, inline data).
+//! On-disk inodes, and classic indirect block maps (ext2/ext3 files).
 
-use super::{Ext4Fs, le16, le32};
+use super::{Ext4Fs, FsState, crc, le16, le32, put16, put32};
 use crate::abi::{Errno, KResult};
 use crate::fs::FileType;
+use alloc::vec;
 use alloc::vec::Vec;
 
 // i_mode file types
-const S_IFMT: u16 = 0o170000;
-const S_IFSOCK: u16 = 0o140000;
-const S_IFLNK: u16 = 0o120000;
-const S_IFREG: u16 = 0o100000;
-const S_IFBLK: u16 = 0o060000;
-const S_IFDIR: u16 = 0o040000;
-const S_IFCHR: u16 = 0o020000;
-const S_IFIFO: u16 = 0o010000;
+pub const S_IFMT: u16 = 0o170000;
+pub const S_IFSOCK: u16 = 0o140000;
+pub const S_IFLNK: u16 = 0o120000;
+pub const S_IFREG: u16 = 0o100000;
+pub const S_IFBLK: u16 = 0o060000;
+pub const S_IFDIR: u16 = 0o040000;
+pub const S_IFCHR: u16 = 0o020000;
+pub const S_IFIFO: u16 = 0o010000;
 
 // i_flags
-const HUGE_FILE_FL: u32 = 0x40000;
-const EXTENTS_FL: u32 = 0x80000;
+pub const INDEX_FL: u32 = 0x1000;
+pub const HUGE_FILE_FL: u32 = 0x40000;
+pub const EXTENTS_FL: u32 = 0x80000;
 const EA_INODE_FL: u32 = 0x200000;
-const INLINE_DATA_FL: u32 = 0x10000000;
+pub const INLINE_DATA_FL: u32 = 0x10000000;
 
-const EXTENT_MAGIC: u16 = 0xf30a;
-/// Extent tree depth limit (Linux: 5).
-const MAX_EXTENT_DEPTH: u16 = 5;
 /// Size of i_block.
 pub const IBLOCK_LEN: usize = 60;
 
@@ -33,7 +31,9 @@ pub const IBLOCK_LEN: usize = 60;
 const XATTR_INDEX_SYSTEM: u8 = 7;
 const XATTR_MAGIC: u32 = 0xea02_0000;
 
-/// An inode as read from the inode table.
+/// An inode as read from the inode table: the fields the file system
+/// uses, and every byte (written back as they were, with these fields
+/// put in).
 #[derive(Clone)]
 pub struct RawInode {
     pub mode: u16,
@@ -44,21 +44,17 @@ pub struct RawInode {
     pub atime_nsec: u32,
     pub ctime_nsec: u32,
     pub mtime_nsec: u32,
+    pub dtime: u32,
     pub links: u16,
     /// i_blocks as stored (units depend on HUGE_FILE_FL).
     pub blocks: u64,
     pub flags: u32,
     pub file_acl: u64,
+    pub generation: u32,
     pub iblock: [u8; IBLOCK_LEN],
-    /// The in-inode extended attribute area (after i_extra_isize).
-    pub xattrs: Vec<u8>,
-}
-
-/// A run of file blocks: mapped to consecutive device blocks starting at
-/// `pblk`, or a hole (`None`, reads as zeros).
-pub struct Mapping {
-    pub pblk: Option<u64>,
-    pub len: u64,
+    /// i_extra_isize (0 for 128-byte inodes).
+    pub extra_isize: usize,
+    pub bytes: Vec<u8>,
 }
 
 fn time_with_extra(secs: u32, extra: Option<u32>) -> (i64, u32) {
@@ -69,6 +65,12 @@ fn time_with_extra(secs: u32, extra: Option<u32>) -> (i64, u32) {
         nsec = x >> 2;
     }
     (t, nsec)
+}
+
+/// (seconds field, extra field) of a time.
+fn encode_time(t: i64, nsec: u32) -> (u32, u32) {
+    let epoch = ((t - (t as i32 as i64)) >> 32) as u32 & 3;
+    (t as u32, epoch | (nsec << 2))
 }
 
 impl RawInode {
@@ -82,12 +84,15 @@ impl RawInode {
             atime_nsec: 0,
             ctime_nsec: 0,
             mtime_nsec: 0,
+            dtime: 0,
             links: 0,
             blocks: 0,
             flags: 0,
             file_acl: 0,
+            generation: 0,
             iblock: [0; IBLOCK_LEN],
-            xattrs: Vec::new(),
+            extra_isize: 0,
+            bytes: Vec::new(),
         }
     }
 
@@ -108,10 +113,9 @@ impl RawInode {
         let (atime, atime_nsec) = time_with_extra(le32(b, 0x8), extra(0x8c));
         let mut iblock = [0u8; IBLOCK_LEN];
         iblock.copy_from_slice(&b[0x28..0x28 + IBLOCK_LEN]);
-        let mode = le16(b, 0x0);
         let size_high = le32(b, 0x6c) as u64;
         Ok(Self {
-            mode,
+            mode: le16(b, 0x0),
             size: le32(b, 0x4) as u64 | (size_high << 32),
             atime,
             ctime,
@@ -119,17 +123,89 @@ impl RawInode {
             atime_nsec,
             ctime_nsec,
             mtime_nsec,
+            dtime: le32(b, 0x14),
             links: le16(b, 0x1a),
             blocks: le32(b, 0x1c) as u64 | ((le16(b, 0x74) as u64) << 32),
             flags: le32(b, 0x20),
             file_acl: le32(b, 0x68) as u64 | ((le16(b, 0x76) as u64) << 32),
+            generation: le32(b, 0x64),
             iblock,
-            xattrs: if extra_end < b.len() {
-                b[extra_end..].to_vec()
-            } else {
-                Vec::new()
-            },
+            extra_isize,
+            bytes: b.to_vec(),
         })
+    }
+
+    /// A fresh inode of `inode_size` bytes.
+    pub fn new(fs: &Ext4Fs, mode: u16, generation: u32) -> Self {
+        let isz = fs.sb.inode_size as usize;
+        let mut r = Self::empty();
+        r.bytes = vec![0u8; isz];
+        if isz > 128 {
+            let want = (fs.sb.want_extra_isize as usize).max(32);
+            r.extra_isize = want.min(isz - 128) & !3;
+            put16(&mut r.bytes, 0x80, r.extra_isize as u16);
+        }
+        r.mode = mode;
+        r.generation = generation;
+        let (t, ns) = super::now();
+        (r.atime, r.ctime, r.mtime) = (t, t, t);
+        (r.atime_nsec, r.ctime_nsec, r.mtime_nsec) = (ns, ns, ns);
+        // i_crtime
+        if r.extra_isize >= 24 {
+            let (s, x) = encode_time(t, ns);
+            put32(&mut r.bytes, 0x90, s);
+            put32(&mut r.bytes, 0x94, x);
+        }
+        r
+    }
+
+    /// The bytes to write to the inode table, checksummed.
+    pub fn serialize(&self, fs: &Ext4Fs, ino: u32) -> Vec<u8> {
+        let mut b = self.bytes.clone();
+        put16(&mut b, 0x0, self.mode);
+        put32(&mut b, 0x4, self.size as u32);
+        put32(&mut b, 0x6c, (self.size >> 32) as u32);
+        let extra_end = 128 + self.extra_isize;
+        let blen = b.len();
+        let fits = |off: usize| off + 4 <= extra_end && extra_end <= blen;
+        for (secs_off, extra_off, t, ns) in [
+            (0x8, 0x8c, self.atime, self.atime_nsec),
+            (0xc, 0x84, self.ctime, self.ctime_nsec),
+            (0x10, 0x88, self.mtime, self.mtime_nsec),
+        ] {
+            let (s, x) = encode_time(t, ns);
+            put32(&mut b, secs_off, s);
+            if fits(extra_off) {
+                put32(&mut b, extra_off, x);
+            }
+        }
+        put32(&mut b, 0x14, self.dtime);
+        put16(&mut b, 0x1a, self.links);
+        put32(&mut b, 0x1c, self.blocks as u32);
+        put16(&mut b, 0x74, (self.blocks >> 32) as u16);
+        put32(&mut b, 0x20, self.flags);
+        put32(&mut b, 0x64, self.generation);
+        b[0x28..0x28 + IBLOCK_LEN].copy_from_slice(&self.iblock);
+        if fs.metadata_csum() {
+            let hi = b.len() > 128 && self.extra_isize >= 4;
+            put16(&mut b, 0x7c, 0);
+            if hi {
+                put16(&mut b, 0x82, 0);
+            }
+            let c = crc::crc32c(self.csum_seed(fs, ino), &b);
+            put16(&mut b, 0x7c, c as u16);
+            if hi {
+                put16(&mut b, 0x82, (c >> 16) as u16);
+            }
+        }
+        b
+    }
+
+    /// The per-inode checksum seed (extent blocks and directory blocks are
+    /// checksummed with it).
+    pub fn csum_seed(&self, fs: &Ext4Fs, ino: u32) -> u32 {
+        let c = crc::crc32c(fs.seed, &ino.to_le_bytes());
+        crc::crc32c(c, &self.generation.to_le_bytes())
     }
 
     pub fn file_type(&self) -> Option<FileType> {
@@ -152,8 +228,16 @@ impl RawInode {
         self.flags & INLINE_DATA_FL != 0
     }
 
-    fn iblock32(&self, i: usize) -> u32 {
+    pub fn has_extents(&self) -> bool {
+        self.flags & EXTENTS_FL != 0
+    }
+
+    pub fn iblock32(&self, i: usize) -> u32 {
         le32(&self.iblock, i * 4)
+    }
+
+    fn set_iblock32(&mut self, i: usize, v: u32) {
+        put32(&mut self.iblock, i * 4, v);
     }
 
     /// i_blocks in 512-byte units.
@@ -166,6 +250,16 @@ impl RawInode {
         } else {
             self.blocks & 0xffff_ffff
         }
+    }
+
+    /// Adds `n` file system blocks (negative: removes) to i_blocks.
+    pub fn add_blocks(&mut self, fs: &Ext4Fs, n: i64) {
+        let per = if self.flags & HUGE_FILE_FL != 0 {
+            1
+        } else {
+            (fs.block_size() / 512) as i64
+        };
+        self.blocks = (self.blocks as i64 + n * per).max(0) as u64;
     }
 
     /// Device number of a device file: the old 16-bit encoding in
@@ -201,7 +295,11 @@ impl RawInode {
     /// The value of the in-inode extended attribute `system.data` (the
     /// part of inline data that does not fit in i_block).
     pub fn inline_xattr(&self) -> KResult<&[u8]> {
-        let x = &self.xattrs;
+        let start = 128 + self.extra_isize;
+        if start >= self.bytes.len() {
+            return Ok(&[]);
+        }
+        let x = &self.bytes[start..];
         if x.len() < 4 || le32(x, 0) != XATTR_MAGIC {
             return Ok(&[]);
         }
@@ -232,128 +330,90 @@ impl RawInode {
         Ok(&[])
     }
 
-    /// Maps file block `lblk`.
-    pub fn map(&self, fs: &Ext4Fs, lblk: u64) -> KResult<Mapping> {
-        if self.flags & EXTENTS_FL != 0 {
-            self.map_extent(fs, lblk)
-        } else {
-            self.map_indirect(fs, lblk)
+    /// Whether `system.data` is the only extended attribute kept in the
+    /// inode (or there are none), so the area can simply be cleared when
+    /// the data moves out to blocks.
+    pub fn only_data_xattr(&self) -> bool {
+        let start = 128 + self.extra_isize;
+        if start + 4 > self.bytes.len() || le32(&self.bytes, start) != XATTR_MAGIC {
+            return true;
         }
-    }
-
-    fn map_extent(&self, fs: &Ext4Fs, lblk: u64) -> KResult<Mapping> {
-        if lblk > u32::MAX as u64 {
-            return Ok(Mapping {
-                pblk: None,
-                len: u64::MAX - lblk,
-            });
-        }
-        let lblk32 = lblk as u32;
-        // The node being searched; `end` is the first file block past what
-        // this subtree can map (the start of the next sibling).
-        let mut node: Vec<u8> = self.iblock.to_vec();
-        let mut end: u64 = 1 << 32;
-        let mut depth_seen: Option<u16> = None;
-        loop {
-            if node.len() < 12 || le16(&node, 0) != EXTENT_MAGIC {
-                return Err(Errno::EIO);
-            }
-            let entries = le16(&node, 2) as usize;
-            let depth = le16(&node, 6);
-            if depth > MAX_EXTENT_DEPTH
-                || 12 + entries * 12 > node.len()
-                || depth_seen.is_some_and(|d| depth + 1 != d)
+        let x = &self.bytes[start..];
+        let mut off = 4;
+        while off + 16 <= x.len() && le32(x, off) != 0 {
+            let name_len = x[off] as usize;
+            let name_end = off + 16 + name_len;
+            if name_end > x.len()
+                || x[off + 1] != XATTR_INDEX_SYSTEM
+                || &x[off + 16..name_end] != b"data"
             {
-                return Err(Errno::EIO);
+                return false;
             }
-            depth_seen = Some(depth);
-            // Last entry starting at or before lblk.
-            let first_of = |i: usize| le32(&node, 12 + i * 12);
-            let mut lo = 0usize;
-            let mut hi = entries; // entries[..lo] start <= lblk
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if first_of(mid) <= lblk32 {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            let next_start = if lo < entries {
-                first_of(lo) as u64
-            } else {
-                end
-            };
-            if lo == 0 {
-                // Before the first entry: a hole up to it.
-                return Ok(Mapping {
-                    pblk: None,
-                    len: next_start.max(lblk + 1) - lblk,
-                });
-            }
-            let e = 12 + (lo - 1) * 12;
-            if depth == 0 {
-                let start = le32(&node, e) as u64;
-                let raw_len = le16(&node, e + 4) as u64;
-                let (len, uninit) = if raw_len > 32768 {
-                    (raw_len - 32768, true)
-                } else {
-                    (raw_len, false)
-                };
-                let pstart = ((le16(&node, e + 6) as u64) << 32) | le32(&node, e + 8) as u64;
-                if lblk < start + len {
-                    let off = lblk - start;
-                    return Ok(Mapping {
-                        pblk: (!uninit).then_some(pstart + off),
-                        len: len - off,
-                    });
-                }
-                return Ok(Mapping {
-                    pblk: None,
-                    len: next_start.max(lblk + 1) - lblk,
-                });
-            }
-            let child = ((le16(&node, e + 8) as u64) << 32) | le32(&node, e + 4) as u64;
-            end = next_start;
-            node = fs.block(child)?.to_vec();
+            off = (name_end + 3) & !3;
+        }
+        true
+    }
+
+    /// Clears the in-inode extended attribute area.
+    pub fn clear_xattrs(&mut self) {
+        let start = 128 + self.extra_isize;
+        if start < self.bytes.len() {
+            self.bytes[start..].fill(0);
         }
     }
 
-    fn map_indirect(&self, fs: &Ext4Fs, lblk: u64) -> KResult<Mapping> {
-        let per = fs.block_size() / 4; // pointers per block
+    /// Which indirect tree holds file block `lblk`, and the index of each
+    /// level on the way: (tree level 0 = direct, path).
+    fn indirect_path(fs: &Ext4Fs, lblk: u64) -> KResult<(usize, [usize; 3])> {
+        let per = fs.block_size() / 4;
         if lblk < 12 {
-            return Ok(match self.iblock32(lblk as usize) {
-                0 => Mapping { pblk: None, len: 1 },
-                p => Mapping {
-                    pblk: Some(p as u64),
-                    len: 1,
-                },
-            });
+            return Ok((0, [lblk as usize, 0, 0]));
         }
-        // Which tree, and the index path within it.
         let mut rel = lblk - 12;
-        let mut span = per; // blocks one tree of this level maps
+        let mut span = per;
         let mut level = 1usize;
         while rel >= span {
             rel -= span;
             level += 1;
             if level > 3 {
-                return Ok(Mapping {
-                    pblk: None,
-                    len: u64::MAX - lblk,
-                });
+                return Err(Errno::EFBIG);
             }
-            span = span.saturating_mul(per);
+            span *= per;
+        }
+        let mut path = [0usize; 3];
+        let mut covered = span;
+        for p in path.iter_mut().take(level) {
+            covered /= per;
+            *p = (rel / covered) as usize;
+            rel %= covered;
+        }
+        Ok((level, path))
+    }
+
+    /// Maps file block `lblk` through the indirect blocks: (device block or
+    /// 0 for a hole, run of following blocks with the same state).
+    pub fn map_indirect(&self, fs: &Ext4Fs, lblk: u64) -> KResult<(u64, u64)> {
+        let per = fs.block_size() / 4;
+        if lblk < 12 {
+            return Ok((self.iblock32(lblk as usize) as u64, 1));
+        }
+        let mut rel = lblk - 12;
+        let mut span = per;
+        let mut level = 1usize;
+        while rel >= span {
+            rel -= span;
+            level += 1;
+            if level > 3 {
+                return Ok((0, u64::MAX - lblk));
+            }
+            span *= per;
         }
         let mut ptr = self.iblock32(11 + level) as u64;
-        // span: file blocks covered by the current pointer.
+        // covered: file blocks mapped by `ptr`; rel: position in them.
         let mut covered = span;
         for _ in 0..level {
             if ptr == 0 {
-                return Ok(Mapping {
-                    pblk: None,
-                    len: covered - rel,
-                });
+                return Ok((0, covered - rel));
             }
             covered /= per;
             let idx = (rel / covered) as usize;
@@ -362,49 +422,149 @@ impl RawInode {
             ptr = le32(&b, idx * 4) as u64;
             if covered == 1 {
                 // Leaf level: extend over consecutive pointers.
+                let per = per as usize;
+                let mut n = 1;
                 if ptr == 0 {
-                    let mut n = 1;
-                    while idx + n < per as usize && le32(&b, (idx + n) * 4) == 0 {
+                    while idx + n < per && le32(&b, (idx + n) * 4) == 0 {
                         n += 1;
                     }
-                    return Ok(Mapping {
-                        pblk: None,
-                        len: n as u64,
-                    });
+                } else {
+                    while idx + n < per && le32(&b, (idx + n) * 4) as u64 == ptr + n as u64 {
+                        n += 1;
+                    }
                 }
-                let mut n = 1;
-                while idx + n < per as usize && le32(&b, (idx + n) * 4) as u64 == ptr + n as u64 {
-                    n += 1;
-                }
-                return Ok(Mapping {
-                    pblk: Some(ptr),
-                    len: n as u64,
-                });
+                return Ok((ptr, n as u64));
             }
         }
         Err(Errno::EIO)
     }
 
-    /// Reads file data at `off` (already clamped by the caller to the file
-    /// size), into `buf`. Inline data is handled by the caller.
-    pub fn read_blocks(&self, fs: &Ext4Fs, off: u64, buf: &mut [u8]) -> KResult<()> {
-        let bs = fs.block_size();
-        let mut done = 0usize;
-        while done < buf.len() {
-            let pos = off + done as u64;
-            let lblk = pos / bs;
-            let in_blk = pos % bs;
-            let m = self.map(fs, lblk)?;
-            let avail = m.len.max(1).saturating_mul(bs) - in_blk;
-            // Bounded chunks: read_bytes may bounce through a buffer.
-            let n = (buf.len() - done).min(avail.min(1 << 20) as usize);
-            let dst = &mut buf[done..done + n];
-            match m.pblk {
-                None => dst.fill(0),
-                Some(p) => fs.read_blocks_direct(p, in_blk, dst)?,
+    /// Sets the device block of file block `lblk` in the indirect map,
+    /// allocating indirect blocks on the way (counted in `allocated`, also
+    /// when a later step fails).
+    pub fn set_indirect(
+        &mut self,
+        fs: &Ext4Fs,
+        st: &mut FsState,
+        lblk: u64,
+        pblk: u64,
+        allocated: &mut i64,
+    ) -> KResult<()> {
+        if pblk > u32::MAX as u64 {
+            return Err(Errno::EFBIG);
+        }
+        let (level, path) = Self::indirect_path(fs, lblk)?;
+        if level == 0 {
+            self.set_iblock32(lblk as usize, pblk as u32);
+            return Ok(());
+        }
+        let mut ptr = self.iblock32(11 + level) as u64;
+        if ptr == 0 {
+            ptr = Self::new_indirect(fs, st, pblk)?;
+            *allocated += 1;
+            self.set_iblock32(11 + level, ptr as u32);
+        }
+        for (depth, &idx) in path.iter().take(level).enumerate() {
+            let b = fs.block(ptr)?;
+            if depth + 1 == level {
+                fs.write_at(ptr, (idx * 4) as u64, &(pblk as u32).to_le_bytes())?;
+                return Ok(());
             }
-            done += n;
+            let mut next = le32(&b, idx * 4) as u64;
+            if next == 0 {
+                next = Self::new_indirect(fs, st, ptr + 1)?;
+                *allocated += 1;
+                fs.write_at(ptr, (idx * 4) as u64, &(next as u32).to_le_bytes())?;
+            }
+            ptr = next;
+        }
+        Err(Errno::EIO)
+    }
+
+    fn new_indirect(fs: &Ext4Fs, st: &mut FsState, goal: u64) -> KResult<u64> {
+        let (b, _) = fs.alloc_blocks(st, goal, 1)?;
+        if b > u32::MAX as u64 {
+            fs.free_blocks(st, b, 1)?;
+            return Err(Errno::ENOSPC);
+        }
+        fs.write_at(b, 0, &vec![0u8; fs.block_size() as usize])?;
+        Ok(b)
+    }
+
+    /// Removes every block at or after file block `from` from the
+    /// indirect map; the freed blocks (data and indirect) are appended to
+    /// `freed`.
+    pub fn truncate_indirect(
+        &mut self,
+        fs: &Ext4Fs,
+        from: u64,
+        freed: &mut Vec<u64>,
+    ) -> KResult<()> {
+        for i in (from.min(12) as usize)..12 {
+            let p = self.iblock32(i);
+            if p != 0 {
+                freed.push(p as u64);
+                self.set_iblock32(i, 0);
+            }
+        }
+        let per = fs.block_size() / 4;
+        let mut base = 12u64;
+        let mut span = per;
+        for level in 1..=3usize {
+            let root = self.iblock32(11 + level) as u64;
+            if root != 0 && from < base + span {
+                let start = from.saturating_sub(base);
+                if Self::free_subtree(fs, root, level, start, freed)? {
+                    freed.push(root);
+                    self.set_iblock32(11 + level, 0);
+                }
+            }
+            base += span;
+            span = span.saturating_mul(per);
         }
         Ok(())
+    }
+
+    /// Frees blocks at or after `start` in the subtree of `blk` (which maps
+    /// per^level blocks). Returns whether the subtree is now empty.
+    fn free_subtree(
+        fs: &Ext4Fs,
+        blk: u64,
+        level: usize,
+        start: u64,
+        freed: &mut Vec<u64>,
+    ) -> KResult<bool> {
+        let per = (fs.block_size() / 4) as usize;
+        let child_span = (per as u64).pow(level as u32 - 1);
+        let mut b = fs.block(blk)?.to_vec();
+        let mut changed = false;
+        for idx in 0..per {
+            let p = le32(&b, idx * 4) as u64;
+            if p == 0 {
+                continue;
+            }
+            let lo = idx as u64 * child_span;
+            let hi = lo + child_span;
+            if start <= lo {
+                if level > 1 {
+                    Self::free_subtree(fs, p, level - 1, 0, freed)?;
+                }
+                freed.push(p);
+                put32(&mut b, idx * 4, 0);
+                changed = true;
+            } else if start < hi
+                && level > 1
+                && Self::free_subtree(fs, p, level - 1, start - lo, freed)?
+            {
+                freed.push(p);
+                put32(&mut b, idx * 4, 0);
+                changed = true;
+            }
+        }
+        let empty = b.iter().all(|&x| x == 0);
+        if changed && !empty {
+            fs.write_at(blk, 0, &b)?;
+        }
+        Ok(empty)
     }
 }

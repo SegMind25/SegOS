@@ -127,7 +127,7 @@ fn kernel_init(boot: &'static BootInfo) {
     drivers::ahci::init();
     block::start_flusher();
     match fs::disk::mount_root() {
-        Some(dev) => info!("root: {dev} (ext4, read-only)"),
+        Some(dev) => info!("root: {dev} (ext4)"),
         None => load_initramfs(boot),
     }
     let started = proc::console_stdio().and_then(|stdio| {

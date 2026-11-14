@@ -4,15 +4,17 @@ An operating system written from scratch in Rust, aiming to run **unmodified
 Linux applications** (and, through Wine/Proton, Windows ones) by implementing
 the Linux system call interface in a new kernel.
 
-Status: **Phase 3 (a shell) done**. SegOS boots on UEFI with its own
-bootloader, starts every CPU, and gives you **a shell**: BusyBox, the
-statically linked binary exactly as Ubuntu ships it, runs on the console,
-and `ls | grep | wc` works. Behind it: `fork` with copy-on-write,
-`execve`, `wait4`, process groups and sessions, signals delivered to
-handlers, pipes, `poll`/`select`, symbolic links, `/proc`, and a terminal
-with keyboard and serial input, line editing and `^C`. The kernel answers
-140 Linux system call numbers, and three conformance tests print byte for
-byte what they print on Linux. Next is Phase 4: real disks.
+Status: **Phase 4 (real disks) done**. SegOS boots on UEFI with its own
+bootloader, starts every CPU, finds its disks (virtio, NVMe and SATA
+drivers), reads their GPT partitions and **boots from an ext4 root file
+system on disk**, read-write: what SegOS writes passes Linux's `e2fsck`.
+On it runs **a shell**: BusyBox, the statically linked binary exactly as
+Ubuntu ships it, with `fork`, signals, pipes, job control and `/proc`
+behind it. FAT32 (the EFI partition), `mount`/`umount`, a write-back
+block cache and a page cache with real shared file mappings are in too.
+Four conformance tests print byte for byte what they print on Linux.
+Next is Phase 5: the full Linux userland (glibc, dynamic linking,
+threads).
 
 The operating system itself is all in this repository: the bootloader, the
 kernel and the build tool use no third-party crates, only Rust's `core`,

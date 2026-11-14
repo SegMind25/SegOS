@@ -1072,8 +1072,7 @@ pub fn mount(ctx: &Ctx, source: u64, target: u64, fstype: u64, flags: u64) -> KR
     }
     let fstype = ctx.mm().read_cstr(fstype, 64)?;
     let (root, info) = make_fs(ctx, &fstype, &source, &point)?;
-    // ext2/3/4 is read-only for now.
-    let ro = flags & MS_RDONLY != 0 || fstype.starts_with("ext");
+    let ro = flags & MS_RDONLY != 0 || info.as_ref().is_some_and(|i| i.read_only());
     fs::mount::add(point, root, &source, &fstype, &path, ro, info)?;
     Ok(0)
 }

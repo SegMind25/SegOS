@@ -10,7 +10,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="SegOS">
   <meta property="og:title" content="SegOS: a from-scratch OS in Rust that speaks Linux">
-  <meta property="og:description" content="A new kernel in Rust that implements the Linux syscall ABI, so unmodified Linux apps (and Windows apps via Wine/Proton) can run on it. Phases 0 to 3 done: Ubuntu&#39;s BusyBox runs unmodified as a shell.">
+  <meta property="og:description" content="A new kernel in Rust that implements the Linux syscall ABI, so unmodified Linux apps (and Windows apps via Wine/Proton) can run on it. Phases 0 to 4 done: it boots from an ext4 disk and runs Ubuntu&#39;s BusyBox unmodified as a shell.">
   <meta property="og:image" content="/assets/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -41,7 +41,7 @@
   <main id="main">
     <div class="wrap">
       <section class="hero" aria-labelledby="hero-title">
-        <p class="eyebrow"><span class="dot" aria-hidden="true"></span><span>Early development &middot; 4 of 11 phases done</span></p>
+        <p class="eyebrow"><span class="dot" aria-hidden="true"></span><span>Early development &middot; 5 of 11 phases done</span></p>
         <h1 id="hero-title">A new operating system in Rust that <em>speaks Linux</em>.</h1>
         <p class="lede">
           SegOS is a kernel written from scratch whose native interface is the
@@ -153,7 +153,7 @@
         <div class="section-head">
           <p class="kicker">Status</p>
           <h2 id="status-title">Where it is right now</h2>
-          <p>Each phase ends with a demo that has to work in QEMU and in CI. Phases 0 to 3 have passed; Phase 4, real disks, is next.</p>
+          <p>Each phase ends with a demo that has to work in QEMU and in CI. Phases 0 to 4 have passed; Phase 5, the full Linux userland, is next.</p>
         </div>
         <div class="grid">
           <div class="panel">
@@ -188,14 +188,25 @@
             </ul>
           </div>
           <div class="panel">
-            <h3>Phase 4 &middot; Real storage <span class="badge wip">Next</span></h3>
-            <ul class="checklist">
-              <li>PCI(e), MSI interrupts</li>
-              <li>virtio-blk, NVMe and AHCI (SATA) drivers</li>
-              <li>A block layer and page cache</li>
-              <li>GPT partitions, ext4, FAT32, mounts</li>
+            <h3>Phase 4 &middot; Real storage <span class="badge done">Done</span></h3>
+            <ul class="checklist done">
+              <li>Boots from an ext4 root file system on disk, read-write</li>
+              <li>PCI; virtio-blk, NVMe and AHCI (SATA) drivers</li>
+              <li>GPT partitions; ext2/3/4 with journal replay; FAT32</li>
+              <li><code>mount</code>/<code>umount</code>, a block cache, a page cache</li>
+              <li>Real <code>MAP_SHARED</code> file mappings</li>
+              <li>Linux&rsquo;s <code>e2fsck</code> passes what SegOS writes</li>
             </ul>
-            <p class="notice"><span>Done when SegOS boots from a disk with a full root file system.</span></p>
+          </div>
+          <div class="panel">
+            <h3>Phase 5 &middot; The full Linux userland <span class="badge wip">Next</span></h3>
+            <ul class="checklist">
+              <li>glibc programs, dynamically linked</li>
+              <li>Threads: <code>clone</code>, TLS, <code>futex</code></li>
+              <li><code>epoll</code>, <code>eventfd</code>, <code>timerfd</code>, <code>signalfd</code></li>
+              <li>Interrupt-driven disk I/O</li>
+            </ul>
+            <p class="notice"><span>Done when bash, coreutils, python3 and gcc from Debian or Artix run unmodified.</span></p>
           </div>
         </div>
         <p style="margin-top:1.5rem"><a href="/roadmap">All 11 phases, from bring-up to Steam &rarr;</a></p>
