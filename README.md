@@ -4,11 +4,15 @@ An operating system written from scratch in Rust, aiming to run **unmodified
 Linux applications** (and, through Wine/Proton, Windows ones) by implementing
 the Linux system call interface in a new kernel.
 
-Status: **Phase 1 (multitasking) done**. The kernel boots on UEFI and BIOS,
-prints to the serial port and the screen, handles CPU exceptions, manages
-physical memory, page tables and a kernel heap, starts every CPU, and runs
-kernel threads on all of them with a preemptive scheduler. It does not run
-programs yet; that is Phase 2.
+Status: **Phase 1 (multitasking) done**. SegOS boots on UEFI with its own
+bootloader, segboot. The kernel prints to the serial port and the screen,
+handles CPU exceptions, manages physical memory, page tables and a kernel
+heap, starts every CPU, and runs kernel threads on all of them with a
+preemptive scheduler. It does not run programs yet; that is Phase 2.
+
+Everything it runs is in this repository: the bootloader, the kernel and
+the build tool use no third-party crates, only Rust's `core`, `alloc` and
+(for the build tool) `std`.
 
 The whole roadmap, from here to Steam: [docs/plan.md](docs/plan.md).
 
@@ -37,24 +41,32 @@ flowchart TB
     kernel["<b>segkernel</b>, Rust, written from scratch<br/>processes · memory · files · network · drivers"]
     hal["<b>hardware layer</b><br/>CPU tables · interrupts · APIC · paging<br/>the only place for low-level unsafe code"]
     hw[("PC hardware")]
-    boot["Limine bootloader<br/>UEFI or BIOS"]
+    boot["<b>segboot</b>, our UEFI bootloader"]
 
     apps --> libc --> abi --> kernel --> hal --> hw
     boot -. loads .-> kernel
     style abi fill:#fff3e0,stroke:#e8590c,color:#000
     style kernel fill:#e7f5ff,stroke:#1c7ed6,color:#000
+    style boot fill:#e7f5ff,stroke:#1c7ed6,color:#000
 ```
 
 ### What happens when it boots
 
 ```mermaid
 flowchart LR
-    A["Power on<br/>UEFI or BIOS"] --> B["Limine loads<br/>the kernel"]
+    A["Power on<br/>UEFI firmware"] --> B["segboot loads<br/>the kernel,<br/>builds page tables"]
     B --> C["CPU setup<br/>serial log<br/>GDT · TSS · IDT"]
     C --> D["Memory<br/>frames · paging<br/>heap"]
     D --> E["Screen console<br/>APIC timer"]
     E --> F["All CPUs start<br/>scheduler runs<br/>threads everywhere"]
 ```
+
+segboot is a UEFI application (`EFI/BOOT/BOOTX64.EFI` on the disk). It
+reads `\boot\segkernel` from the same partition, copies its ELF segments
+into memory, builds the kernel's first page tables, picks a framebuffer,
+finds the ACPI tables, exits the firmware's boot services and jumps to the
+kernel with a [`BootInfo`](bootinfo/src/lib.rs) describing the machine.
+The kernel then starts the other CPUs itself, from the ACPI processor list.
 
 Every step logs to the serial port, so if something fails early you still
 see how far it got. A crash prints the faulting address, all registers and
@@ -87,7 +99,7 @@ sequenceDiagram
 
 | Virtual address | What |
 |---|---|
-| `0xffff_8000_0000_0000` | all physical memory, mapped directly (from Limine) |
+| `0xffff_8000_0000_0000` | all physical memory, mapped directly (set up by segboot) |
 | `0xffff_c000_0000_0000` | kernel heap: starts at 4 MiB, grows on demand |
 | `0xffff_d800_0000_0000` | kernel thread stacks, 64 KiB each, with an unmapped guard page below |
 | `0xffff_e000_0000_0000` | device registers (local APIC) |
@@ -142,19 +154,15 @@ tracks the roadmap.
 
 ## Build and run
 
-Needs Rust (the version is pinned in `rust-toolchain.toml`), QEMU, xorriso,
-git, make, a C compiler and OVMF. On Debian/Ubuntu:
+Needs Rust (the version is pinned in `rust-toolchain.toml`), QEMU and
+OVMF (UEFI firmware for QEMU). On Debian/Ubuntu:
 
 ```bash
-sudo apt install qemu-system-x86 xorriso ovmf build-essential git
+sudo apt install qemu-system-x86 ovmf git
 ```
 
 ```bash
-cargo xtask run          # build the ISO and boot it in QEMU (UEFI)
-```
-
-```bash
-cargo xtask run --bios   # legacy BIOS boot
+cargo xtask run          # build the disk image and boot it in QEMU
 ```
 
 ```bash
@@ -162,26 +170,36 @@ cargo xtask test         # in-kernel tests, in QEMU
 ```
 
 ```bash
-cargo xtask image        # target/segos.iso, bootable from USB or DVD
+cargo xtask image        # target/segos.img
 ```
 
-The first build downloads the [Limine](https://github.com/limine-bootloader/limine)
-bootloader into `target/limine`.
+Nothing is downloaded. `target/segos.img` is a GPT disk with one FAT32 EFI
+system partition, written by `xtask` itself. To boot a real PC from a USB
+stick (UEFI only, Secure Boot off; this erases the stick):
+
+```bash
+sudo dd if=target/segos.img of=/dev/sdX bs=4M conv=fsync
+```
+
+Set `OVMF=/path/to/OVMF.fd` if your distribution keeps it elsewhere than
+`/usr/share/ovmf/OVMF.fd`.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `kernel/src/hal/` | x86-64: serial, GDT/TSS, IDT and the trap path, local APIC and timer, per-CPU data, starting CPUs |
-| `kernel/src/mm/` | frame allocator, page tables, kernel heap |
+| `boot/` | segboot, the UEFI bootloader: loads the kernel ELF, page tables, memory map, framebuffer |
+| `bootinfo/` | the boot protocol: what segboot hands the kernel |
+| `kernel/src/hal/` | x86-64: instructions, serial, GDT/TSS, IDT and the trap path, ACPI tables, local APIC and timer, per-CPU data, starting CPUs |
+| `kernel/src/mm/` | frame allocator, page tables, kernel heap allocator |
 | `kernel/src/task/` | kernel threads, scheduler and context switch, wait queues |
 | `kernel/src/sync.rs` | interrupt-safe spinlock, sleeping mutex |
 | `kernel/src/time.rs` | uptime and sleeping |
-| `kernel/src/console.rs` | framebuffer text console and kernel log |
-| `kernel/src/limine.rs` | boot protocol requests |
+| `kernel/src/console.rs` | framebuffer text console |
+| `kernel/src/font.rs` | the console's 8×16 bitmap font |
+| `kernel/src/klog.rs` | kernel log levels and macros |
 | `kernel/src/ktest.rs` | in-kernel tests |
-| `xtask/` | build tool: kernel, ISO, QEMU |
-| `image/` | bootloader configuration |
+| `xtask/` | build tool: builds segboot and the kernel, writes the GPT/FAT32 disk image, runs QEMU |
 | `site/` | the website, deployed by Vercel (`vercel.json`) |
 
 Subsystems become their own crates once they grow (see the plan).

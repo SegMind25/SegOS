@@ -138,6 +138,15 @@ pub fn print(args: fmt::Arguments) {
     });
 }
 
+/// Prints to the screen only (for what serial already has).
+pub fn print_screen(args: fmt::Arguments) {
+    crate::hal::x86::without_interrupts(|| {
+        if let Some(console) = CONSOLE.lock().as_mut() {
+            let _ = console.write_fmt(args);
+        }
+    });
+}
+
 /// For the panic handler: never blocks on a lock.
 pub fn print_panic(args: fmt::Arguments) {
     serial::write_unlocked(args);

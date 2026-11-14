@@ -55,7 +55,8 @@ extern "sysv64" fn kmain(boot: &'static BootInfo) -> ! {
     // anything before this point fails.
     console::init(&boot.framebuffer);
     if boot.framebuffer.address != 0 {
-        kprintln!("SegOS {VERSION}");
+        // The banner is on serial already; the screen starts empty.
+        console::print_screen(format_args!("SegOS {VERSION}\n"));
         info!(
             "console: {}x{} framebuffer",
             boot.framebuffer.width, boot.framebuffer.height

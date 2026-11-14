@@ -136,10 +136,13 @@ pub const LOADER_CODE: u32 = 1;
 pub const LOADER_DATA: u32 = 2;
 pub const BOOT_SERVICES_CODE: u32 = 3;
 pub const BOOT_SERVICES_DATA: u32 = 4;
+pub const RUNTIME_SERVICES_CODE: u32 = 5;
+pub const RUNTIME_SERVICES_DATA: u32 = 6;
 pub const CONVENTIONAL_MEMORY: u32 = 7;
 pub const UNUSABLE_MEMORY: u32 = 8;
 pub const ACPI_RECLAIM_MEMORY: u32 = 9;
 pub const ACPI_MEMORY_NVS: u32 = 10;
+pub const PERSISTENT_MEMORY: u32 = 14;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -243,7 +246,8 @@ pub struct File {
     pub write: usize,
     pub get_position: usize,
     pub set_position: usize,
-    pub get_info: unsafe extern "efiapi" fn(*mut File, *const Guid, *mut usize, *mut c_void) -> Status,
+    pub get_info:
+        unsafe extern "efiapi" fn(*mut File, *const Guid, *mut usize, *mut c_void) -> Status,
     pub set_info: usize,
     pub flush: usize,
 }

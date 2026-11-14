@@ -55,13 +55,17 @@ const COM1: u16 = 0x3f8;
 
 unsafe fn outb(port: u16, v: u8) {
     // SAFETY: the caller owns the port.
-    unsafe { asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags)) };
+    unsafe {
+        asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags))
+    };
 }
 
 unsafe fn inb(port: u16) -> u8 {
     let v: u8;
     // SAFETY: the caller owns the port.
-    unsafe { asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags)) };
+    unsafe {
+        asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags))
+    };
     v
 }
 
@@ -127,16 +131,12 @@ pub fn both_print(args: fmt::Arguments) {
     serial_print(args);
 }
 
-/// Progress message on the text console.
+/// Message on the text console while boot services are active. OVMF and
+/// most firmware with a serial console mirror it to COM1 themselves, so
+/// writing COM1 too would print every line twice.
 #[macro_export]
 macro_rules! info {
     ($($t:tt)*) => { $crate::console::con_print(format_args!("segboot: {}\n", format_args!($($t)*))) };
-}
-
-/// Progress message on the text console and COM1.
-#[macro_export]
-macro_rules! progress {
-    ($($t:tt)*) => { $crate::console::both_print(format_args!("segboot: {}\n", format_args!($($t)*))) };
 }
 
 /// Message on COM1 only (after ExitBootServices).

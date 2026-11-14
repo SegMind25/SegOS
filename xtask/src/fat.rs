@@ -128,7 +128,7 @@ fn generated_short_name(name: &str, used: &[[u8; 11]]) -> [u8; 11] {
 fn lfn_checksum(short: &[u8; 11]) -> u8 {
     short
         .iter()
-        .fold(0u8, |sum, &c| (sum >> 1 | sum << 7).wrapping_add(c))
+        .fold(0u8, |sum, &c| sum.rotate_right(1).wrapping_add(c))
 }
 
 fn dir_entries(children: &BTreeMap<String, Node>) -> Vec<Entry<'_>> {
@@ -193,7 +193,11 @@ impl Writer<'_> {
             return Err("files do not fit in the EFI system partition".into());
         }
         for c in first..first + n {
-            let next = if c + 1 == first + n { END_OF_CHAIN } else { c + 1 };
+            let next = if c + 1 == first + n {
+                END_OF_CHAIN
+            } else {
+                c + 1
+            };
             self.set_fat(c, next);
         }
         self.next_cluster += n;
@@ -284,7 +288,7 @@ fn short_entry(buf: &mut Vec<u8>, name: &[u8; 11], attr: u8, cluster: u32, size:
 fn long_entries(buf: &mut Vec<u8>, name: &str, checksum: u8) {
     let mut chars: Vec<u16> = name.encode_utf16().collect();
     let parts = chars.len().div_ceil(13);
-    if chars.len() % 13 != 0 {
+    if !chars.len().is_multiple_of(13) {
         chars.push(0);
     }
     chars.resize(parts * 13, 0xffff);

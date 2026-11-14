@@ -131,7 +131,7 @@ pub unsafe fn load_segments(code: u16, data: u16) {
             "mov ss, {data:x}",
             code = in(reg) code as u64,
             data = in(reg) data,
-            tmp = lateout(reg) _,
+            tmp = out(reg) _,
             options(preserves_flags),
         )
     }

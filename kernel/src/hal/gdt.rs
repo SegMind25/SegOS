@@ -80,12 +80,12 @@ static mut BSP_GDT: Gdt = Gdt([0; 7]);
 pub fn init_bsp() {
     // SAFETY: runs once, on the BSP, before anything else uses these.
     unsafe {
-        let tss = &mut *(&raw mut BSP_TSS);
-        tss.ist[DOUBLE_FAULT_IST] =
+        let tss = &raw mut BSP_TSS;
+        (*tss).ist[DOUBLE_FAULT_IST] =
             (&raw const BSP_DOUBLE_FAULT_STACK) as u64 + IST_STACK_SIZE as u64;
-        let gdt = &mut *(&raw mut BSP_GDT);
-        *gdt = Gdt::new(&*(&raw const BSP_TSS));
-        load(gdt);
+        let gdt = &raw mut BSP_GDT;
+        gdt.write(Gdt::new(&*tss));
+        load(&*gdt);
     }
 }
 
