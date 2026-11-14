@@ -191,7 +191,10 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         140 | 141 => Ok(0), // getpriority, setpriority: everyone at nice 0
         157 => info::prctl(ctx, a),
         158 => process::arch_prctl(ctx, a[0] as u32, a[1]),
-        162 => Ok(0), // sync: tmpfs has nothing to write back
+        162 => {
+            crate::block::sync_all();
+            Ok(0)
+        }
         169 => info::reboot(a[0] as u32, a[1] as u32, a[2] as u32),
         186 => Ok(ctx.thread().tid as u64),
         201 => info::time(ctx, a[0]),

@@ -6,6 +6,7 @@
 //! with Linux's device numbers, and file systems (ext4, FAT) read and
 //! write through this interface, in 512-byte sectors.
 
+pub mod cache;
 pub mod gpt;
 
 use crate::abi::{Errno, KResult};
@@ -140,6 +141,7 @@ static DEVICES: SpinLock<Vec<Arc<dyn BlockDevice>>> = SpinLock::new(Vec::new());
 /// `minor_base` is the disk's own minor; partition n gets `minor_base + n`
 /// (Linux: 16 minors per virtio disk, 8 per SCSI/SATA disk).
 pub fn register_disk(disk: Arc<dyn BlockDevice>, major: u32, minor_base: u32) {
+    let disk: Arc<dyn BlockDevice> = Arc::new(cache::Cached::new(disk));
     crate::info!(
         "block: {} ({} MiB{})",
         disk.name(),
@@ -189,6 +191,31 @@ fn add(dev: Arc<dyn BlockDevice>) {
     });
     let _ = fs::dev_dir().insert(dev.name(), node);
     DEVICES.lock().push(dev);
+}
+
+/// Writes every disk's cached changes and flushes its write cache.
+pub fn sync_all() {
+    let disks: Vec<_> = DEVICES
+        .lock()
+        .iter()
+        .filter(|d| !d.name().is_empty())
+        .cloned()
+        .collect();
+    for d in disks {
+        if let Err(e) = d.flush() {
+            crate::warn!("block: {}: write-back failed ({e:?})", d.name());
+        }
+    }
+}
+
+/// Starts the thread that writes changes back every 5 seconds.
+pub fn start_flusher() {
+    crate::task::spawn_named("blockflush", || {
+        loop {
+            crate::time::sleep_ms(5000);
+            sync_all();
+        }
+    });
 }
 
 /// A registered device by its `/dev` name.

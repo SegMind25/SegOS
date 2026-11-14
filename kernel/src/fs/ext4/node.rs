@@ -98,7 +98,8 @@ impl Ext4Inode {
                     continue;
                 }
                 let len = (self.raw.size - lblk * bs).min(bs) as usize;
-                self.raw.read_blocks(&self.fs, lblk * bs, &mut block[..len])?;
+                self.raw
+                    .read_blocks(&self.fs, lblk * bs, &mut block[..len])?;
                 dir::parse_block(&block[..len], filetype, big, &mut out);
             }
         }

@@ -240,9 +240,12 @@ fn loadavg() -> String {
 }
 
 fn mounts() -> String {
-    let mut s =
-        String::from("rootfs / rootfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n");
-    for m in super::mount::all() {
+    let mounts = super::mount::all();
+    let mut s = String::new();
+    if !mounts.iter().any(|m| m.path == "/") {
+        s.push_str("rootfs / rootfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n");
+    }
+    for m in mounts {
         s.push_str(&format!(
             "{} {} {} {} 0 0\n",
             m.source,

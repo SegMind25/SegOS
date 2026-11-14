@@ -14,6 +14,8 @@
 pub mod cpio;
 pub mod dev;
 pub mod disk;
+pub mod ext4;
+pub mod fat;
 pub mod mount;
 pub mod pipe;
 pub mod procfs;

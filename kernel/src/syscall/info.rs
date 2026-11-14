@@ -311,6 +311,11 @@ pub fn reboot(magic1: u32, magic2: u32, cmd: u32) -> KResult<u64> {
     if magic1 != MAGIC1 || !MAGIC2.contains(&magic2) {
         return Err(Errno::EINVAL);
     }
+    if matches!(cmd, RESTART | POWER_OFF | HALT) {
+        // Nothing cached may be lost (Linux leaves this to user space; a
+        // forced power-off from BusyBox skips it, so the kernel does it).
+        crate::block::sync_all();
+    }
     match cmd {
         CAD_ON | CAD_OFF => Ok(0),
         RESTART => {

@@ -38,8 +38,7 @@ pub fn parse_block(b: &[u8], filetype: bool, big_blocks: bool, out: &mut Vec<Dir
         } else {
             le16(b, off + 6) as usize
         };
-        if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > b.len() || 8 + name_len > rec_len
-        {
+        if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > b.len() || 8 + name_len > rec_len {
             break; // corrupt: keep what was read
         }
         if ino != 0 && name_len != 0 {

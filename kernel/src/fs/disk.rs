@@ -3,14 +3,34 @@
 
 use super::Inode;
 use super::mount;
-use crate::abi::{Errno, KResult};
+use crate::abi::KResult;
 use crate::block::BlockDevice;
 use alloc::format;
 use alloc::sync::Arc;
 
 /// Mounts the ext2/3/4 file system on `dev`: its root and statfs info.
-pub fn mount_ext4(_dev: Arc<dyn BlockDevice>) -> KResult<mount::Mounted> {
-    Err(Errno::ENODEV)
+pub fn mount_ext4(dev: Arc<dyn BlockDevice>) -> KResult<mount::Mounted> {
+    let id = dev.rdev();
+    let fs = super::ext4::Ext4Fs::mount(dev, id)?;
+    Ok((fs.root(), Some(Arc::new(Ext4Info(fs)))))
+}
+
+struct Ext4Info(Arc<super::ext4::Ext4Fs>);
+
+impl mount::FsInfo for Ext4Info {
+    fn magic(&self) -> u64 {
+        0xef53
+    }
+    fn stats(&self) -> (u64, u64, u64, u64, u64) {
+        self.0.stats()
+    }
+}
+
+/// Mounts the FAT12/16/32 file system on `dev`.
+pub fn mount_fat(dev: Arc<dyn BlockDevice>) -> KResult<mount::Mounted> {
+    let id = dev.rdev();
+    let fs = super::fat::FatFs::mount(dev, id)?;
+    Ok((fs.root(), Some(fs)))
 }
 
 /// Looks for a partition holding a root file system (ext4 with `/init`)

@@ -123,6 +123,9 @@ fn kernel_init(boot: &'static BootInfo) {
     );
     drivers::pci::init();
     drivers::virtio_blk::init();
+    drivers::nvme::init();
+    drivers::ahci::init();
+    block::start_flusher();
     match fs::disk::mount_root() {
         Some(dev) => info!("root: {dev} (ext4, read-only)"),
         None => load_initramfs(boot),

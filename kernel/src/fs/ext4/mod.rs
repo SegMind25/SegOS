@@ -178,7 +178,7 @@ impl Superblock {
         }
         let power_of = |base: u64| {
             let mut n = g;
-            while n % base == 0 {
+            while n.is_multiple_of(base) {
                 n /= base;
             }
             n == 1

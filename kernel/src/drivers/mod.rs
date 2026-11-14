@@ -1,6 +1,8 @@
 //! Device drivers. Each speaks to one kind of hardware and hands what it
 //! gets to the rest of the kernel (input to the terminal, for now).
 
+pub mod ahci;
+pub mod nvme;
 pub mod pci;
 pub mod ps2kbd;
 pub mod virtio_blk;

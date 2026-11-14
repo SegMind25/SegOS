@@ -92,7 +92,11 @@ impl RawInode {
     }
 
     pub fn parse(b: &[u8]) -> KResult<Self> {
-        let extra_isize = if b.len() > 128 { le16(b, 0x80) as usize } else { 0 };
+        let extra_isize = if b.len() > 128 {
+            le16(b, 0x80) as usize
+        } else {
+            0
+        };
         let extra_end = 128 + extra_isize;
         if extra_isize != 0 && (extra_end > b.len() || extra_isize % 4 != 0) {
             return Err(Errno::EIO);

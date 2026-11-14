@@ -162,6 +162,16 @@ pub fn set_read_only(root: &Arc<dyn Inode>, ro: bool) -> KResult<()> {
     Ok(())
 }
 
+/// Whether the file system with this st_dev is mounted read-only.
+pub fn is_read_only(dev: u64) -> bool {
+    MOUNTS
+        .lock()
+        .iter()
+        .rev()
+        .find(|m| m.root.dev() == dev)
+        .is_some_and(|m| m.read_only)
+}
+
 pub fn all() -> Vec<Arc<Mount>> {
     MOUNTS.lock().clone()
 }

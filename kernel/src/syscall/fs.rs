@@ -177,6 +177,9 @@ fn resolve(ctx: &Ctx, dirfd: i32, path: &str, follow: bool) -> KResult<Arc<dyn I
 fn resolve_parent(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<(Arc<dyn Inode>, String)> {
     let base = dir_of(ctx, dirfd, path)?;
     let (dir, name) = fs::lookup_parent(&base, path)?;
+    if fs::mount::is_read_only(dir.dev()) {
+        return Err(Errno::EROFS);
+    }
     if !dir.writable_dir() {
         return Err(Errno::EACCES);
     }
@@ -392,7 +395,10 @@ pub fn fcntl(ctx: &Ctx, fd: i32, cmd: u32, arg: u64) -> KResult<u64> {
 }
 
 pub fn fsync(ctx: &Ctx, fd: i32) -> KResult<u64> {
-    file(ctx, fd)?;
+    let f = file(ctx, fd)?;
+    if f.inode.dev() != fs::DEV_TMPFS {
+        crate::block::sync_all();
+    }
     Ok(0)
 }
 
@@ -519,6 +525,9 @@ pub fn renameat(
     }
     let inode = from_dir.lookup(&from)?;
     let is_dir = inode.file_type() == FileType::Directory;
+    if from_dir.dev() != to_dir.dev() {
+        return Err(Errno::EXDEV);
+    }
     if is_dir && fs::is_within(&to_dir, &inode) {
         return Err(Errno::EINVAL); // into itself
     }
@@ -997,6 +1006,11 @@ fn make_fs(
             let dev = crate::block::device_of(&node).ok_or(Errno::ENOTBLK)?;
             fs::disk::mount_ext4(dev)
         }
+        "vfat" | "msdos" | "fat" => {
+            let node = resolve(ctx, AT_FDCWD, source, true)?;
+            let dev = crate::block::device_of(&node).ok_or(Errno::ENOTBLK)?;
+            fs::disk::mount_fat(dev)
+        }
         _ => Err(Errno::ENODEV),
     }
 }
@@ -1047,7 +1061,8 @@ pub fn mount(ctx: &Ctx, source: u64, target: u64, fstype: u64, flags: u64) -> KR
     }
     let fstype = ctx.mm().read_cstr(fstype, 64)?;
     let (root, info) = make_fs(ctx, &fstype, &source, &point)?;
-    let ro = flags & MS_RDONLY != 0 || info.is_some(); // disk file systems: read-only for now
+    // ext2/3/4 is read-only for now.
+    let ro = flags & MS_RDONLY != 0 || fstype.starts_with("ext");
     fs::mount::add(point, root, &source, &fstype, &path, ro, info)?;
     Ok(0)
 }
@@ -1057,5 +1072,6 @@ pub fn umount2(ctx: &Ctx, target: u64, _flags: u64) -> KResult<u64> {
     let target = path_arg(ctx, target)?;
     let root = resolve(ctx, AT_FDCWD, &target, true)?;
     fs::mount::remove(&root)?;
+    crate::block::sync_all();
     Ok(0)
 }
