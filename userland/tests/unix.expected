@@ -1,0 +1,82 @@
+# socketpair
+ok   socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0
+ok   write(sv[0], "hello", 5) == 5
+ok   write(sv[0], " world", 6) == 6
+ok   ioctl(sv[1], FIONREAD, &n) == 0 && n == 11
+ok   recv(sv[1], buf, sizeof buf, MSG_PEEK) == 11
+ok   read(sv[1], buf, sizeof buf) == 11 && memcmp(buf, "hello world", 11) == 0
+ok   recv(sv[1], buf, sizeof buf, MSG_DONTWAIT) == -1 && errno == EAGAIN
+ok   shutdown(sv[0], SHUT_WR) == 0
+ok   read(sv[1], buf, sizeof buf) == 0
+ok   write(sv[1], "back", 4) == 4
+ok   read(sv[0], buf, sizeof buf) == 4
+ok   send(sv[0], "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE
+ok   socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0
+ok   send(sv[0], "one", 3, 0) == 3
+ok   send(sv[0], "two!", 4, 0) == 4
+ok   recv(sv[1], buf, 2, 0) == 2
+ok   recv(sv[1], buf, sizeof buf, 0) == 4 && memcmp(buf, "two!", 4) == 0
+ok   socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0
+ok   send(sv[0], "abc", 3, 0) == 3 && send(sv[0], "de", 2, 0) == 2
+ok   recv(sv[1], buf, sizeof buf, 0) == 3
+ok   recv(sv[1], buf, sizeof buf, 0) == 2
+# file-system names
+ok   srv >= 0
+ok   bind(srv, (struct sockaddr *)&a, len) == 0
+ok   stat(path, &st) == 0 && S_ISSOCK(st.st_mode)
+ok   bind(again, (struct sockaddr *)&a, len) == -1 && errno == EADDRINUSE
+ok   connect(c, (struct sockaddr *)&a, len) == -1 && errno == ECONNREFUSED
+ok   listen(srv, 4) == 0
+ok   connect(c, (struct sockaddr *)&a, len) == 0
+ok   poll(&p, 1, 1000) == 1 && (p.revents & POLLIN)
+ok   s >= 0
+ok   read(s, &p, 1) == -1 && errno == EAGAIN
+ok   write(c, "ping", 4) == 4
+ok   read(s, buf, sizeof buf) == 4 && memcmp(buf, "ping", 4) == 0
+ok   getsockname(srv, (struct sockaddr *)&got, &len) == 0 && got.sun_family == AF_UNIX
+ok   strcmp(got.sun_path, path) == 0
+ok   getpeername(c, (struct sockaddr *)&got, &len) == 0
+ok   strcmp(got.sun_path, path) == 0
+ok   getsockopt(s, SOL_SOCKET, SO_PEERCRED, &cr, &len) == 0 && cr.pid == getpid()
+ok   getsockopt(s, SOL_SOCKET, SO_TYPE, &type, &len) == 0 && type == SOCK_STREAM
+ok   read(s, buf, sizeof buf) == 0
+ok   unlink(path) == 0
+# abstract names
+ok   srv >= 0
+ok   bind(srv, (struct sockaddr *)&a, len) == 0
+ok   bind(again, (struct sockaddr *)&a, len) == -1 && errno == EADDRINUSE
+ok   connect(c, (struct sockaddr *)&a, len) == -1 && errno == ECONNREFUSED
+ok   listen(srv, 4) == 0
+ok   connect(c, (struct sockaddr *)&a, len) == 0
+ok   poll(&p, 1, 1000) == 1 && (p.revents & POLLIN)
+ok   s >= 0
+ok   read(s, &p, 1) == -1 && errno == EAGAIN
+ok   write(c, "ping", 4) == 4
+ok   read(s, buf, sizeof buf) == 4 && memcmp(buf, "ping", 4) == 0
+ok   getsockname(srv, (struct sockaddr *)&got, &len) == 0 && got.sun_family == AF_UNIX
+ok   getpeername(c, (struct sockaddr *)&got, &len) == 0
+ok   getsockopt(s, SOL_SOCKET, SO_PEERCRED, &cr, &len) == 0 && cr.pid == getpid()
+ok   getsockopt(s, SOL_SOCKET, SO_TYPE, &type, &len) == 0 && type == SOCK_STREAM
+ok   read(s, buf, sizeof buf) == 0
+# passing descriptors
+ok   socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0
+ok   pipe(pipefd) == 0
+ok   sendmsg(sv[0], &m, 0) == 1
+ok   recvmsg(sv[1], &r, MSG_CMSG_CLOEXEC) == 1 && data == 'F'
+ok   rc != NULL && rc->cmsg_level == SOL_SOCKET && rc->cmsg_type == SCM_RIGHTS
+ok   got >= 0
+ok   fcntl(got, F_GETFD) == FD_CLOEXEC
+ok   write(got, "via", 3) == 3
+ok   read(pipefd[0], buf, sizeof buf) == 3 && memcmp(buf, "via", 3) == 0
+# across fork
+ok   socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0
+ok   write(sv[0], "upper case", 10) == 10
+ok   read(sv[0], buf, sizeof buf) == 10 && memcmp(buf, "UPPER CASE", 10) == 0
+ok   waitpid(child, &st, 0) == child
+# errors
+ok   socket(AF_UNIX, 99, 0) == -1
+ok   listen(fd, 1) == -1 && errno == ENOTSOCK
+ok   listen(s, 1) == -1 && errno == EINVAL
+ok   send(s, "x", 1, MSG_NOSIGNAL) == -1 && errno == ENOTCONN
+ok   connect(s, (struct sockaddr *)&a, len) == -1 && errno == ENOENT
+PASSED

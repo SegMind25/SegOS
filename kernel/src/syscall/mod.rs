@@ -9,6 +9,7 @@ mod event;
 mod fs;
 mod info;
 mod mem;
+mod net;
 mod process;
 
 use crate::abi::{AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, Errno, KResult};
@@ -198,9 +199,22 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         191..=193 | 197..=199 => Err(Errno::ENODATA),
         194..=196 => Ok(0), // listxattr: an empty list
         332 => fs::statx(ctx, a[0] as i32, a[1], a[2] as u32, a[4]),
-        // Sockets come with networking (Phase 6).
-        41 => Err(Errno::EAFNOSUPPORT),
-        42..=55 => Err(Errno::ENOTSOCK),
+        41 => net::socket(ctx, a[0] as u32, a[1] as u32, a[2] as u32),
+        42 => net::connect(ctx, fd, a[1], a[2]),
+        43 => net::accept4(ctx, fd, a[1], a[2], 0),
+        288 => net::accept4(ctx, fd, a[1], a[2], a[3] as u32),
+        44 => net::sendto(ctx, fd, a[1], a[2], a[3] as u32, a[4], a[5]),
+        45 => net::recvfrom(ctx, fd, a[1], a[2], a[3] as u32, a[4], a[5]),
+        46 => net::sendmsg(ctx, fd, a[1], a[2] as u32),
+        47 => net::recvmsg(ctx, fd, a[1], a[2] as u32),
+        48 => net::shutdown(ctx, fd, a[1] as u32),
+        49 => net::bind(ctx, fd, a[1], a[2]),
+        50 => net::listen(ctx, fd, a[1] as u32),
+        51 => net::getsockname(ctx, fd, a[1], a[2]),
+        52 => net::getpeername(ctx, fd, a[1], a[2]),
+        53 => net::socketpair(ctx, a[0] as u32, a[1] as u32, a[2] as u32, a[3]),
+        54 => net::setsockopt(ctx, fd, a[1] as u32, a[2] as u32, a[3], a[4]),
+        55 => net::getsockopt(ctx, fd, a[1] as u32, a[2] as u32, a[3], a[4]),
         166 => fs::umount2(ctx, a[0], a[1]),
         137 => fs::statfs(ctx, a[0], a[1], false),
         138 => fs::statfs(ctx, a[0], a[1], true),

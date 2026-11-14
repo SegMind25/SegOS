@@ -420,7 +420,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
         ("echo SEGOS-$((6 * 7))-OK", "SEGOS-42-OK"),
         (
             "ls /tests | grep expected | wc -l | sed 's/^/COUNT=/'",
-            "COUNT=6",
+            "COUNT=7",
         ),
         ("hello | tr a-z A-Z", "HELLO, WORLD!"),
         ("cat /proc/self/comm | tr a-z A-Z", "CAT"),

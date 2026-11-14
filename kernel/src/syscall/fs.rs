@@ -40,7 +40,7 @@ pub fn write(ctx: &Ctx, fd: i32, buf: u64, count: u64) -> KResult<u64> {
     Ok(f.write(&kbuf)? as u64)
 }
 
-fn iovecs(ctx: &Ctx, iov: u64, count: u64) -> KResult<Vec<Iovec>> {
+pub(super) fn iovecs(ctx: &Ctx, iov: u64, count: u64) -> KResult<Vec<Iovec>> {
     if count > IOV_MAX {
         return Err(Errno::EINVAL);
     }

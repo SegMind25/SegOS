@@ -168,6 +168,18 @@ impl Inode for SocketFile {
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
+    fn ioctl(&self, req: u32, arg: u64, mm: &crate::mm::vm::AddressSpace) -> KResult<u64> {
+        const FIONREAD: u32 = 0x541b;
+        const FIONBIO: u32 = 0x5421;
+        match req {
+            FIONREAD => {
+                mm.write(arg, &(self.sock.bytes_ready() as i32))?;
+                Ok(0)
+            }
+            FIONBIO => Ok(0), // the descriptor's flag is set by fcntl's path
+            _ => Err(Errno::ENOTTY),
+        }
+    }
 }
 
 /// The socket behind a descriptor's inode (ENOTSOCK otherwise).

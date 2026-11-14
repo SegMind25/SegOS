@@ -516,7 +516,7 @@ impl File {
         matches!(*self.flags.lock() & O_ACCMODE, O_WRONLY | O_RDWR)
     }
 
-    fn nonblock(&self) -> bool {
+    pub fn nonblock(&self) -> bool {
         *self.flags.lock() & crate::abi::open::O_NONBLOCK != 0
     }
 
