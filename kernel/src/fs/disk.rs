@@ -67,6 +67,7 @@ pub fn mount_root() -> Option<alloc::string::String> {
             ("dev", "devtmpfs", super::dev_dir()),
             ("proc", "proc", super::procfs::root(&root)),
             ("tmp", "tmpfs", super::tmpfs::Dir::new_root(0o1777)),
+            ("sys", "sysfs", super::sysfs::create()),
         ];
         if read_only {
             // Somewhere to write a shell history and the like.

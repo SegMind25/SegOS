@@ -1062,6 +1062,7 @@ fn make_fs(
     match fstype {
         "tmpfs" | "ramfs" => Ok((fs::tmpfs::Dir::new_root(0o1777), None)),
         "proc" => Ok((fs::procfs::root(point), None)),
+        "sysfs" => Ok((fs::sysfs::create(), None)),
         // The kernel's own /dev, wherever it is asked for.
         "devtmpfs" => Ok((fs::dev_dir(), None)),
         "ext4" | "ext3" | "ext2" => {

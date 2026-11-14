@@ -20,6 +20,7 @@ pub mod mount;
 pub mod pagecache;
 pub mod pipe;
 pub mod procfs;
+pub mod sysfs;
 pub mod tmpfs;
 
 use crate::abi::{Errno, KResult, Stat, mode};
