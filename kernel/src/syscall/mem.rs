@@ -41,7 +41,11 @@ pub fn mmap(
         let f = ctx.process().files.lock().get(fd)?;
         match f.inode.file_type() {
             FileType::Regular => {}
-            FileType::Directory | FileType::Fifo | FileType::Symlink | FileType::BlockDevice => {
+            FileType::Directory
+            | FileType::Fifo
+            | FileType::Symlink
+            | FileType::BlockDevice
+            | FileType::Socket => {
                 return Err(Errno::ENODEV);
             }
             // Device memory (/dev/zero is the common case): anonymous.

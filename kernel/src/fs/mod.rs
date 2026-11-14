@@ -41,6 +41,7 @@ pub enum FileType {
     CharDevice,
     BlockDevice,
     Symlink,
+    Socket,
     Fifo,
 }
 
@@ -51,6 +52,7 @@ impl FileType {
             Self::Directory => mode::S_IFDIR,
             Self::CharDevice => mode::S_IFCHR,
             Self::BlockDevice => mode::S_IFBLK,
+            Self::Socket => mode::S_IFSOCK,
             Self::Symlink => mode::S_IFLNK,
             Self::Fifo => mode::S_IFIFO,
         }
@@ -62,6 +64,7 @@ impl FileType {
             Self::Fifo => 1,
             Self::CharDevice => 2,
             Self::BlockDevice => 6,
+            Self::Socket => 12,
             Self::Directory => 4,
             Self::Regular => 8,
             Self::Symlink => 10,
@@ -76,6 +79,7 @@ static NEXT_INO: AtomicU64 = AtomicU64::new(1);
 pub const DEV_TMPFS: u64 = 0x1;
 pub const DEV_PIPEFS: u64 = 0xc;
 pub const DEV_PROC: u64 = 0x16;
+pub const DEV_SOCKFS: u64 = 0x8;
 
 pub fn new_ino() -> u64 {
     NEXT_INO.fetch_add(1, Ordering::Relaxed)

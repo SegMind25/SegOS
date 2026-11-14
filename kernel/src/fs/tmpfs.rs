@@ -151,7 +151,7 @@ impl Inode for Dir {
             }),
             FileType::Directory => self.new_child(perm),
             FileType::Fifo => super::pipe::Fifo::create(perm),
-            FileType::CharDevice | FileType::BlockDevice | FileType::Symlink => {
+            FileType::CharDevice | FileType::BlockDevice | FileType::Symlink | FileType::Socket => {
                 return Err(Errno::EPERM);
             }
         };

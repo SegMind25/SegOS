@@ -25,6 +25,7 @@ mod klog;
 mod ktest;
 mod ktest_hooks;
 mod mm;
+mod net;
 mod proc;
 mod random;
 mod sync;
