@@ -6,13 +6,18 @@ use crate::hal::idt::TrapFrame;
 use crate::hal::x86;
 use crate::proc::signal::{self, SigAction, SigInfo, UNBLOCKABLE, signo};
 use crate::proc::{self, wait_flags};
-use crate::sync::SpinLock;
 use crate::task::wait::WaitQueue;
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
+/// `exit`: ends the calling thread (the process ends with its last one).
 pub fn exit(ctx: &Ctx, code: i32) -> KResult<u64> {
+    ctx.thread().request_thread_exit((code & 0xff) << 8);
+    Ok(0)
+}
+
+/// `exit_group`: ends every thread of the process.
+pub fn exit_group(ctx: &Ctx, code: i32) -> KResult<u64> {
     ctx.thread().request_exit((code & 0xff) << 8);
     Ok(0)
 }
@@ -33,6 +38,16 @@ pub fn execve(ctx: &Ctx, frame: &mut TrapFrame, path: u64, argv: u64, envp: u64)
     let path = path_arg(ctx, path)?;
     let argv = proc::read_string_array(ctx.mm(), argv)?;
     let envp = proc::read_string_array(ctx.mm(), envp)?;
+    if ctx.process().thread_count() > 1 {
+        // The other threads go first, unless the program obviously cannot
+        // be run (a failed execve must leave the process as it was).
+        let cwd = ctx.process().cwd.lock().clone();
+        let inode = crate::fs::lookup(&cwd, &path)?;
+        if inode.file_type() != crate::fs::FileType::Regular || inode.perm() & 0o111 == 0 {
+            return Err(Errno::EACCES);
+        }
+        proc::kill_other_threads()?;
+    }
     proc::exec::execve(ctx.thread(), frame, &path, argv, envp)?;
     Ok(0)
 }
@@ -98,16 +113,28 @@ pub fn waitid(ctx: &Ctx, idtype: u32, id: u32, infop: u64, options: u32) -> KRes
 /// kill(pid, sig), tkill(tid, sig), tgkill(tgid, tid, sig).
 pub fn kill(ctx: &Ctx, a: [u64; 6], nr: u64) -> KResult<u64> {
     let me = ctx.process();
-    let (target, sig, info) = match nr {
-        62 => (a[0] as i32, a[1] as i32, SigInfo::user(me.pid)),
-        200 => (a[0] as i32, a[1] as i32, SigInfo::tkill(me.pid)),
-        _ => {
-            if a[0] as i32 != a[1] as i32 {
-                return Err(Errno::ESRCH); // threads come in Phase 5
-            }
-            (a[1] as i32, a[2] as i32, SigInfo::tkill(me.pid))
+    if nr != 62 {
+        // tkill(tid, sig), tgkill(tgid, tid, sig): one thread.
+        let (tgid, tid, sig) = if nr == 200 {
+            (None, a[0] as i32, a[1] as i32)
+        } else {
+            (Some(a[0] as i32), a[1] as i32, a[2] as i32)
+        };
+        if tid <= 0 || tgid.is_some_and(|g| g <= 0) || !(0..=signal::NSIG as i32).contains(&sig) {
+            return Err(Errno::EINVAL);
         }
-    };
+        let t = proc::find_thread(tid as u32).ok_or(Errno::ESRCH)?;
+        if let Some(g) = tgid
+            && t.user().is_none_or(|u| u.process.pid != g as u32)
+        {
+            return Err(Errno::ESRCH);
+        }
+        if sig != 0 {
+            signal::send_thread(&t, sig, SigInfo::tkill(me.pid));
+        }
+        return Ok(0);
+    }
+    let (target, sig, info) = (a[0] as i32, a[1] as i32, SigInfo::user(me.pid));
     if !(0..=signal::NSIG as i32).contains(&sig) {
         return Err(Errno::EINVAL);
     }
@@ -116,9 +143,6 @@ pub fn kill(ctx: &Ctx, a: [u64; 6], nr: u64) -> KResult<u64> {
             signal::send(p, sig, info);
         }
     };
-    if nr != 62 && target <= 0 {
-        return Err(Errno::EINVAL);
-    }
     match target {
         t if t > 0 => {
             let p = proc::lookup(t as u32).ok_or(Errno::ESRCH)?;
@@ -176,10 +200,7 @@ pub fn rt_sigaction(ctx: &Ctx, sig: i32, act: u64, old: u64, setsize: u64) -> KR
     if let Some(n) = new
         && (n.handler == signal::SIG_IGN || (n.handler == signal::SIG_DFL && sig == signo::SIGCHLD))
     {
-        ctx.thread()
-            .sig
-            .pending
-            .fetch_and(!(1 << (sig - 1)), Ordering::Relaxed);
+        signal::discard(ctx.process(), sig);
     }
     if old != 0 {
         ctx.mm().write(old, &prev)?;
@@ -217,7 +238,7 @@ pub fn rt_sigpending(ctx: &Ctx, set: u64, size: u64) -> KResult<u64> {
     if size > 8 {
         return Err(Errno::EINVAL);
     }
-    let pending = ctx.thread().sig.pending.load(Ordering::Relaxed);
+    let pending = ctx.thread().pending_signals();
     ctx.mm()
         .copy_to(set, &pending.to_le_bytes()[..size as usize])?;
     Ok(0)
@@ -309,70 +330,72 @@ pub fn arch_prctl(ctx: &Ctx, code: u32, addr: u64) -> KResult<u64> {
     }
 }
 
-/// One futex word's waiters.
-struct FutexQueue {
-    queue: WaitQueue,
-    wakes: AtomicU64,
+pub fn futex(ctx: &Ctx, a: [u64; 6]) -> KResult<u64> {
+    proc::futex::futex(ctx.mm(), a)
 }
 
-/// Futexes by (address space, address). Waiters on a shared address space
-/// (a vfork child) find each other; real thread support comes in Phase 5.
-static FUTEXES: SpinLock<BTreeMap<(usize, u64), Arc<FutexQueue>>> = SpinLock::new(BTreeMap::new());
-
-pub fn futex(ctx: &Ctx, a: [u64; 6]) -> KResult<u64> {
-    const FUTEX_WAIT: u64 = 0;
-    const FUTEX_WAKE: u64 = 1;
-    const FUTEX_WAIT_BITSET: u64 = 9;
-    const FUTEX_WAKE_BITSET: u64 = 10;
-    let (addr, op, val) = (a[0], a[1] & 0x7f, a[2] as u32);
-    if addr % 4 != 0 {
+/// `set_robust_list(head, len)`.
+pub fn set_robust_list(ctx: &Ctx, head: u64, len: u64) -> KResult<u64> {
+    if len != 24 {
         return Err(Errno::EINVAL);
     }
-    let key = (ctx.mm() as *const _ as usize, addr);
-    let q = FUTEXES
-        .lock()
-        .entry(key)
-        .or_insert_with(|| {
-            Arc::new(FutexQueue {
-                queue: WaitQueue::new(),
-                wakes: AtomicU64::new(0),
+    ctx.thread().robust_list.store(head, Ordering::Relaxed);
+    Ok(0)
+}
+
+/// `get_robust_list(tid, head_ptr, len_ptr)`.
+pub fn get_robust_list(ctx: &Ctx, tid: u32, head: u64, len: u64) -> KResult<u64> {
+    let t = if tid == 0 {
+        crate::task::current()
+    } else {
+        proc::find_thread(tid).ok_or(Errno::ESRCH)?
+    };
+    let u = t.user().ok_or(Errno::ESRCH)?;
+    ctx.mm()
+        .write(head, &u.robust_list.load(Ordering::Relaxed))?;
+    ctx.mm().write(len, &24u64)?;
+    Ok(0)
+}
+
+/// `rt_sigtimedwait(set, info, timeout, setsize)`: takes a pending signal
+/// of `set` (normally blocked ones), waiting for one up to `timeout`.
+pub fn rt_sigtimedwait(ctx: &Ctx, set: u64, info: u64, timeout: u64, size: u64) -> KResult<u64> {
+    if size != 8 {
+        return Err(Errno::EINVAL);
+    }
+    let want: u64 = ctx.mm().read::<u64>(set)? & !UNBLOCKABLE;
+    let deadline = if timeout != 0 {
+        let ts: crate::abi::Timespec = ctx.mm().read(timeout)?;
+        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+            return Err(Errno::EINVAL);
+        }
+        let ns = (ts.tv_sec as u64)
+            .saturating_mul(crate::time::NS_PER_SEC)
+            .saturating_add(ts.tv_nsec as u64);
+        Some(crate::time::monotonic_ns().saturating_add(ns))
+    } else {
+        None
+    };
+    let u = ctx.thread();
+    let _timer = deadline.map(crate::time::wake_at);
+    let timed_out = || deadline.is_some_and(|d| crate::time::monotonic_ns() >= d);
+    loop {
+        if let Some((sig, si)) = u.dequeue_signal(want) {
+            if info != 0 {
+                ctx.mm().copy_to(info, &si.to_bytes(sig))?;
+            }
+            return Ok(sig as u64);
+        }
+        if timed_out() {
+            return Err(Errno::EAGAIN);
+        }
+        let seen = crate::fs::POLL_EVENTS.load(Ordering::Acquire);
+        crate::fs::POLL_WAIT
+            .wait_interruptible(|| {
+                crate::fs::POLL_EVENTS.load(Ordering::Acquire) != seen
+                    || u.pending_signals() & want != 0
+                    || timed_out()
             })
-        })
-        .clone();
-    match op {
-        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-            let seen = q.wakes.load(Ordering::Acquire);
-            let cur: u32 = ctx.mm().read(addr)?;
-            if cur != val {
-                return Err(Errno::EAGAIN);
-            }
-            let deadline = if a[3] != 0 {
-                let ts: crate::abi::Timespec = ctx.mm().read(a[3])?;
-                let ns = (ts.tv_sec.max(0) as u64)
-                    .saturating_mul(crate::time::NS_PER_SEC)
-                    .saturating_add(ts.tv_nsec.max(0) as u64);
-                Some(if op == FUTEX_WAIT {
-                    crate::time::monotonic_ns().saturating_add(ns)
-                } else {
-                    ns // WAIT_BITSET takes an absolute time
-                })
-            } else {
-                None
-            };
-            let _timer = deadline.map(crate::time::wake_at);
-            let timed_out = || deadline.is_some_and(|d| crate::time::monotonic_ns() >= d);
-            q.queue
-                .wait_interruptible(|| q.wakes.load(Ordering::Acquire) != seen || timed_out())?;
-            if q.wakes.load(Ordering::Acquire) == seen {
-                return Err(Errno::ETIMEDOUT);
-            }
-            Ok(0)
-        }
-        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
-            q.wakes.fetch_add(1, Ordering::Release);
-            q.queue.wake_all();
-            Ok(val.min(1) as u64)
-        }
-        _ => Err(Errno::ENOSYS),
+            .map_err(|_| Errno::EINTR)?;
     }
 }

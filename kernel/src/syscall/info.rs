@@ -336,3 +336,15 @@ pub fn reboot(magic1: u32, magic2: u32, cmd: u32) -> KResult<u64> {
         _ => Err(Errno::EINVAL),
     }
 }
+
+/// `getcpu(cpu, node, cache)`: the CPU the caller runs on; one NUMA node.
+pub fn getcpu(ctx: &Ctx, cpu: u64, node: u64) -> KResult<u64> {
+    let index = crate::hal::x86::without_interrupts(|| crate::hal::percpu::this_cpu().index);
+    if cpu != 0 {
+        ctx.mm().write(cpu, &index)?;
+    }
+    if node != 0 {
+        ctx.mm().write(node, &0u32)?;
+    }
+    Ok(0)
+}

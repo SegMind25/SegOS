@@ -4,17 +4,16 @@ An operating system written from scratch in Rust, aiming to run **unmodified
 Linux applications** (and, through Wine/Proton, Windows ones) by implementing
 the Linux system call interface in a new kernel.
 
-Status: **Phase 4 (real disks) done**. SegOS boots on UEFI with its own
-bootloader, starts every CPU, finds its disks (virtio, NVMe and SATA
-drivers), reads their GPT partitions and **boots from an ext4 root file
-system on disk**, read-write: what SegOS writes passes Linux's `e2fsck`.
-On it runs **a shell**: BusyBox, the statically linked binary exactly as
-Ubuntu ships it, with `fork`, signals, pipes, job control and `/proc`
-behind it. FAT32 (the EFI partition), `mount`/`umount`, a write-back
-block cache and a page cache with real shared file mappings are in too.
-Four conformance tests print byte for byte what they print on Linux.
-Next is Phase 5: the full Linux userland (glibc, dynamic linking,
-threads).
+Status: **Phase 5 (the Linux userland) done**. SegOS boots on UEFI with
+its own bootloader, finds its disks (virtio, NVMe and SATA drivers,
+interrupt-driven) and boots from a read-write **ext4 root file system**.
+On it, **unmodified Linux programs** run as Ubuntu builds them,
+dynamically linked against glibc: **bash, GNU coreutils, Python 3.13 and
+gcc**, which compiles a C program on SegOS that then runs. Behind them:
+threads, futexes, `epoll`/`eventfd`/`timerfd`/`signalfd`, `fork`,
+signals, pipes, mounts, FAT32, a block cache and a page cache. Six
+conformance tests print byte for byte what they print on Linux. Next is
+Phase 6: networking.
 
 The operating system itself is all in this repository: the bootloader, the
 kernel and the build tool use no third-party crates, only Rust's `core`,

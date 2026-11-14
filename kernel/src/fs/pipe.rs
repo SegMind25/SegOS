@@ -12,7 +12,7 @@ use crate::sync::SpinLock;
 use crate::task::wait::WaitQueue;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Capacity (Linux's default: 16 pages).
 const CAPACITY: usize = 64 * 1024;
@@ -26,6 +26,8 @@ pub struct Pipe {
     writers: AtomicUsize,
     read_wait: WaitQueue,
     write_wait: WaitQueue,
+    /// Bumped on every change (edge-triggered epoll).
+    generation: AtomicU64,
 }
 
 impl Pipe {
@@ -37,6 +39,7 @@ impl Pipe {
             writers: AtomicUsize::new(0),
             read_wait: WaitQueue::new(),
             write_wait: WaitQueue::new(),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -53,6 +56,7 @@ impl Pipe {
     }
 
     fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
         self.read_wait.wake_all();
         self.write_wait.wake_all();
         poll_notify();
@@ -202,6 +206,10 @@ impl Inode for PipeEnd {
                 return if done > 0 { Ok(done) } else { Err(e) };
             }
         }
+    }
+
+    fn poll_generation(&self) -> u64 {
+        self.pipe.generation.load(Ordering::Acquire)
     }
 
     fn poll(&self) -> u16 {

@@ -4,8 +4,13 @@
 //! process, its address space, and the CPU state that is per thread but
 //! not saved by the kernel's own context switch (FS/GS base, x87/SSE
 //! registers). The scheduler is unchanged; [`switch_hook`] swaps that extra
-//! state on every switch. Every process has one thread until `clone` with
-//! threads comes in Phase 5.
+//! state on every switch.
+//!
+//! A process is a thread group: `clone(CLONE_THREAD)` adds threads that
+//! share its address space, descriptors, working directory and signal
+//! handlers. `getpid` is the group's id (the first thread's tid). `exit`
+//! ends one thread; the process ends, a zombie for its parent, when its
+//! last thread has gone. `exit_group` and fatal signals end every thread.
 //!
 //! Processes form the usual Unix tree: `fork` makes a child, `exit` leaves
 //! a zombie holding the wait status until the parent reaps it with
@@ -15,6 +20,7 @@
 pub mod elf;
 pub mod exec;
 pub mod faults;
+pub mod futex;
 pub mod signal;
 
 use crate::abi::{Errno, KResult};
@@ -75,8 +81,14 @@ pub struct Process {
     exit_signal: i32,
     /// Whether the process has the console as its controlling terminal.
     pub has_ctty: AtomicBool,
-    /// The (only) thread, while it runs.
-    thread: SpinLock<Weak<Task>>,
+    /// The live threads (the first is the oldest).
+    threads: SpinLock<Vec<Weak<Task>>>,
+    /// Woken whenever a thread of the group exits.
+    thread_exit_wait: WaitQueue,
+    /// The exit status `exit_group` or a fatal signal set for the group.
+    group_exit: AtomicI32,
+    /// Process-directed signals not yet taken by a thread.
+    pub(crate) shared_sig: signal::SigQueue,
     /// Monotonic ns at creation (for /proc).
     pub start_ns: u64,
 }
@@ -93,8 +105,22 @@ impl Process {
         }
     }
 
+    /// A live thread of the process (the oldest), if any.
     pub fn thread(&self) -> Option<Arc<Task>> {
-        self.thread.lock().upgrade()
+        self.threads.lock().iter().find_map(|w| w.upgrade())
+    }
+
+    /// Every live thread.
+    pub fn threads(&self) -> Vec<Arc<Task>> {
+        self.threads
+            .lock()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .collect()
+    }
+
+    pub fn thread_count(&self) -> usize {
+        self.threads.lock().len()
     }
 
     pub fn pgid(&self) -> u32 {
@@ -127,6 +153,15 @@ pub fn all() -> Vec<Arc<Process>> {
     TABLE.lock().values().cloned().collect()
 }
 
+/// The thread with id `tid`, in any process.
+pub fn find_thread(tid: u32) -> Option<Arc<Task>> {
+    all().iter().find_map(|p| {
+        p.threads()
+            .into_iter()
+            .find(|t| t.user().is_some_and(|u| u.tid == tid))
+    })
+}
+
 /// The per-thread state of a user thread.
 pub struct UserThread {
     pub process: Arc<Process>,
@@ -146,6 +181,9 @@ pub struct UserThread {
     pending_exit: AtomicI32,
     /// Completed when a `vfork` child execs or exits.
     vfork_done: SpinLock<Option<Arc<Completion>>>,
+    /// Exiting ends only this thread (`exit`, or killed by another
+    /// thread's `exit_group` or `execve`), not the whole group.
+    thread_only: AtomicBool,
 }
 
 unsafe impl Sync for UserThread {}
@@ -169,6 +207,12 @@ impl UserThread {
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
+    }
+
+    /// Makes the thread (alone) exit when the current system call returns.
+    pub fn request_thread_exit(&self, status: i32) {
+        self.thread_only.store(true, Ordering::Relaxed);
+        self.request_exit(status);
     }
 
     pub fn take_pending_exit(&self) -> Option<i32> {
@@ -265,7 +309,10 @@ fn new_process(
         stop_wait: WaitQueue::new(),
         exit_signal: signo::SIGCHLD,
         has_ctty: AtomicBool::new(false),
-        thread: SpinLock::new(Weak::new()),
+        threads: SpinLock::new(Vec::new()),
+        thread_exit_wait: WaitQueue::new(),
+        group_exit: AtomicI32::new(NO_EXIT),
+        shared_sig: signal::SigQueue::default(),
         start_ns: crate::time::monotonic_ns(),
     }
 }
@@ -284,7 +331,23 @@ fn new_thread(process: Arc<Process>, mm: Arc<AddressSpace>) -> UserThread {
         fpu: UnsafeCell::new(FxArea::initial()),
         pending_exit: AtomicI32::new(NO_EXIT),
         vfork_done: SpinLock::new(None),
+        thread_only: AtomicBool::new(false),
     }
+}
+
+/// Starts `thread` (of `p`) with `frame`, adding it to the process's
+/// threads first. Fails if the group is exiting.
+fn start_thread(p: &Arc<Process>, thread: UserThread, frame: TrapFrame) -> KResult<Arc<Task>> {
+    let task = task::new_user(thread, frame);
+    {
+        let mut threads = p.threads.lock();
+        if p.group_exit.load(Ordering::Relaxed) != NO_EXIT {
+            return Err(Errno::EAGAIN);
+        }
+        threads.push(Arc::downgrade(&task));
+    }
+    task::start(task.clone());
+    Ok(task)
 }
 
 /// Starts the program at `path` as a new process (a new session and
@@ -317,9 +380,7 @@ pub fn spawn(
     let frame = initial_frame(image.entry, image.rsp);
     let thread = new_thread(process.clone(), mm);
     TABLE.lock().insert(pid, process.clone());
-    let task = task::spawn_user(thread, frame);
-    *process.thread.lock() = Arc::downgrade(&task);
-    Ok(task)
+    start_thread(&process, thread, frame)
 }
 
 /// `clone` flags (sched.h).
@@ -332,6 +393,7 @@ pub mod clone_flags {
     pub const CLONE_VFORK: u64 = 0x4000;
     pub const CLONE_PARENT: u64 = 0x8000;
     pub const CLONE_THREAD: u64 = 0x10000;
+    pub const CLONE_SYSVSEM: u64 = 0x40000;
     pub const CLONE_SETTLS: u64 = 0x80000;
     pub const CLONE_PARENT_SETTID: u64 = 0x100000;
     pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
@@ -340,9 +402,9 @@ pub mod clone_flags {
     pub const UNSUPPORTED: u64 = 0x7e02_0000 | 0x2000_0000;
 }
 
-/// `fork`, `vfork` and `clone` (processes, not threads yet). `frame` is the
-/// parent's saved user state; the child resumes from a copy of it with
-/// RAX = 0. Returns the child's pid.
+/// `fork`, `vfork` and `clone`. `frame` is the parent's saved user state;
+/// the child resumes from a copy of it with RAX = 0. Returns the child's
+/// pid (or tid, for a thread).
 pub fn clone(
     t: &UserThread,
     frame: &TrapFrame,
@@ -353,12 +415,14 @@ pub fn clone(
     tls: u64,
 ) -> KResult<u32> {
     use clone_flags::*;
-    if flags & CLONE_THREAD != 0 {
-        // Threads come with glibc support in Phase 5.
-        return Err(Errno::ENOSYS);
-    }
     if flags & UNSUPPORTED != 0 || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0) {
         return Err(Errno::EINVAL);
+    }
+    if flags & CLONE_THREAD != 0 {
+        if flags & CLONE_SIGHAND == 0 {
+            return Err(Errno::EINVAL);
+        }
+        return clone_thread(t, frame, flags, stack, ptid, ctid, tls);
     }
     let parent = &t.process;
     let parent_mm = t.mm();
@@ -424,14 +488,101 @@ pub fn clone(
         p.children.lock().push(child.clone());
     }
     TABLE.lock().insert(pid, child.clone());
-    let task = task::spawn_user(thread, child_frame);
-    *child.thread.lock() = Arc::downgrade(&task);
+    let task = start_thread(&child, thread, child_frame)?;
     drop(task);
     if let Some(done) = vfork {
         // The child borrows our memory until it execs or exits.
         done.wait();
     }
     Ok(pid)
+}
+
+/// `clone(CLONE_THREAD | CLONE_VM | CLONE_SIGHAND ...)`: a new thread of
+/// the caller's process.
+fn clone_thread(
+    t: &UserThread,
+    frame: &TrapFrame,
+    flags: u64,
+    stack: u64,
+    ptid: u64,
+    ctid: u64,
+    tls: u64,
+) -> KResult<u32> {
+    use clone_flags::*;
+    let p = &t.process;
+    let mm = t.mm();
+    let tid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let mut thread = new_thread(p.clone(), mm.clone());
+    thread.tid = tid;
+    thread.fs_base.store(
+        if flags & CLONE_SETTLS != 0 {
+            tls
+        } else {
+            t.fs_base.load(Ordering::Relaxed)
+        },
+        Ordering::Relaxed,
+    );
+    thread
+        .gs_base
+        .store(t.gs_base.load(Ordering::Relaxed), Ordering::Relaxed);
+    // The signal mask is inherited; the alternate stack is not.
+    thread.sig.set_mask(t.sig.mask.load(Ordering::Relaxed));
+    x86::fxsave(unsafe { &mut *thread.fpu.get() });
+    if flags & CLONE_CHILD_CLEARTID != 0 {
+        thread.clear_child_tid.store(ctid, Ordering::Relaxed);
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
+        mm.write(ctid, &tid)?;
+    }
+    if flags & CLONE_PARENT_SETTID != 0 {
+        mm.write(ptid, &tid)?;
+    }
+    let mut child_frame = *frame;
+    child_frame.rax = 0;
+    if stack != 0 {
+        child_frame.rsp = stack;
+    }
+    start_thread(p, thread, child_frame)?;
+    Ok(tid)
+}
+
+/// Kills every thread of the current process but the caller and waits
+/// until they are gone (`execve` from a multithreaded program). Fails if
+/// the caller itself is killed meanwhile (another thread's `exit_group`).
+pub fn kill_other_threads() -> KResult<()> {
+    let me = current();
+    let p = me.user().unwrap().process.clone();
+    let others: Vec<_> = p
+        .threads()
+        .into_iter()
+        .filter(|t| !Arc::ptr_eq(t, &me))
+        .collect();
+    if others.is_empty() {
+        return Ok(());
+    }
+    others.iter().for_each(kill_thread);
+    drop(others);
+    p.thread_exit_wait.wait_until(|| {
+        signal::kill_pending()
+            || p.threads
+                .lock()
+                .iter()
+                .all(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(&me)))
+    });
+    if signal::kill_pending() {
+        return Err(Errno::EINTR);
+    }
+    Ok(())
+}
+
+/// Makes thread `t` exit (alone) as soon as it can.
+fn kill_thread(t: &Arc<Task>) {
+    if let Some(u) = t.user() {
+        u.thread_only.store(true, Ordering::Relaxed);
+        u.sig.q.post(signo::SIGKILL, signal::SigInfo::kernel());
+        core::sync::atomic::fence(Ordering::SeqCst);
+        task::kick(t);
+    }
 }
 
 /// Swaps the per-thread CPU state that `switch_context` does not: the
@@ -474,16 +625,57 @@ pub fn current() -> Arc<Task> {
     t
 }
 
-/// Ends the current process with wait status `status` (exit code << 8, or
-/// the signal number).
+/// Ends the current thread's process with wait status `status` (exit code
+/// << 8, or the signal number): every thread exits (`exit_group`, fatal
+/// signals). A thread asked to exit alone (`exit`, or killed by another
+/// thread) ends only itself.
 pub fn exit(status: i32) -> ! {
     {
         let task = current();
         let u = task.user().unwrap();
         let p = &u.process;
-        // Close every file.
-        let files = core::mem::take(&mut *p.files.lock());
-        drop(files);
+        if !u.thread_only.load(Ordering::Relaxed)
+            && p.group_exit
+                .compare_exchange(NO_EXIT, status, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            for t in p.threads() {
+                if !Arc::ptr_eq(&t, &task) {
+                    kill_thread(&t);
+                }
+            }
+        }
+    }
+    exit_thread(status)
+}
+
+/// Ends the current thread. The last thread of a process ends the process.
+fn exit_thread(status: i32) -> ! {
+    {
+        let task = current();
+        let u = task.user().unwrap();
+        let p = u.process.clone();
+        let mm = u.mm.lock().clone();
+        if let Some(mm) = &mm {
+            futex::exit_robust_list(mm, u.robust_list.load(Ordering::Relaxed), u.tid);
+            // pthread_join waits for this word to become 0.
+            let ctid = u.clear_child_tid.swap(0, Ordering::Relaxed);
+            if ctid != 0 && mm.write(ctid, &0u32).is_ok() {
+                futex::wake_address(mm, ctid, 1);
+            }
+        }
+        drop(mm);
+        u.release_vfork_parent();
+        let last = {
+            let mut threads = p.threads.lock();
+            threads.retain(|w| !core::ptr::eq(w.as_ptr(), Arc::as_ptr(&task)));
+            threads.is_empty()
+        };
+        if last {
+            // Close every file.
+            let files = core::mem::take(&mut *p.files.lock());
+            drop(files);
+        }
         // Leave the address space before dropping it.
         x86::without_interrupts(|| {
             let kernel = paging::kernel_pml4();
@@ -492,52 +684,66 @@ pub fn exit(status: i32) -> ! {
         });
         let mm = u.mm.lock().take();
         drop(mm);
-        u.release_vfork_parent();
-        // Orphans go to init.
-        let orphans = core::mem::take(&mut *p.children.lock());
-        if !orphans.is_empty() {
-            if let Some(init) = lookup(1).filter(|i| i.pid != p.pid) {
-                let mut any_zombie = false;
-                for c in &orphans {
-                    c.ppid.store(1, Ordering::Relaxed);
-                    any_zombie |= c.exit_status().is_some();
-                }
-                init.children.lock().extend(orphans);
-                if any_zombie {
-                    init.child_events.fetch_add(1, Ordering::Release);
-                    init.child_wait.wake_all();
-                }
-            } else {
-                for c in orphans {
-                    c.ppid.store(0, Ordering::Relaxed);
-                    if c.exit_status().is_some() {
-                        TABLE.lock().remove(&c.pid);
-                    }
-                }
-            }
-        }
-        *p.state.lock() = RunState::Zombie(status);
-        let parent = lookup(p.ppid.load(Ordering::Relaxed));
-        match parent {
-            Some(parent) => {
-                let auto_reap = signal::parent_ignores_children(&parent);
-                if p.exit_signal != 0 {
-                    signal::send(&parent, p.exit_signal, signal::SigInfo::child(p, status));
-                }
-                if auto_reap {
-                    parent.children.lock().retain(|c| c.pid != p.pid);
-                    TABLE.lock().remove(&p.pid);
-                }
-                p.notify_parent();
-            }
-            // Started by the kernel: nobody will reap it but the kernel's
-            // `join`; keep the status readable through the Arc.
-            None => {
-                TABLE.lock().remove(&p.pid);
-            }
+        p.thread_exit_wait.wake_all();
+        if last {
+            let group = p.group_exit.load(Ordering::Acquire);
+            end_process(&p, if group != NO_EXIT { group } else { status });
+        } else if u.tid == p.pid {
+            // The group leader stays until the whole group has gone (a
+            // parent, or the kernel's `join`, waits for the process).
+            p.thread_exit_wait
+                .wait_until(|| matches!(p.state(), RunState::Zombie(_)));
         }
     }
     task::exit()
+}
+
+/// The last thread of `p` has exited: it becomes a zombie for its parent.
+fn end_process(p: &Arc<Process>, status: i32) {
+    // Orphans go to init.
+    let orphans = core::mem::take(&mut *p.children.lock());
+    if !orphans.is_empty() {
+        if let Some(init) = lookup(1).filter(|i| i.pid != p.pid) {
+            let mut any_zombie = false;
+            for c in &orphans {
+                c.ppid.store(1, Ordering::Relaxed);
+                any_zombie |= c.exit_status().is_some();
+            }
+            init.children.lock().extend(orphans);
+            if any_zombie {
+                init.child_events.fetch_add(1, Ordering::Release);
+                init.child_wait.wake_all();
+            }
+        } else {
+            for c in orphans {
+                c.ppid.store(0, Ordering::Relaxed);
+                if c.exit_status().is_some() {
+                    TABLE.lock().remove(&c.pid);
+                }
+            }
+        }
+    }
+    *p.state.lock() = RunState::Zombie(status);
+    p.thread_exit_wait.wake_all();
+    let parent = lookup(p.ppid.load(Ordering::Relaxed));
+    match parent {
+        Some(parent) => {
+            let auto_reap = signal::parent_ignores_children(&parent);
+            if p.exit_signal != 0 {
+                signal::send(&parent, p.exit_signal, signal::SigInfo::child(p, status));
+            }
+            if auto_reap {
+                parent.children.lock().retain(|c| c.pid != p.pid);
+                TABLE.lock().remove(&p.pid);
+            }
+            p.notify_parent();
+        }
+        // Started by the kernel: nobody will reap it but the kernel's
+        // `join`; keep the status readable through the Arc.
+        None => {
+            TABLE.lock().remove(&p.pid);
+        }
+    }
 }
 
 /// `wait4` options.

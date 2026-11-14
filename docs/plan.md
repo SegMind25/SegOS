@@ -1,15 +1,15 @@
 # SegOS: a from-scratch operating system in Rust (plan)
 
-Status: **Phase 4 done**. SegOS boots on UEFI with its own bootloader,
-segboot, starts every CPU, finds its disks (virtio, NVMe, SATA), and
-mounts a **read-write ext4 root file system** from disk, on which
-Ubuntu's statically linked BusyBox runs unmodified as an interactive
-shell. FAT32, mounts, a block cache and a page cache with shared file
-mappings are in; Linux's `e2fsck` passes what SegOS writes. Four
-conformance tests print byte for byte what they print on Linux; 26
-kernel tests pass in QEMU on 4 CPUs (debug and release); CI also types
-commands into the shell over the serial port. No third-party crates.
-Next: Phase 5, the full (glibc, dynamically linked) Linux userland.
+Status: **Phase 5 done**. SegOS boots on UEFI with its own bootloader,
+segboot, finds its disks (virtio, NVMe, SATA; interrupt-driven), mounts a
+read-write ext4 root from disk, and runs **unmodified, dynamically linked
+Linux programs**: Ubuntu's bash, GNU coreutils, Python 3.13 (threads
+included) and gcc, which compiles a C program on SegOS that then runs.
+Threads, futexes, epoll, eventfd, timerfd and signalfd are in. Six
+conformance tests print byte for byte what they print on Linux; 26 kernel
+tests pass in QEMU on 4 CPUs (debug and release); CI types commands into
+the shell, bash, python3 and gcc over the serial port. No third-party
+crates. Next: Phase 6, networking.
 
 ## 1. The goal, stated precisely
 
@@ -300,26 +300,51 @@ same tree as the initramfs) and every test run boots from it.
   coherence), recorded on Linux like the others; the kernel tests and the
   serial-port shell session now run on the ext4 root.
 
-## 11. Next concrete steps (Phase 5: the full Linux userland)
+## 11. Phase 5, as built
 
-The demo: an unmodified Debian or Artix root (glibc, dynamically linked)
-boots from disk; bash, coreutils, python3 and gcc work, and gcc compiles
-and runs a program on SegOS.
+The demo: Ubuntu's own bash, coreutils, Python and gcc, dynamically
+linked against glibc and unmodified, run on SegOS from its ext4 root; gcc
+compiles and links a program there, and it runs. `cargo xtask` copies the
+packages (and every library `ldd` finds) from the build machine onto the
+root disk; they are guest software on the test disk, not part of SegOS.
 
-1. **Dynamic linking**: `PT_INTERP`, loading `ld-linux-x86-64.so.2`,
-   file-backed private mappings paged in on demand from the page cache
-   (instead of copied at `mmap`).
-2. **Threads**: `clone` with `CLONE_THREAD | CLONE_VM | CLONE_SETTLS |
-   CLONE_CHILD_CLEARTID…`, thread groups, `exit_group`, `set_robust_list`,
-   a complete `futex` (wait, wake, requeue, bitset, PI later), `tgkill`.
-3. **Event interfaces**: `epoll`, `eventfd`, `timerfd`, `signalfd`,
-   `inotify` (enough for coreutils and python).
-4. **Files and processes**: `openat2`, `statx`, `getdents64` on every
-   file system, `*xattr` (ext4 user/security attributes), `fallocate`,
-   per-process root (`chroot`, `pivot_root`), resource limits, `/proc`
-   and `/sys` files glibc and python read.
-5. **Interrupt-driven I/O**: MSI-X for NVMe and virtio, several requests
-   in flight, so disk waits sleep instead of polling.
-6. **Tests**: conformance tests for threads and futexes recorded on Linux,
-   and a CI boot of a glibc root that runs a script with bash, python3
-   and gcc.
+- **Dynamic linking** (`proc/elf.rs`, `proc/exec.rs`): the program's
+  `PT_INTERP` (`ld-linux-x86-64.so.2`) is loaded below the mmap area and
+  started with `AT_BASE`/`AT_ENTRY`/`AT_PHDR`; glibc's loader does the rest.
+- **Threads** (`proc/`): a process is a thread group; `clone` with
+  `CLONE_THREAD` and the flags glibc and musl pass, TLS, set/clear tid,
+  robust lists, `exit` per thread and `exit_group`, `execve` from a
+  threaded process, process- and thread-directed signals (`tgkill`),
+  `rt_sigtimedwait`, `/proc/<pid>/task`.
+- **futex** (`proc/futex.rs`): wait/wake with exact counts, bitsets,
+  requeue, WAKE_OP, absolute and relative timeouts, shared futexes keyed
+  by physical page (PI later).
+- **Event descriptors** (`fs/event.rs`): epoll (level, edge, one-shot,
+  nested), eventfd, timerfd, signalfd, and inotify descriptors that never
+  report (yet).
+- **Interrupt-driven disks** (`drivers/msi.rs`): virtio-blk and NVMe
+  complete through MSI-X; waiting threads sleep. Python starts in 1.4 s
+  instead of 3.3 s.
+- **Smaller**: `statx`, extended-attribute calls answering as a file
+  system without attributes, sockets refused as on a Linux without
+  networking, a minimal `/sys` (CPU counts), `getcpu`.
+- **Tests**: `userland/tests/threads.c` (86 checks) and `events.c` (129),
+  recorded on Linux; the shell session runs bash, GNU `seq`, python3 (an
+  8-thread pool) and gcc.
+
+## 12. Next concrete steps (Phase 6: networking)
+
+The demo: `curl https://…` and `ssh` work on SegOS (QEMU's virtio-net and
+Intel e1000, then a real PC's network card).
+
+1. **Network drivers**: virtio-net first, then e1000/e1000e; MSI-X.
+2. **A TCP/IP stack in Rust**: Ethernet, ARP, IPv4 (then IPv6), ICMP,
+   UDP, TCP with retransmission, windows and congestion control; DHCP.
+3. **Sockets**: `socket`, `bind`, `listen`, `accept4`, `connect`,
+   `send*`/`recv*`, `shutdown`, socket options, `poll`/`epoll` on sockets;
+   Unix domain sockets with `SCM_RIGHTS`; `socketpair`.
+4. **Netlink** (route and link messages) so `ip` and glibc's
+   `getaddrinfo`/`getifaddrs` work; `/etc/resolv.conf` and DNS through
+   glibc.
+5. **Tests**: socket conformance tests recorded on Linux, and a CI run
+   that fetches a page from a server on the host with `curl`.

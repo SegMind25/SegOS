@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Roadmap: SegOS</title>
-  <meta name="description" content="The SegOS roadmap: 11 phases from kernel bring-up to running Steam and Proton games on a from-scratch Rust kernel that implements the Linux ABI. Phases 0 to 4 are done: SegOS boots from an ext4 disk and runs Ubuntu's BusyBox unmodified. Phase 5, the full Linux userland, is next.">
+  <meta name="description" content="The SegOS roadmap: 11 phases from kernel bring-up to running Steam and Proton games on a from-scratch Rust kernel that implements the Linux ABI. Phases 0 to 5 are done: unmodified bash, coreutils, Python and gcc run on SegOS. Phase 6, networking, is next.">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f7f5f1" media="(prefers-color-scheme: light)">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="SegOS">
   <meta property="og:title" content="SegOS roadmap: from bring-up to Steam">
-  <meta property="og:description" content="11 phases, each ending in a working demo. Phases 0 to 4 done: bring-up, multitasking, the first Linux program, a shell, and real disks. Phase 5, the full Linux userland, next.">
+  <meta property="og:description" content="11 phases, each ending in a working demo. Phases 0 to 5 done: bring-up to real disks and the full Linux userland (bash, Python, gcc). Phase 6, networking, next.">
   <meta property="og:image" content="/assets/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -51,10 +51,10 @@
         </p>
       </section>
 
-      <div class="progress" role="img" aria-label="Progress: phases 0 to 4 done, phase 5 next, phases 6 to 10 planned">
-        <span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="wip"></span><span></span><span></span><span></span><span></span><span></span>
+      <div class="progress" role="img" aria-label="Progress: phases 0 to 5 done, phase 6 next, phases 7 to 10 planned">
+        <span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="wip"></span><span></span><span></span><span></span><span></span>
       </div>
-      <p class="progress-legend">Phases 0&ndash;4 done &middot; Phase 5 next &middot; Phases 6&ndash;10 planned</p>
+      <p class="progress-legend">Phases 0&ndash;5 done &middot; Phase 6 next &middot; Phases 7&ndash;10 planned</p>
 
       <div class="table-wrap">
         <table class="phases">
@@ -104,19 +104,19 @@
               <td data-label="Effort" class="effort">2&ndash;3 months</td>
               <td class="status"><span class="badge done">Done</span></td>
             </tr>
-            <tr class="is-wip">
+            <tr class="is-done">
               <th scope="row"><span class="num">5</span> glibc and dynamic linking</th>
               <td data-label="What gets built"><code>ld-linux.so</code>, threads (<code>clone</code> flags, TLS, <code>futex</code>, <code>set_robust_list</code>), <code>epoll</code>, <code>eventfd</code>, <code>timerfd</code>, <code>signalfd</code>, <code>poll</code>/<code>select</code>, <code>/proc/self/*</code></td>
               <td data-label="Done when">Unmodified Debian/Artix userland: bash, coreutils, python3, gcc compiling a program</td>
               <td data-label="Effort" class="effort">3&ndash;4 months</td>
-              <td class="status"><span class="badge wip">Next</span></td>
+              <td class="status"><span class="badge done">Done</span></td>
             </tr>
-            <tr>
+            <tr class="is-wip">
               <th scope="row"><span class="num">6</span> Networking</th>
               <td data-label="What gets built">virtio-net, e1000, TCP/IP (smoltcp, later own), unix sockets incl. <code>SCM_RIGHTS</code>, netlink (route, uevent)</td>
               <td data-label="Done when"><code>curl https://&hellip;</code> and <code>ssh</code> work</td>
               <td data-label="Effort" class="effort">2&ndash;3 months</td>
-              <td class="status"><span class="badge planned">Planned</span></td>
+              <td class="status"><span class="badge wip">Next</span></td>
             </tr>
             <tr>
               <th scope="row"><span class="num">7</span> Graphics and input</th>

@@ -1,0 +1,129 @@
+# eventfd
+ok   fd >= 0
+ok   fcntl(fd, F_GETFD) == FD_CLOEXEC
+ok   revents(fd, POLLIN | POLLOUT) == (POLLIN | POLLOUT)
+ok   rd64(fd) == 3
+ok   revents(fd, POLLIN | POLLOUT) == POLLOUT
+ok   wr64(fd, 5) && wr64(fd, 2)
+ok   rd64(fd) == 7
+ok   read(fd, small, 4) == -1 && errno == EINVAL
+ok   write(fd, &big, 8) == -1 && errno == EINVAL
+ok   fstat(fd, &st) == 0
+ok   rd64(fd) == 9
+ok   fd >= 0 && (fcntl(fd, F_GETFL) & O_NONBLOCK)
+ok   read(fd, &v, 8) == -1 && errno == EAGAIN
+ok   wr64(fd, UINT64_MAX - 1)
+ok   write(fd, &(uint64_t){ 1 }, 8) == -1 && errno == EAGAIN
+ok   revents(fd, POLLIN | POLLOUT) == POLLIN
+ok   rd64(fd) == UINT64_MAX - 1
+# eventfd semaphore
+ok   rd64(fd) == 1 && rd64(fd) == 1 && rd64(fd) == 1
+ok   read(fd, &v, 8) == -1 && errno == EAGAIN
+ok   wr64(fd, 2) && rd64(fd) == 1 && rd64(fd) == 1
+ok   eventfd(0, 0x1000) == -1 && errno == EINVAL
+# timerfd
+ok   fd >= 0
+ok   timerfd_gettime(fd, &old) == 0 && old.it_value.tv_sec == 0 && old.it_value.tv_nsec == 0
+ok   revents(fd, POLLIN) == 0
+ok   timerfd_settime(fd, 0, &its, NULL) == 0
+ok   timerfd_gettime(fd, &old) == 0 && old.it_value.tv_sec == 0 && old.it_value.tv_nsec > 0 && old.it_value.tv_nsec <= 30000000L
+ok   rd64(fd) == 1
+ok   timerfd_gettime(fd, &old) == 0 && old.it_value.tv_nsec == 0
+ok   timerfd_settime(fd, 0, &its, NULL) == 0
+ok   rd64(fd) >= 1
+ok   revents(fd, POLLIN) == POLLIN
+ok   n >= 3 && n <= 7
+ok   timerfd_gettime(fd, &old) == 0 && old.it_interval.tv_nsec == 20000000L
+ok   timerfd_settime(fd, 0, &zero, &old) == 0 && old.it_interval.tv_nsec == 20000000L
+ok   timerfd_gettime(fd, &old) == 0 && old.it_value.tv_nsec == 0 && old.it_interval.tv_nsec == 0
+ok   fcntl(fd, F_SETFL, O_NONBLOCK) == 0
+ok   read(fd, &v, 8) == -1 && errno == EAGAIN
+ok   fd >= 0
+ok   timerfd_settime(fd, TFD_TIMER_ABSTIME, &its, NULL) == 0
+ok   read(fd, &v, 8) == -1 && errno == EAGAIN
+ok   poll(&p, 1, 2000) == 1 && p.revents == POLLIN
+ok   rd64(fd) == 1
+ok   timerfd_settime(fd, TFD_TIMER_ABSTIME, &its, NULL) == 0
+ok   rd64(fd) == 1
+ok   timerfd_create(12345, 0) == -1 && errno == EINVAL
+ok   timerfd_settime(0, 0, &its, NULL) == -1 && errno == EINVAL
+# signalfd
+ok   fd >= 0
+ok   read(fd, &si, sizeof si) == -1 && errno == EAGAIN
+ok   revents(fd, POLLIN) == 0
+ok   kill(getpid(), SIGUSR1) == 0
+ok   revents(fd, POLLIN) == POLLIN
+ok   read(fd, &si, sizeof si) == sizeof si
+ok   si.ssi_signo == SIGUSR1 && si.ssi_code == SI_USER && si.ssi_pid == (uint32_t)getpid()
+ok   read(fd, &si, sizeof si) == -1 && errno == EAGAIN
+ok   syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGUSR1) == 0
+ok   read(fd, &si, sizeof si) == sizeof si
+ok   si.ssi_signo == SIGUSR1 && si.ssi_code == SI_TKILL
+ok   read(fd, small, sizeof small) == -1 && errno == EINVAL
+ok   poll(&pf, 1, 5000) == 1
+ok   read(fd, &si, sizeof si) == sizeof si
+ok   si.ssi_signo == SIGCHLD && si.ssi_code == CLD_EXITED && si.ssi_status == 7 && si.ssi_pid == (uint32_t)p
+ok   signalfd(fd, &only_usr2, 0) == fd
+ok   read(fd, &si, sizeof si) == -1 && errno == EAGAIN
+ok   signalfd(fd, &set, 0) == fd
+ok   read(fd, &si, sizeof si) == sizeof si && si.ssi_signo == SIGUSR1
+ok   signalfd(notsfd, &set, 0) == -1 && errno == EINVAL
+# epoll
+ok   ep >= 0
+ok   epoll_create1(0x1234) == -1 && errno == EINVAL
+ok   epoll_create(0) == -1 && errno == EINVAL
+ok   add(ep, pfd[0], EPOLLIN, 1) == 0
+ok   add(ep, efd, EPOLLIN, 2) == 0
+ok   add(ep, tfd, EPOLLIN, 3) == 0
+ok   add(ep, efd, EPOLLIN, 2) == -1 && errno == EEXIST
+ok   add(ep, ep, EPOLLIN, 9) == -1 && errno == EINVAL
+ok   add(ep, reg, EPOLLIN, 9) == -1 && errno == EPERM
+ok   epoll_ctl(ep, EPOLL_CTL_DEL, pfd[1], NULL) == -1 && errno == ENOENT
+ok   mod(ep, pfd[1], EPOLLOUT, 9) == -1 && errno == ENOENT
+ok   epoll_wait(ep, evs, 8, 0) == 0
+ok   epoll_wait(ep, evs, 0, 0) == -1 && errno == EINVAL
+ok   wait_sorted(ep, 0) == 1 && evs[0].data.u64 == 1 && evs[0].events == EPOLLIN
+ok   wait_sorted(ep, 0) == 1
+ok   wait_sorted(ep, 0) == 2 && evs[0].data.u64 == 1 && evs[1].data.u64 == 2
+ok   wait_sorted(ep, 0) == 0
+ok   wait_sorted(ep, 5000) == 1 && evs[0].data.u64 == 3
+ok   rd64(tfd) == 1
+ok   wait_sorted(ep, 5000) == 1 && evs[0].data.u64 == 2
+ok   epoll_wait(ep, evs, 8, 30) == 0
+ok   syscall(SYS_epoll_pwait2, ep, evs, 8, &ts, NULL, 8) == 0
+ok   epoll_pwait(ep, evs, 8, 10, &mask) == 0
+# epoll edge-triggered and one-shot
+ok   mod(ep, pfd[0], EPOLLIN | EPOLLET, 1) == 0
+ok   wait_sorted(ep, 0) == 1 && evs[0].data.u64 == 1
+ok   wait_sorted(ep, 0) == 0
+ok   wait_sorted(ep, 0) == 1 && evs[0].data.u64 == 1
+ok   mod(ep, efd, EPOLLIN | EPOLLONESHOT, 22) == 0
+ok   wait_sorted(ep, 0) == 1 && evs[0].data.u64 == 22
+ok   wait_sorted(ep, 0) == 0
+ok   mod(ep, efd, EPOLLIN | EPOLLONESHOT, 23) == 0
+ok   wait_sorted(ep, 0) == 1 && evs[0].data.u64 == 23
+ok   wait_sorted(ep, 0) == 0
+# epoll nesting, hang-up and close
+ok   add(outer, ep, EPOLLIN, 100) == 0
+ok   add(ep, outer, EPOLLIN, 101) == -1 && errno == ELOOP
+ok   epoll_wait(outer, evs, 8, 0) == 0
+ok   revents(ep, POLLIN) == 0
+ok   mod(ep, efd, EPOLLIN, 2) == 0
+ok   revents(ep, POLLIN) == POLLIN
+ok   epoll_wait(outer, evs, 8, 0) == 1 && evs[0].data.u64 == 100
+ok   epoll_wait(outer, evs, 8, 0) == 0
+ok   epoll_ctl(ep, EPOLL_CTL_DEL, efd, NULL) == 0
+ok   wait_sorted(ep, 0) == 0
+ok   mod(ep, pfd[0], EPOLLIN, 1) == 0
+ok   wait_sorted(ep, 0) == 1 && evs[0].events == EPOLLHUP
+ok   wait_sorted(ep, 0) == 0
+ok   add(ep, pfd[1], EPOLLOUT, 7) == 0
+ok   wait_sorted(ep, 0) == 1 && evs[0].events == EPOLLOUT && evs[0].data.u64 == 7
+ok   wait_sorted(ep, 0) == 1 && evs[0].events == (EPOLLOUT | EPOLLERR)
+# inotify
+ok   fd >= 0
+ok   inotify_add_watch(fd, "/proc", IN_CREATE) >= 1
+ok   inotify_add_watch(fd, "/no/such/dir", IN_CREATE) == -1 && errno == ENOENT
+ok   read(fd, buf, sizeof buf) == -1 && errno == EAGAIN
+ok   revents(fd, POLLIN) == 0
+PASSED

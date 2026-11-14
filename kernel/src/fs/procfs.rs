@@ -341,7 +341,7 @@ fn pid_stat(p: &Process) -> String {
         .and_then(|t| t.user().map(|u| u.mm()))
         .map_or(0, |mm| mm.regions().iter().map(|v| v.end - v.start).sum());
     format!(
-        "{} ({}) {} {} {} {} {tty} -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 {start} {vsize} 0 \
+        "{} ({}) {} {} {} {} {tty} -1 4194304 0 0 0 0 0 0 0 0 20 0 {threads} 0 {start} {vsize} 0 \
          18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         p.pid,
         p.name.lock().as_str(),
@@ -349,6 +349,7 @@ fn pid_stat(p: &Process) -> String {
         p.ppid.load(Ordering::Relaxed),
         p.pgid(),
         p.sid(),
+        threads = p.thread_count().max(1),
     )
 }
 
@@ -361,16 +362,20 @@ fn pid_status(p: &Process) -> String {
     };
     format!(
         "Name:\t{}\nUmask:\t{:04o}\nState:\t{state}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{}\n\
-         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\n",
+         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t{}\n",
         p.name.lock().as_str(),
         p.umask.load(Ordering::Relaxed),
         p.ppid.load(Ordering::Relaxed),
+        p.thread_count().max(1),
         pid = p.pid,
     )
 }
 
 /// What `/proc/<pid>/fd/<n>` points to.
 fn fd_target(f: &super::File) -> String {
+    if let Some(name) = f.inode.anon_name() {
+        return format!("anon_inode:{name}");
+    }
     match f.inode.file_type() {
         FileType::Fifo => format!("pipe:[{}]", f.inode.ino()),
         FileType::CharDevice => {
@@ -427,6 +432,68 @@ fn pid_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
                 )))
             ),
             ("fd".into(), fd_dir(pid, me)),
+            ("task".into(), task_dir(pid, me)),
+        ]
+    })
+}
+
+/// The tids of `p`'s live threads.
+fn tids(p: &Process) -> Vec<u32> {
+    p.threads()
+        .iter()
+        .filter_map(|t| t.user().map(|u| u.tid))
+        .collect()
+}
+
+/// `/proc/<pid>/task`: a directory per thread.
+fn task_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
+    GenDir::create(ino_of(pid, 9), Arc::downgrade(parent), move |me| {
+        let Ok(p) = process(pid) else {
+            return Vec::new();
+        };
+        tids(&p)
+            .into_iter()
+            .map(|tid| (tid.to_string(), thread_dir(pid, tid, me)))
+            .collect()
+    })
+}
+
+/// `/proc/<pid>/task/<tid>`: the thread's stat, status and comm (the
+/// process's, with the thread's id).
+fn thread_dir(pid: u32, tid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
+    GenDir::create(ino_of(tid, 10), Arc::downgrade(parent), move |me| {
+        let alive = move || {
+            process(pid)
+                .ok()
+                .filter(|p| tids(p).contains(&tid) || tid == pid)
+        };
+        let replace_pid = move |text: String| {
+            // The first field of stat, and the Pid: line of status.
+            if let Some(rest) = text.strip_prefix(&format!("{pid} (")) {
+                format!("{tid} ({rest}")
+            } else {
+                text.replace(&format!("\nPid:\t{pid}\n"), &format!("\nPid:\t{tid}\n"))
+            }
+        };
+        alloc::vec![
+            (
+                "stat".into(),
+                file(ino_of(tid, 11), me, move || alive()
+                    .map(|p| replace_pid(pid_stat(&p)))
+                    .unwrap_or_default())
+            ),
+            (
+                "status".into(),
+                file(ino_of(tid, 12), me, move || alive()
+                    .map(|p| replace_pid(pid_status(&p)))
+                    .unwrap_or_default())
+            ),
+            (
+                "comm".into(),
+                file(ino_of(tid, 13), me, move || alive()
+                    .map(|p| format!("{}\n", p.name.lock().as_str()))
+                    .unwrap_or_default())
+            ),
         ]
     })
 }

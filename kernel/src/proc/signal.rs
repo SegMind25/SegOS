@@ -180,7 +180,7 @@ impl SigInfo {
         }
     }
 
-    fn to_bytes(self, sig: i32) -> [u8; 128] {
+    pub fn to_bytes(self, sig: i32) -> [u8; 128] {
         let mut b = [0u8; 128];
         b[0..4].copy_from_slice(&sig.to_le_bytes());
         b[8..12].copy_from_slice(&self.code.to_le_bytes());
@@ -190,15 +190,55 @@ impl SigInfo {
     }
 }
 
+/// Pending signals with their `siginfo`: a thread's own, or its
+/// process's shared set (process-directed signals, which whichever thread
+/// does not block them takes).
+#[derive(Default)]
+pub struct SigQueue {
+    pub pending: AtomicU64,
+    info: SpinLock<Vec<(i32, SigInfo)>>,
+}
+
+impl SigQueue {
+    /// Marks `sig` pending (standard signals do not queue: a second one
+    /// while the first is pending is merged into it).
+    pub fn post(&self, sig: i32, info: SigInfo) {
+        if self.pending.load(Ordering::Relaxed) & bit(sig) == 0 {
+            let mut infos = self.info.lock();
+            infos.retain(|(x, _)| *x != sig);
+            infos.push((sig, info));
+        }
+        self.pending.fetch_or(bit(sig), Ordering::SeqCst);
+    }
+
+    /// Takes `sig` if it is pending.
+    pub fn take(&self, sig: i32) -> Option<SigInfo> {
+        if self.pending.fetch_and(!bit(sig), Ordering::AcqRel) & bit(sig) == 0 {
+            return None;
+        }
+        let mut v = self.info.lock();
+        Some(match v.iter().position(|(s, _)| *s == sig) {
+            Some(i) => v.swap_remove(i).1,
+            None => SigInfo::kernel(),
+        })
+    }
+
+    /// Forgets the signals in `set`.
+    pub fn discard(&self, set: u64) {
+        self.pending.fetch_and(!set, Ordering::AcqRel);
+        self.info.lock().retain(|(s, _)| set & bit(*s) == 0);
+    }
+}
+
 /// A thread's signal state.
 #[derive(Default)]
 pub struct ThreadSignals {
-    pub pending: AtomicU64,
+    /// Signals sent to this thread (tgkill, faults).
+    pub q: SigQueue,
     pub mask: AtomicU64,
     /// The mask to restore after `sigsuspend`, if one is in progress.
     saved_mask: AtomicU64,
     has_saved: AtomicBool,
-    info: SpinLock<Vec<(i32, SigInfo)>>,
     /// sigaltstack: (sp, size, flags).
     pub altstack: SpinLock<(u64, u64, u32)>,
 }
@@ -210,10 +250,6 @@ impl ThreadSignals {
         self.mask
             .store(from.mask.load(Ordering::Relaxed), Ordering::Relaxed);
         *self.altstack.lock() = *from.altstack.lock();
-    }
-
-    fn deliverable(&self) -> u64 {
-        self.pending.load(Ordering::Acquire) & (!self.mask.load(Ordering::Relaxed) | UNBLOCKABLE)
     }
 
     pub fn set_mask(&self, mask: u64) {
@@ -228,11 +264,42 @@ impl ThreadSignals {
         self.set_mask(mask);
     }
 
-    fn take_info(&self, sig: i32) -> SigInfo {
-        let mut v = self.info.lock();
-        match v.iter().position(|(s, _)| *s == sig) {
-            Some(i) => v.swap_remove(i).1,
-            None => SigInfo::kernel(),
+    fn blocks(&self, sig: i32) -> bool {
+        self.mask.load(Ordering::Relaxed) & bit(sig) & !UNBLOCKABLE != 0
+    }
+}
+
+impl UserThread {
+    /// Signals pending for this thread: its own and its process's.
+    pub fn pending_signals(&self) -> u64 {
+        self.sig.q.pending.load(Ordering::Acquire)
+            | self.process.shared_sig.pending.load(Ordering::Acquire)
+    }
+
+    fn deliverable(&self) -> u64 {
+        self.pending_signals() & (!self.sig.mask.load(Ordering::Relaxed) | UNBLOCKABLE)
+    }
+
+    /// Takes the lowest pending signal in `set` (the thread's own first),
+    /// for delivery or `signalfd`.
+    pub fn dequeue_signal(&self, set: u64) -> Option<(i32, SigInfo)> {
+        loop {
+            let ready = self.pending_signals() & set;
+            if ready == 0 {
+                return None;
+            }
+            let sig = if ready & bit(SIGKILL) != 0 {
+                SIGKILL
+            } else {
+                ready.trailing_zeros() as i32 + 1
+            };
+            if let Some(i) = self.sig.q.take(sig) {
+                return Some((sig, i));
+            }
+            if let Some(i) = self.process.shared_sig.take(sig) {
+                return Some((sig, i));
+            }
+            // Another thread took a shared signal meanwhile: look again.
         }
     }
 }
@@ -241,14 +308,14 @@ impl ThreadSignals {
 /// early when it does).
 pub fn pending() -> bool {
     let t = crate::task::current();
-    t.user().is_some_and(|u| u.sig.deliverable() != 0)
+    t.user().is_some_and(|u| u.deliverable() != 0)
 }
 
 /// Whether SIGKILL is pending for the current thread.
 pub fn kill_pending() -> bool {
     let t = crate::task::current();
     t.user()
-        .is_some_and(|u| u.sig.pending.load(Ordering::Acquire) & bit(SIGKILL) != 0)
+        .is_some_and(|u| u.sig.q.pending.load(Ordering::Acquire) & bit(SIGKILL) != 0)
 }
 
 pub fn parent_ignores_children(parent: &Process) -> bool {
@@ -260,43 +327,85 @@ pub fn parent_ignores_stops(parent: &Process) -> bool {
     parent.sigactions.lock()[SIGCHLD as usize - 1].flags & SA_NOCLDSTOP != 0
 }
 
-/// Sends `sig` to process `p`. Safe from interrupt handlers (the terminal
-/// sends SIGINT from the keyboard interrupt): only spinlocks are taken.
+/// Sends `sig` to process `p` (any of its threads that does not block it
+/// takes it). Safe from interrupt handlers (the terminal sends SIGINT from
+/// the keyboard interrupt): only spinlocks are taken.
 pub fn send(p: &Arc<Process>, sig: i32, info: SigInfo) {
     if sig <= 0 || sig as usize > NSIG {
         return;
     }
-    let Some(task) = p.thread() else {
+    let threads = p.threads();
+    if threads.is_empty() {
         return; // a zombie
-    };
-    let Some(u) = task.user() else {
-        return;
-    };
-    let s = &u.sig;
+    }
+    let users = || threads.iter().filter_map(|t| t.user());
     if sig == SIGCONT {
-        s.pending.fetch_and(!STOP_SIGNALS, Ordering::Relaxed);
+        p.shared_sig.discard(STOP_SIGNALS);
+        users().for_each(|u| u.sig.q.discard(STOP_SIGNALS));
         continue_process(p);
     } else if bit(sig) & STOP_SIGNALS != 0 {
-        s.pending.fetch_and(!bit(SIGCONT), Ordering::Relaxed);
+        p.shared_sig.discard(bit(SIGCONT));
+        users().for_each(|u| u.sig.q.discard(bit(SIGCONT)));
     }
-    let act = p.sigactions.lock()[sig as usize - 1];
-    let blocked = s.mask.load(Ordering::Relaxed) & bit(sig) & !UNBLOCKABLE != 0;
-    if !blocked && sig != SIGKILL && sig != SIGSTOP && ignored(sig, &act) {
+    if sig == SIGKILL {
+        // Every thread dies.
+        users().for_each(|u| u.sig.q.post(SIGKILL, info));
+        fence(Ordering::SeqCst);
+        continue_process(p);
+        threads.iter().for_each(crate::task::kick);
         return;
     }
-    if s.pending.load(Ordering::Relaxed) & bit(sig) == 0 {
-        let mut infos = s.info.lock();
-        infos.retain(|(x, _)| *x != sig);
-        infos.push((sig, info));
+    let act = p.sigactions.lock()[sig as usize - 1];
+    let blocked = users().all(|u| u.sig.blocks(sig));
+    if !blocked && sig != SIGSTOP && ignored(sig, &act) {
+        return;
     }
-    s.pending.fetch_or(bit(sig), Ordering::SeqCst);
+    p.shared_sig.post(sig, info);
     // Pairs with the fence in WaitQueue::wait: the thread either sees the
     // signal before sleeping or is Blocked when we kick it.
     fence(Ordering::SeqCst);
-    if sig == SIGKILL {
-        continue_process(p);
+    for t in &threads {
+        if t.user().is_some_and(|u| !u.sig.blocks(sig)) {
+            crate::task::kick(t);
+        }
     }
-    crate::task::kick(&task);
+    // A signalfd may be waiting for it.
+    crate::fs::poll_notify();
+}
+
+/// Sends `sig` to one thread (`tgkill`, `pthread_kill`). Signals whose
+/// effect is on the whole process (kill, stop, continue) go to it.
+pub fn send_thread(task: &Arc<crate::task::Task>, sig: i32, info: SigInfo) {
+    if sig <= 0 || sig as usize > NSIG {
+        return;
+    }
+    let Some(u) = task.user() else {
+        return;
+    };
+    if matches!(sig, SIGKILL | SIGSTOP | SIGCONT) {
+        return send(&u.process, sig, info);
+    }
+    let act = u.process.sigactions.lock()[sig as usize - 1];
+    if !u.sig.blocks(sig) && ignored(sig, &act) {
+        return;
+    }
+    if bit(sig) & STOP_SIGNALS != 0 {
+        u.process.shared_sig.discard(bit(SIGCONT));
+    }
+    u.sig.q.post(sig, info);
+    fence(Ordering::SeqCst);
+    crate::task::kick(task);
+    crate::fs::poll_notify();
+}
+
+/// Discards `sig` wherever it is pending in `p` (it became ignored).
+pub fn discard(p: &Process, sig: i32) {
+    p.shared_sig.discard(bit(sig));
+    for t in p.threads() {
+        if let Some(u) = t.user() {
+            u.sig.q.discard(bit(sig));
+        }
+    }
 }
 
 /// Sends `sig` to every process in group `pgid`.
@@ -326,8 +435,7 @@ pub fn force(t: &UserThread, sig: i32, info: SigInfo) {
             t.sig.mask.fetch_and(!bit(sig), Ordering::Relaxed);
         }
     }
-    t.sig.info.lock().push((sig, info));
-    t.sig.pending.fetch_or(bit(sig), Ordering::SeqCst);
+    t.sig.q.post(sig, info);
 }
 
 const EFLAGS_DF: u64 = 1 << 10;
@@ -488,6 +596,7 @@ pub fn on_return_to_user(frame: &mut TrapFrame, syscall: Option<u64>) {
             Done,
             Exit(i32),
             Stop(Arc<Process>, i32),
+            Wait(Arc<Process>),
             Again,
         }
         let action = {
@@ -495,17 +604,12 @@ pub fn on_return_to_user(frame: &mut TrapFrame, syscall: Option<u64>) {
             let Some(u) = task.user() else {
                 return;
             };
-            let ready = u.sig.deliverable();
-            if ready == 0 {
-                Action::Done
-            } else {
-                let sig = if ready & bit(SIGKILL) != 0 {
-                    SIGKILL
-                } else {
-                    ready.trailing_zeros() as i32 + 1
-                };
-                u.sig.pending.fetch_and(!bit(sig), Ordering::AcqRel);
-                let info = u.sig.take_info(sig);
+            let stopped = matches!(u.process.state(), super::RunState::Stopped { .. });
+            let allowed = !u.sig.mask.load(Ordering::Relaxed) | UNBLOCKABLE;
+            if stopped && !kill_pending() {
+                // Another thread stopped the process: stop here too.
+                Action::Wait(u.process.clone())
+            } else if let Some((sig, info)) = u.dequeue_signal(allowed) {
                 let act = u.process.sigactions.lock()[sig as usize - 1];
                 if sig == SIGKILL {
                     Action::Exit(SIGKILL)
@@ -537,6 +641,8 @@ pub fn on_return_to_user(frame: &mut TrapFrame, syscall: Option<u64>) {
                         Err(_) => Action::Exit(SIGSEGV),
                     }
                 }
+            } else {
+                Action::Done
             }
         };
         match action {
@@ -544,6 +650,9 @@ pub fn on_return_to_user(frame: &mut TrapFrame, syscall: Option<u64>) {
             Action::Again => continue,
             Action::Exit(status) => super::exit(status),
             Action::Stop(p, sig) => stop_self(&p, sig),
+            Action::Wait(p) => p.stop_wait.wait_until(|| {
+                !matches!(p.state(), super::RunState::Stopped { .. }) || kill_pending()
+            }),
         }
     }
     // No handler ran: an interrupted system call starts again.

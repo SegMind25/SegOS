@@ -1,0 +1,86 @@
+# create and join
+ok   gettid_() == getpid()
+ok   pthread_create(&t, NULL, identity, (void *)41) == 0
+ok   pthread_join(t, &ret) == 0
+ok   ret == (void *)42
+ok   ok
+ok   sum == 16 + 120
+ok   waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD
+# mutex and condvar contention
+ok   counter == NT * 20000
+ok   consumed == want
+# condvar broadcast
+ok   ready_count == 0
+# thread-local storage and pthread_exit
+ok   sum == NT * 1000 + 28
+ok   tls_value == 99
+# futex wait and wake
+ok   futex(&fword, FUTEX_WAIT_PRIVATE, 2, NULL, NULL, 0) == -1 && errno == EAGAIN
+ok   futex(&fword, FUTEX_WAIT_PRIVATE, 1, &rel, NULL, 0) == -1 && errno == ETIMEDOUT
+ok   futex(&fword, FUTEX_WAKE_PRIVATE, 5, NULL, NULL, 0) == 0
+ok   futex((int *)((char *)&fword + 1), FUTEX_WAKE, 1, NULL, NULL, 0) == -1 && errno == EINVAL
+ok   futex(&fword, FUTEX_WAKE_PRIVATE, 2, NULL, NULL, 0) == 2
+ok   __atomic_load_n(&woke_count, __ATOMIC_SEQ_CST) == 2
+ok   futex(&fword, FUTEX_WAKE_PRIVATE, 10, NULL, NULL, 0) == 2
+ok   w[0].ret == 0 && w[1].ret == 0 && w[2].ret == 0 && w[3].ret == 0
+# futex bitsets
+ok   futex(&fword, FUTEX_WAKE_BITSET_PRIVATE, 10, NULL, NULL, 4) == 0
+ok   futex(&fword, FUTEX_WAKE_BITSET_PRIVATE, 10, NULL, NULL, 2) == 2
+ok   __atomic_load_n(&woke_count, __ATOMIC_SEQ_CST) == 2
+ok   futex(&fword, FUTEX_WAKE_BITSET_PRIVATE, 10, NULL, NULL, 0) == -1 && errno == EINVAL
+ok   futex(&fword, FUTEX_WAKE_PRIVATE, 10, NULL, NULL, 0) == 1
+# futex timeouts
+ok   futex(&fword, FUTEX_WAIT_BITSET_PRIVATE, 1, &abs, NULL, -1) == -1 && errno == ETIMEDOUT
+ok   after.tv_sec > abs.tv_sec || (after.tv_sec == abs.tv_sec && after.tv_nsec >= abs.tv_nsec)
+ok   futex(&fword, FUTEX_WAIT_BITSET_PRIVATE | FUTEX_CLOCK_REALTIME, 1, &abs, NULL, -1) == -1 && errno == ETIMEDOUT
+ok   futex(&fword, FUTEX_WAIT_PRIVATE, 1, &bad, NULL, 0) == -1 && errno == EINVAL
+# futex requeue
+ok   futex(&fword, FUTEX_CMP_REQUEUE_PRIVATE, 1, (void *)10L, &fword2, 5) == -1 && errno == EAGAIN
+ok   futex(&fword, FUTEX_CMP_REQUEUE_PRIVATE, 1, (void *)10L, &fword2, 1) == 4
+ok   __atomic_load_n(&woke_count, __ATOMIC_SEQ_CST) == 1
+ok   futex(&fword, FUTEX_WAKE_PRIVATE, 10, NULL, NULL, 0) == 0
+ok   futex(&fword2, FUTEX_WAKE_PRIVATE, 2, NULL, NULL, 0) == 2
+ok   futex(&fword2, FUTEX_WAKE_PRIVATE, 10, NULL, NULL, 0) == 1
+ok   futex(&fword, FUTEX_REQUEUE_PRIVATE, 0, (void *)1L, &fword2, 0) == 1
+ok   futex(&fword, FUTEX_WAKE_PRIVATE, 10, NULL, NULL, 0) == 1
+ok   futex(&fword2, FUTEX_WAKE_PRIVATE, 10, NULL, NULL, 0) == 1
+# futex wake_op
+ok   futex(&fword, FUTEX_WAKE_OP_PRIVATE, 1, (void *)1L, &fword2, op) == 1
+ok   fword2 == 8
+ok   futex(&fword2, FUTEX_WAKE_OP_PRIVATE, 1, (void *)1L, &fword, op) == 1
+ok   fword == 0
+# signals and threads
+ok   pthread_kill(t, SIGUSR1) == 0
+ok   handler_tid == worker_tid
+ok   kill(getpid(), SIGUSR2) == 0
+ok   handler_tid == worker_tid
+ok   syscall(SYS_tgkill, getpid(), gettid_(), 0) == 0
+ok   syscall(SYS_tgkill, getpid() + 100000, gettid_(), 0) == -1 && errno == ESRCH
+ok   syscall(SYS_tkill, gettid_(), 0) == 0
+ok   w.ret == -1 && w.err == EINTR
+ok   w.ret == -1 && w.err == EINTR
+# exits
+ok   WIFEXITED(st) && WEXITSTATUS(st) == 3
+ok   WIFEXITED(st) && WEXITSTATUS(st) == 0
+ok   WIFEXITED(st) && WEXITSTATUS(st) == 5
+ok   WIFSIGNALED(st) && WTERMSIG(st) == SIGTERM
+ok   WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL
+# robust mutex
+ok   pthread_mutex_lock(&robust) == EOWNERDEAD
+ok   pthread_mutex_consistent(&robust) == 0
+ok   pthread_mutex_unlock(&robust) == 0
+ok   pthread_mutex_lock(&robust) == 0
+ok   pthread_mutex_unlock(&robust) == 0
+ok   syscall(SYS_get_robust_list, 0, &head, &len) == 0 && len == 3 * sizeof(long)
+# proc and exec
+ok   threads_in_status() == 4
+ok   task_entries() == 4
+ok   access(path, R_OK) == 0
+ok   threads_in_status() == 1
+ok   WIFEXITED(st) && WEXITSTATUS(st) == 1
+# scheduling
+ok   sched_getaffinity(0, sizeof set, &set) == 0
+ok   CPU_COUNT(&set) >= 1
+ok   sched_yield() == 0
+ok   sched_getcpu() >= 0
+PASSED

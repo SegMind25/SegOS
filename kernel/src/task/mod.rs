@@ -169,7 +169,12 @@ pub fn spawn_named(name: &'static str, f: impl FnOnce() + Send + 'static) -> Arc
     sched::spawn_task(Task::new(name, Box::new(f)))
 }
 
-/// Makes a user thread runnable; it starts in user mode with `frame`.
-pub fn spawn_user(user: UserThread, frame: crate::hal::idt::TrapFrame) -> Arc<Task> {
-    sched::spawn_task(Task::new_user(user, &frame))
+/// A user thread that starts in user mode with `frame` once [`start`]ed.
+pub fn new_user(user: UserThread, frame: crate::hal::idt::TrapFrame) -> Arc<Task> {
+    Arc::new(Task::new_user(user, &frame))
+}
+
+/// Makes a task from [`new_user`] runnable.
+pub fn start(task: Arc<Task>) {
+    sched::make_ready(task);
 }

@@ -5,6 +5,7 @@
 //! in RAX, exactly as on Linux. An unknown call returns `ENOSYS` and is
 //! logged once per number: that log is the to-do list.
 
+mod event;
 mod fs;
 mod info;
 mod mem;
@@ -141,7 +142,8 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
             process::clone(ctx, frame, flags, 0, 0, 0, 0)
         }
         59 => process::execve(ctx, frame, a[0], a[1], a[2]),
-        60 | 231 => process::exit(ctx, a[0] as i32),
+        60 => process::exit(ctx, a[0] as i32),
+        231 => process::exit_group(ctx, a[0] as i32),
         61 => process::wait4(ctx, a[0] as i32, a[1], a[2] as u32, a[3]),
         62 | 200 | 234 => process::kill(ctx, a, nr),
         63 => info::uname(ctx, a[0]),
@@ -184,6 +186,7 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         121 => process::getpgid(ctx, a[0] as u32),
         124 => process::getsid(ctx, a[0] as u32),
         127 => process::rt_sigpending(ctx, a[0], a[1]),
+        128 => process::rt_sigtimedwait(ctx, a[0], a[1], a[2], a[3]),
         130 => process::rt_sigsuspend(ctx, a[0], a[1]),
         131 => process::sigaltstack(ctx, frame, a[0], a[1]),
         132 | 235 | 280 => fs::utimes(ctx, nr, a),
@@ -235,18 +238,52 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         269 | 439 => fs::faccessat(ctx, fd, a[1], a[2] as u32),
         270 => fs::select(ctx, a[0] as i32, [a[1], a[2], a[3]], a[4], Some(a[5])),
         271 => fs::ppoll(ctx, a[0], a[1], a[2], a[3]),
-        273 => {
-            ctx.thread().robust_list.store(a[0], Ordering::Relaxed);
-            Ok(0)
+        273 => process::set_robust_list(ctx, a[0], a[1]),
+        274 => process::get_robust_list(ctx, a[0] as u32, a[1], a[2]),
+        // Event descriptors.
+        213 => event::epoll_create(ctx, a[0] as i32),
+        291 => event::epoll_create1(ctx, a[0] as u32),
+        233 => event::epoll_ctl(ctx, fd, a[1] as u32, a[2] as i32, a[3]),
+        232 => event::epoll_wait(
+            ctx,
+            fd,
+            a[1],
+            a[2] as i32,
+            event::ms_timeout(a[3] as i32),
+            0,
+        ),
+        281 => event::epoll_wait(
+            ctx,
+            fd,
+            a[1],
+            a[2] as i32,
+            event::ms_timeout(a[3] as i32),
+            a[4],
+        ),
+        441 => {
+            let timeout = event::ts_timeout(ctx, a[3])?;
+            event::epoll_wait(ctx, fd, a[1], a[2] as i32, timeout, a[4])
         }
+        284 => event::eventfd(ctx, a[0] as u32, 0),
+        290 => event::eventfd(ctx, a[0] as u32, a[1] as u32),
+        283 => event::timerfd_create(ctx, a[0] as u32, a[1] as u32),
+        286 => event::timerfd_settime(ctx, fd, a[1] as u32, a[2], a[3]),
+        287 => event::timerfd_gettime(ctx, fd, a[1]),
+        282 => event::signalfd(ctx, fd, a[1], a[2], 0),
+        289 => event::signalfd(ctx, fd, a[1], a[2], a[3] as u32),
+        253 => event::inotify_init(ctx, 0),
+        294 => event::inotify_init(ctx, a[0] as u32),
+        254 => event::inotify_add_watch(ctx, fd, a[1], a[2] as u32),
+        255 => event::inotify_rm_watch(ctx, fd, a[1] as i32),
+        309 => info::getcpu(ctx, a[0], a[1]),
         292 => fs::dup3(ctx, fd, a[1] as i32, a[2] as u32, false),
         293 => fs::pipe2(ctx, a[0], a[1] as u32),
         302 => info::prlimit64(ctx, a[0] as u32, a[1] as u32, a[2], a[3]),
         316 => fs::renameat(ctx, fd, a[1], a[2] as i32, a[3], a[4] as u32),
         318 => info::getrandom(ctx, a[0], a[1]),
-        // rseq, clone3: the C libraries probe these and fall back without
-        // them; no log line.
-        334 | 435 => Err(Errno::ENOSYS),
+        // rseq, clone3, membarrier: the C libraries probe these and fall
+        // back without them; no log line.
+        334 | 435 | 324 => Err(Errno::ENOSYS),
         _ => {
             report_unknown(ctx, nr);
             Err(Errno::ENOSYS)

@@ -420,7 +420,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
         ("echo SEGOS-$((6 * 7))-OK", "SEGOS-42-OK"),
         (
             "ls /tests | grep expected | wc -l | sed 's/^/COUNT=/'",
-            "COUNT=4",
+            "COUNT=6",
         ),
         ("hello | tr a-z A-Z", "HELLO, WORLD!"),
         ("cat /proc/self/comm | tr a-z A-Z", "CAT"),
@@ -448,6 +448,10 @@ fn shell_session(img: &Path) -> Result<(), String> {
         steps.push((
             "python3 -c 'import json; print(\"PY-\" + json.dumps(sorted({3: 1, 1: 2})))'",
             "PY-[1, 3]",
+        ));
+        steps.push((
+            "python3 -c 'import threading as t, concurrent.futures as f; e = f.ThreadPoolExecutor(8); print(\"THREADS-\" + str(sum(e.map(lambda x: x * x, range(100)))))'",
+            "THREADS-328350",
         ));
     }
     if rootfs.join("gcc").exists() {

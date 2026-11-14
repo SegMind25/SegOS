@@ -208,7 +208,11 @@ fn wait(
 /// Wakes `nr_wake` waiters of `k1` and moves up to `nr_requeue` of the
 /// rest to `k2`. Returns woken + moved.
 fn requeue(k1: Key, k2: Key, nr_wake: i32, nr_requeue: i32) -> u64 {
-    let woken = wake_key(k1, nr_wake, FUTEX_BITSET_MATCH_ANY);
+    let woken = if nr_wake > 0 {
+        wake_key(k1, nr_wake, FUTEX_BITSET_MATCH_ANY)
+    } else {
+        0
+    };
     if k1 == k2 || nr_requeue <= 0 {
         return woken;
     }

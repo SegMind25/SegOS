@@ -14,6 +14,7 @@
 pub mod cpio;
 pub mod dev;
 pub mod disk;
+pub mod event;
 pub mod ext4;
 pub mod fat;
 pub mod mount;
@@ -167,6 +168,22 @@ pub trait Inode: Send + Sync {
     /// Which of POLLIN/POLLOUT/POLLHUP/POLLERR hold now.
     fn poll(&self) -> u16 {
         poll::POLLIN | poll::POLLOUT
+    }
+    /// A counter bumped whenever the object's readiness may have changed
+    /// (new data, a closed end), for edge-triggered epoll; 0 for objects
+    /// that do not keep one.
+    fn poll_generation(&self) -> u64 {
+        0
+    }
+    /// For anonymous inodes: the name `/proc/<pid>/fd` shows
+    /// ("anon_inode:[eventfd]").
+    fn anon_name(&self) -> Option<&'static str> {
+        None
+    }
+    /// The object itself, for system calls that work on one kind of file
+    /// (epoll_ctl, signalfd4, timerfd_settime).
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
     }
     /// Called when the inode is opened (terminals take a controlling
     /// terminal here).
