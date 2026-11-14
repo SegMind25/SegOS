@@ -141,6 +141,27 @@ pub fn remove(root: &Arc<dyn Inode>) -> KResult<Arc<Mount>> {
     Ok(m)
 }
 
+/// Moves the mount whose root is `root` onto `point` (`mount --move`).
+pub fn move_to(root: &Arc<dyn Inode>, point: Arc<dyn Inode>, path: &str) -> KResult<()> {
+    let mut mounts = MOUNTS.lock();
+    let i = mounts
+        .iter()
+        .rposition(|m| same(&m.root, root))
+        .ok_or(Errno::EINVAL)?;
+    let m = mounts.remove(i);
+    mounts.push(Arc::new(Mount {
+        id: m.id,
+        point,
+        root: m.root.clone(),
+        source: m.source.clone(),
+        fstype: m.fstype.clone(),
+        path: path.into(),
+        read_only: m.read_only,
+        info: m.info.clone(),
+    }));
+    Ok(())
+}
+
 pub fn set_read_only(root: &Arc<dyn Inode>, ro: bool) -> KResult<()> {
     let mut mounts = MOUNTS.lock();
     let i = mounts

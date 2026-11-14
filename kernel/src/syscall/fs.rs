@@ -177,8 +177,13 @@ fn resolve(ctx: &Ctx, dirfd: i32, path: &str, follow: bool) -> KResult<Arc<dyn I
 fn resolve_parent(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<(Arc<dyn Inode>, String)> {
     let base = dir_of(ctx, dirfd, path)?;
     let (dir, name) = fs::lookup_parent(&base, path)?;
+    // A name that exists gets the operation's own error (EEXIST from
+    // mkdir, EROFS from the file system on unlink), as on Linux.
     if fs::mount::is_read_only(dir.dev()) {
-        return Err(Errno::EROFS);
+        return match dir.lookup(&name) {
+            Ok(_) => Ok((dir, name)),
+            Err(_) => Err(Errno::EROFS),
+        };
     }
     if !dir.writable_dir() {
         return Err(Errno::EACCES);
@@ -462,6 +467,9 @@ pub fn fchdir(ctx: &Ctx, fd: i32) -> KResult<u64> {
 pub fn mkdirat(ctx: &Ctx, dirfd: i32, path: u64, mode: u32) -> KResult<u64> {
     let path = path_arg(ctx, path)?;
     let (dir, name) = resolve_parent(ctx, dirfd, &path)?;
+    if dir.lookup(&name).is_ok() {
+        return Err(Errno::EEXIST);
+    }
     dir.create(&name, FileType::Directory, mode & 0o7777 & !umask(ctx))?;
     Ok(0)
 }
@@ -1038,15 +1046,17 @@ pub fn mount(ctx: &Ctx, source: u64, target: u64, fstype: u64, flags: u64) -> KR
     if flags & PROPAGATION != 0 && flags & (MS_BIND | MS_MOVE) == 0 {
         return Ok(0);
     }
-    if flags & MS_MOVE != 0 {
-        return Err(Errno::EINVAL);
-    }
     let source = if source == 0 {
         String::from("none")
     } else {
         ctx.mm().read_cstr(source, fs::PATH_MAX)?
     };
     let path = fs::path_of(&point);
+    if flags & MS_MOVE != 0 {
+        let src = resolve(ctx, AT_FDCWD, &source, true)?;
+        fs::mount::move_to(&src, point, &path)?;
+        return Ok(0);
+    }
     if flags & MS_BIND != 0 {
         let src = resolve(ctx, AT_FDCWD, &source, true)?;
         fs::mount::add(
