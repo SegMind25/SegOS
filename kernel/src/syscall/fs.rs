@@ -286,6 +286,60 @@ pub fn stat_path(ctx: &Ctx, dirfd: i32, path: u64, buf: u64, flags: u32) -> KRes
     Ok(0)
 }
 
+/// `statx(dirfd, path, flags, mask, buf)`: the same facts as `stat`, in
+/// the newer layout (coreutils and glibc's `stat` use it).
+pub fn statx(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, buf: u64) -> KResult<u64> {
+    const STATX_BASIC_STATS: u32 = 0x7ff;
+    let p = ctx.mm().read_cstr(path, fs::PATH_MAX)?;
+    let inode = if p.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(Errno::ENOENT);
+        }
+        if dirfd == AT_FDCWD {
+            cwd(ctx)
+        } else {
+            file(ctx, dirfd)?.inode.clone()
+        }
+    } else {
+        resolve(ctx, dirfd, &p, flags & AT_SYMLINK_NOFOLLOW == 0)?
+    };
+    let st = inode.stat();
+    let mut b = [0u8; 256];
+    let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
+    put(0, &STATX_BASIC_STATS.to_le_bytes());
+    put(4, &(st.st_blksize as u32).to_le_bytes());
+    put(16, &(st.st_nlink as u32).to_le_bytes());
+    put(20, &st.st_uid.to_le_bytes());
+    put(24, &st.st_gid.to_le_bytes());
+    put(28, &(st.st_mode as u16).to_le_bytes());
+    put(32, &st.st_ino.to_le_bytes());
+    put(40, &st.st_size.to_le_bytes());
+    put(48, &st.st_blocks.to_le_bytes());
+    for (off, sec, nsec) in [
+        (64, st.st_atime, st.st_atime_nsec),
+        (96, st.st_ctime, st.st_ctime_nsec),
+        (112, st.st_mtime, st.st_mtime_nsec),
+    ] {
+        put(off, &sec.to_le_bytes());
+        put(off + 8, &(nsec as u32).to_le_bytes());
+    }
+    // Device numbers split into major and minor (Linux's encoding).
+    let split = |d: u64| {
+        (
+            ((d >> 8) & 0xfff) | ((d >> 32) & !0xfff),
+            (d & 0xff) | ((d >> 12) & !0xff),
+        )
+    };
+    let (rmaj, rmin) = split(st.st_rdev);
+    let (dmaj, dmin) = split(st.st_dev);
+    put(128, &(rmaj as u32).to_le_bytes());
+    put(132, &(rmin as u32).to_le_bytes());
+    put(136, &(dmaj as u32).to_le_bytes());
+    put(140, &(dmin as u32).to_le_bytes());
+    ctx.mm().copy_to(buf, &b)?;
+    Ok(0)
+}
+
 pub fn faccessat(ctx: &Ctx, dirfd: i32, path: u64, mode: u32) -> KResult<u64> {
     let path = path_arg(ctx, path)?;
     let inode = resolve(ctx, dirfd, &path, true)?;

@@ -8,6 +8,7 @@
 
 mod cpio;
 mod fat;
+mod glibc;
 mod gpt;
 mod userland;
 
@@ -250,7 +251,6 @@ const LINUX_FS_TYPE: [u8; 16] = [
     0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4,
 ];
 const ROOT_FIRST_LBA: u64 = 2048;
-const ROOT_SECTORS: u64 = 128 * 1024 * 1024 / gpt::SECTOR;
 
 /// `target/rootfs.img`: a GPT disk with one ext4 partition holding the full
 /// root file system (the same tree as the initramfs). The ext4 is made by
@@ -259,6 +259,13 @@ fn root_disk(u: &userland::Userland) -> Result<PathBuf, String> {
     let target = root().join("target");
     let tree = target.join("rootfs");
     userland::tree(u, &tree)?;
+    let copied = glibc::add(&tree)?;
+    if copied > 0 {
+        eprintln!("xtask: root disk: {copied} files of Ubuntu's glibc userland");
+    }
+    // Room for the files, ext4's own structures, and some to spare.
+    let mib = (glibc::tree_size(&tree) / (1 << 20)) * 5 / 4 + 96;
+    let root_sectors = mib * 1024 * 1024 / gpt::SECTOR;
     let part = target.join("rootfs.ext4");
     let _ = std::fs::remove_file(&part);
     status(
@@ -266,11 +273,11 @@ fn root_disk(u: &userland::Userland) -> Result<PathBuf, String> {
             .args(["-q", "-F", "-t", "ext4", "-L", "segos-root", "-d"])
             .arg(&tree)
             .arg(&part)
-            .arg(format!("{}k", ROOT_SECTORS * gpt::SECTOR / 1024)),
+            .arg(format!("{}k", root_sectors * gpt::SECTOR / 1024)),
     )?;
     let fs = read(&part)?;
     let sector = gpt::SECTOR as usize;
-    let mut disk = vec![0u8; (ROOT_FIRST_LBA + ROOT_SECTORS + 2048) as usize * sector];
+    let mut disk = vec![0u8; (ROOT_FIRST_LBA + root_sectors + 2048) as usize * sector];
     let start = ROOT_FIRST_LBA as usize * sector;
     disk[start..start + fs.len()].copy_from_slice(&fs);
     gpt::write(
@@ -280,7 +287,7 @@ fn root_disk(u: &userland::Userland) -> Result<PathBuf, String> {
             type_guid: LINUX_FS_TYPE,
             guid: gpt::random_guid(random_bytes()),
             first_lba: ROOT_FIRST_LBA,
-            last_lba: ROOT_FIRST_LBA + ROOT_SECTORS - 1,
+            last_lba: ROOT_FIRST_LBA + root_sectors - 1,
             name: "SegOS root",
         }],
     )?;
@@ -409,7 +416,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
     println!("xtask: shell session: prompt after boot");
     // (command, what its output must contain). Expected text never appears
     // in the command itself, so the echo cannot satisfy the check.
-    let steps: [(&str, &str); 6] = [
+    let mut steps: Vec<(&str, &str)> = vec![
         ("echo SEGOS-$((6 * 7))-OK", "SEGOS-42-OK"),
         (
             "ls /tests | grep expected | wc -l | sed 's/^/COUNT=/'",
@@ -426,10 +433,33 @@ fn shell_session(img: &Path) -> Result<(), String> {
             "FILES=2",
         ),
     ];
+    // Phase 5: Ubuntu's glibc programs, dynamically linked, unmodified
+    // (when the build machine could provide them; see glibc.rs).
+    let rootfs = root().join("target/rootfs/usr/bin");
+    if rootfs.join("bash").exists() {
+        steps.push((
+            "bash -c 'a=(x y z); echo \"BASH-${#a[@]}-$((2**10))\"'",
+            "BASH-3-1024",
+        ));
+        // GNU coreutils (BusyBox's applets would answer to bare names).
+        steps.push(("/usr/bin/seq -s: 1 3", "1:2:3"));
+    }
+    if rootfs.join("python3").exists() {
+        steps.push((
+            "python3 -c 'import json; print(\"PY-\" + json.dumps(sorted({3: 1, 1: 2})))'",
+            "PY-[1, 3]",
+        ));
+    }
+    if rootfs.join("gcc").exists() {
+        steps.push((
+            "cd /tmp && printf 'int main(void){return 7*6;}' > g.c && gcc -O2 -o g g.c; ./g; echo GCC-$?",
+            "GCC-42",
+        ));
+    }
     for (cmd, want) in steps {
         let _ = stdin.write_all(format!("{cmd}\n").as_bytes());
         let _ = stdin.flush();
-        let Some(end) = wait_for(want, at, 30) else {
+        let Some(end) = wait_for(want, at, 120) else {
             return fail(format!("`{cmd}` did not print `{want}`"), &mut child);
         };
         at = end;

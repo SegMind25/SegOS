@@ -22,7 +22,7 @@ errnos! {
     EMFILE = 24, ENOTTY = 25, EFBIG = 27, ENOSPC = 28, ESPIPE = 29,
     ENOTBLK = 15, EROFS = 30, EMLINK = 31, EPIPE = 32, ERANGE = 34, ENAMETOOLONG = 36,
     ENOSYS = 38, ENOTEMPTY = 39, ELOOP = 40, ENOTSOCK = 88, EOPNOTSUPP = 95,
-    ETIMEDOUT = 110,
+    ENODATA = 61, ELIBBAD = 80, EAFNOSUPPORT = 97, ETIMEDOUT = 110,
     // Kernel-internal: never seen by programs. A blocking call interrupted
     // by a signal; turned into a restart or EINTR on the way out.
     ERESTARTSYS = 512,

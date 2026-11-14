@@ -1,9 +1,11 @@
 //! Loading ELF executables, and the initial stack Linux gives a program.
 //!
-//! Static executables only in Phase 2: `ET_EXEC` (loaded at its link
-//! addresses) and static-PIE `ET_DYN` (loaded at Linux's usual base). A
-//! program with `PT_INTERP` needs the dynamic linker, which arrives with
-//! glibc in Phase 5.
+//! `ET_EXEC` programs load at their link addresses and position-independent
+//! `ET_DYN` ones at Linux's usual base. A dynamically linked program names
+//! its dynamic linker in `PT_INTERP` (`/lib64/ld-linux-x86-64.so.2` for
+//! glibc): the kernel loads that too, below the mmap area as Linux does,
+//! starts it instead of the program, and tells it where the program is
+//! through the auxiliary vector (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`).
 
 use crate::abi::mman::{PROT_EXEC, PROT_READ, PROT_WRITE};
 use crate::abi::{Errno, KResult};
@@ -26,7 +28,14 @@ const PIE_BASE: u64 = 0x5555_5555_4000;
 
 /// What the loader learned, for the auxiliary vector and `brk`.
 pub struct Image {
+    /// The program's entry point (AT_ENTRY).
     pub entry: u64,
+    /// Where execution starts: the dynamic linker's entry, or `entry`.
+    pub start: u64,
+    /// Load address of the dynamic linker (AT_BASE), 0 if none.
+    pub interp_base: u64,
+    /// The `PT_INTERP` path, if the program has one.
+    pub interp: Option<alloc::string::String>,
     pub phdr: u64,
     pub phent: u64,
     pub phnum: u64,
@@ -67,45 +76,9 @@ fn prot(flags: u32) -> u32 {
         | (if flags & PF_X != 0 { PROT_EXEC } else { 0 })
 }
 
-/// Maps the program's segments into `mm`.
-pub fn load(mm: &AddressSpace, file: &[u8]) -> KResult<Image> {
-    if file.len() < 64 || &file[..4] != b"\x7fELF" {
-        return Err(Errno::ENOEXEC);
-    }
-    // 64-bit, little-endian, version 1, x86-64.
-    if file[4] != 2 || file[5] != 1 || file[6] != 1 || u16_at(file, 18)? != EM_X86_64 {
-        return Err(Errno::ENOEXEC);
-    }
-    let ty = u16_at(file, 16)?;
-    let entry = u64_at(file, 24)?;
-    let phoff = u64_at(file, 32)? as usize;
-    let phentsize = u16_at(file, 54)? as usize;
-    let phnum = u16_at(file, 56)? as usize;
-    if phentsize < 56 || phnum == 0 || phnum > 128 {
-        return Err(Errno::ENOEXEC);
-    }
-    let mut phdrs = Vec::with_capacity(phnum);
-    for i in 0..phnum {
-        let o = phoff + i * phentsize;
-        phdrs.push(Phdr {
-            ty: u32_at(file, o)?,
-            flags: u32_at(file, o + 4)?,
-            offset: u64_at(file, o + 8)?,
-            vaddr: u64_at(file, o + 16)?,
-            filesz: u64_at(file, o + 32)?,
-            memsz: u64_at(file, o + 40)?,
-        });
-    }
-    if phdrs.iter().any(|p| p.ty == PT_INTERP) {
-        // Dynamically linked: needs ld.so (Phase 5).
-        return Err(Errno::ENOEXEC);
-    }
-    let bias = match ty {
-        ET_EXEC => 0,
-        ET_DYN => PIE_BASE,
-        _ => return Err(Errno::ENOEXEC),
-    };
-
+/// Maps every `PT_LOAD` segment at `bias` and copies its file contents;
+/// returns the end of the highest one.
+fn map_segments(mm: &AddressSpace, file: &[u8], phdrs: &[Phdr], bias: u64) -> KResult<u64> {
     let mut prev_end = 0u64; // end (page aligned) of the last region mapped
     let mut prev_prot = 0u32;
     let mut end = 0u64;
@@ -144,6 +117,107 @@ pub fn load(mm: &AddressSpace, file: &[u8]) -> KResult<Image> {
     if end == 0 {
         return Err(Errno::ENOEXEC);
     }
+    Ok(end)
+}
+
+/// Loads the dynamic linker (an `ET_DYN` file) into the mmap area of `mm`;
+/// returns its load address and entry point.
+pub fn load_interp(mm: &AddressSpace, file: &[u8]) -> KResult<(u64, u64)> {
+    let parsed = parse(file)?;
+    if parsed.ty != ET_DYN {
+        return Err(Errno::ELIBBAD);
+    }
+    let span = parsed
+        .phdrs
+        .iter()
+        .filter(|p| p.ty == PT_LOAD)
+        .map(|p| p.vaddr + p.memsz)
+        .max()
+        .ok_or(Errno::ELIBBAD)?
+        .next_multiple_of(PAGE_SIZE);
+    let base = mm.find_free(span)?;
+    map_segments(mm, file, &parsed.phdrs, base)?;
+    Ok((base, base + parsed.entry))
+}
+
+/// The ELF header fields and program headers of `file`.
+fn parse(file: &[u8]) -> KResult<Parsed> {
+    if file.len() < 64 || &file[..4] != b"\x7fELF" {
+        return Err(Errno::ENOEXEC);
+    }
+    // 64-bit, little-endian, version 1, x86-64.
+    if file[4] != 2 || file[5] != 1 || file[6] != 1 || u16_at(file, 18)? != EM_X86_64 {
+        return Err(Errno::ENOEXEC);
+    }
+    let ty = u16_at(file, 16)?;
+    let entry = u64_at(file, 24)?;
+    let phoff = u64_at(file, 32)? as usize;
+    let phentsize = u16_at(file, 54)? as usize;
+    let phnum = u16_at(file, 56)? as usize;
+    if phentsize < 56 || phnum == 0 || phnum > 128 {
+        return Err(Errno::ENOEXEC);
+    }
+    let mut phdrs = Vec::with_capacity(phnum);
+    for i in 0..phnum {
+        let o = phoff + i * phentsize;
+        phdrs.push(Phdr {
+            ty: u32_at(file, o)?,
+            flags: u32_at(file, o + 4)?,
+            offset: u64_at(file, o + 8)?,
+            vaddr: u64_at(file, o + 16)?,
+            filesz: u64_at(file, o + 32)?,
+            memsz: u64_at(file, o + 40)?,
+        });
+    }
+    Ok(Parsed {
+        ty,
+        entry,
+        phoff,
+        phentsize,
+        phnum,
+        phdrs,
+    })
+}
+
+struct Parsed {
+    ty: u16,
+    entry: u64,
+    phoff: usize,
+    phentsize: usize,
+    phnum: usize,
+    phdrs: Vec<Phdr>,
+}
+
+/// Maps the program's segments into `mm` (and its dynamic linker's, once
+/// the caller has read it: see [`load_interp`]).
+pub fn load(mm: &AddressSpace, file: &[u8]) -> KResult<Image> {
+    let Parsed {
+        ty,
+        entry,
+        phoff,
+        phentsize,
+        phnum,
+        phdrs,
+    } = parse(file)?;
+    let bias = match ty {
+        ET_EXEC => 0,
+        ET_DYN => PIE_BASE,
+        _ => return Err(Errno::ENOEXEC),
+    };
+
+    let end = map_segments(mm, file, &phdrs, bias)?;
+    let interp = match phdrs.iter().find(|p| p.ty == PT_INTERP) {
+        Some(p) => {
+            let raw = file
+                .get(p.offset as usize..(p.offset + p.filesz) as usize)
+                .ok_or(Errno::ENOEXEC)?;
+            let path = raw.split(|&b| b == 0).next().unwrap_or(&[]);
+            Some(alloc::string::String::from(
+                core::str::from_utf8(path).map_err(|_| Errno::ENOEXEC)?,
+            ))
+        }
+        None => None,
+    };
 
     // Where the program headers are in memory, for AT_PHDR.
     let phdr = match phdrs.iter().find(|p| p.ty == PT_PHDR) {
@@ -158,6 +232,9 @@ pub fn load(mm: &AddressSpace, file: &[u8]) -> KResult<Image> {
     };
     Ok(Image {
         entry: entry + bias,
+        start: entry + bias,
+        interp_base: 0,
+        interp,
         phdr,
         phent: phentsize as u64,
         phnum: phnum as u64,
@@ -245,7 +322,7 @@ pub fn build_stack(
         (AT_PHENT, image.phent),
         (AT_PHNUM, image.phnum),
         (AT_PAGESZ, PAGE_SIZE),
-        (AT_BASE, 0),
+        (AT_BASE, image.interp_base),
         (AT_FLAGS, 0),
         (AT_ENTRY, image.entry),
         (AT_UID, 0),

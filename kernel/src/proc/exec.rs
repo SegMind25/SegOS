@@ -36,8 +36,14 @@ const MAX_SHEBANG: usize = 256;
 
 fn read_all(inode: &Arc<dyn Inode>) -> KResult<Vec<u8>> {
     let mut bytes = alloc::vec![0u8; inode.size() as usize];
-    let n = inode.read_at(0, &mut bytes)?;
-    bytes.truncate(n);
+    let mut got = 0;
+    while got < bytes.len() {
+        match fs::pagecache::read_at(inode, got as u64, &mut bytes[got..])? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    bytes.truncate(got);
     Ok(bytes)
 }
 
@@ -88,15 +94,28 @@ pub fn prepare(
             continue;
         }
         let mm = AddressSpace::new()?;
-        let image = elf::load(&mm, &bytes)?;
+        let mut image = elf::load(&mm, &bytes)?;
         drop(bytes);
+        if let Some(interp) = image.interp.take() {
+            // The dynamic linker: found from the root, a regular file.
+            let ld = fs::lookup(&fs::root(), &interp).map_err(|e| match e {
+                Errno::ENOENT => Errno::ENOENT,
+                _ => Errno::ELIBBAD,
+            })?;
+            if ld.file_type() != FileType::Regular {
+                return Err(Errno::ELIBBAD);
+            }
+            let (base, entry) = elf::load_interp(&mm, &read_all(&ld)?)?;
+            image.interp_base = base;
+            image.start = entry;
+        }
         mm.init_brk(image.end);
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
         let rsp = elf::build_stack(&mm, &image, &execfn, &argv_refs, &envp_refs)?;
         return Ok(Prepared {
             mm,
-            entry: image.entry,
+            entry: image.start,
             rsp,
             exe: canonical,
             invoked: execfn,

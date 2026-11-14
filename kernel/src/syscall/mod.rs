@@ -190,6 +190,14 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         133 => fs::mknodat(ctx, AT_FDCWD, a[0], a[1] as u32),
         259 => fs::mknodat(ctx, fd, a[1], a[2] as u32),
         165 => fs::mount(ctx, a[0], a[1], a[2], a[3]),
+        // Extended attributes: none exist; setting them is unsupported.
+        188..=190 => Err(Errno::EOPNOTSUPP),
+        191..=193 | 197..=199 => Err(Errno::ENODATA),
+        194..=196 => Ok(0), // listxattr: an empty list
+        332 => fs::statx(ctx, a[0] as i32, a[1], a[2] as u32, a[4]),
+        // Sockets come with networking (Phase 6).
+        41 => Err(Errno::EAFNOSUPPORT),
+        42..=55 => Err(Errno::ENOTSOCK),
         166 => fs::umount2(ctx, a[0], a[1]),
         137 => fs::statfs(ctx, a[0], a[1], false),
         138 => fs::statfs(ctx, a[0], a[1], true),
