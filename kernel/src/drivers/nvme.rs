@@ -112,6 +112,8 @@ struct QueuePair {
     sq_doorbell: usize,
     cq_doorbell: usize,
     next_cid: u16,
+    /// MSI-X interrupt of its completion queue; None means polling.
+    irq: Option<&'static super::msi::Irq>,
 }
 
 impl QueuePair {
@@ -123,6 +125,7 @@ impl QueuePair {
             size,
             sq_tail: 0,
             cq_head: 0,
+            irq: None,
             phase: true,
             sq_doorbell: DOORBELLS + 2 * qid * stride,
             cq_doorbell: DOORBELLS + (2 * qid + 1) * stride,
@@ -147,10 +150,14 @@ impl QueuePair {
 
         let entry = phys_to_virt(self.cq + self.cq_head as u64 * 16).cast::<u32>();
         let phase = self.phase;
-        let arrived = poll(COMMAND_TIMEOUT_MS, || {
+        let done = || {
             let dw3 = unsafe { read_volatile(entry.add(3)) };
             (dw3 >> 16) & 1 == phase as u32
-        });
+        };
+        let arrived = match self.irq {
+            Some(irq) => irq.wait(done, COMMAND_TIMEOUT_MS),
+            None => poll(COMMAND_TIMEOUT_MS, done),
+        };
         if !arrived {
             crate::warn!("nvme: command {:#x} timed out", cmd[0] & 0xff);
             return Err(Errno::EIO);
@@ -465,16 +472,20 @@ fn setup(d: &pci::Device) -> Result<(), &'static str> {
         max_bytes = max_bytes.min(PAGE << mdts);
     }
 
-    // The I/O queue pair, polled: completion queue without interrupts.
+    // The I/O queue pair. Its completions interrupt through MSI-X entry 1
+    // when the controller has it; otherwise they are polled.
+    let irq = super::msi::enable(d, 1);
     let mut cmd = [0u32; 16];
     cmd[0] = ADMIN_CREATE_CQ as u32;
     cmd[6] = q.io.cq as u32;
     cmd[7] = (q.io.cq >> 32) as u32;
     cmd[10] = (io_size as u32 - 1) << 16 | 1;
-    cmd[11] = 1; // physically contiguous, IEN = 0
+    // Physically contiguous; IEN and vector 1 with MSI-X.
+    cmd[11] = if irq.is_some() { 1 << 16 | 0b11 } else { 1 };
     q.admin
         .run(cmd)
         .map_err(|_| "cannot create I/O completion queue")?;
+    q.io.irq = irq;
     let mut cmd = [0u32; 16];
     cmd[0] = ADMIN_CREATE_SQ as u32;
     cmd[6] = q.io.sq as u32;

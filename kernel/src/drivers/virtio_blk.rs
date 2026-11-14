@@ -105,6 +105,8 @@ struct Queue {
     data: [u64; MAX_PAGES],
     notify: Mmio,
     last_used: u16,
+    /// The queue's MSI-X interrupt; None means polling.
+    irq: Option<&'static super::msi::Irq>,
 }
 
 impl Queue {
@@ -133,8 +135,16 @@ impl Queue {
             fence(Ordering::SeqCst);
         }
         self.notify.w16(0, 0);
+        if let Some(irq) = self.irq {
+            let last = self.last_used;
+            let done = || unsafe { read_volatile(used.add(2).cast::<u16>()) } != last;
+            if !irq.wait(done, 30_000) {
+                return Err(Errno::EIO);
+            }
+            self.last_used = unsafe { read_volatile(used.add(2).cast::<u16>()) };
+        }
         let mut spins: u64 = 0;
-        loop {
+        while self.irq.is_none() {
             let used_idx = unsafe { read_volatile(used.add(2).cast::<u16>()) };
             if used_idx != self.last_used {
                 self.last_used = used_idx;
@@ -350,7 +360,16 @@ fn setup(d: &pci::Device) -> Result<VirtioBlk, &'static str> {
         *p = frame::alloc_zeroed().ok_or("out of memory")?;
     }
     common.w16(common::QUEUE_SIZE, QUEUE_SIZE);
-    common.w16(common::QUEUE_MSIX_VECTOR, 0xffff);
+    // Completion interrupts through MSI-X entry 0 when the device has it.
+    let mut irq = super::msi::enable(d, 0);
+    common.w16(
+        common::QUEUE_MSIX_VECTOR,
+        if irq.is_some() { 0 } else { 0xffff },
+    );
+    if irq.is_some() && common.r16(common::QUEUE_MSIX_VECTOR) != 0 {
+        irq = None; // the device refused the vector
+        common.w16(common::QUEUE_MSIX_VECTOR, 0xffff);
+    }
     common.w64(common::QUEUE_DESC, ring);
     common.w64(common::QUEUE_DRIVER, ring + 1024);
     common.w64(common::QUEUE_DEVICE, ring + 2048);
@@ -375,6 +394,7 @@ fn setup(d: &pci::Device) -> Result<VirtioBlk, &'static str> {
             data,
             notify: Mmio(notify_base + notify_off * caps.notify.2 as u64),
             last_used: 0,
+            irq,
         }),
     })
 }

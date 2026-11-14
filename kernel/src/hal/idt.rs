@@ -273,6 +273,7 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
             super::serial::irq();
             super::apic::eoi();
         }
+        v if crate::drivers::msi::is_ours(v) => crate::drivers::msi::irq(v as u8),
         v if v == super::apic::SPURIOUS_VECTOR as u64 => {}
         v @ 0..32 => panic!(
             "CPU exception {v}: {} (error code {:#x}) rip={:#x}\n{frame:#x?}",
