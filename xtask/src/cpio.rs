@@ -10,16 +10,19 @@ use std::collections::BTreeSet;
 
 pub const MODE_DIR: u32 = 0o040_000;
 pub const MODE_FILE: u32 = 0o100_000;
+/// A symbolic link: the data is the target.
+pub const MODE_SYMLINK: u32 = 0o120_000;
 
 pub struct Entry {
     /// Path inside the archive, without a leading slash ("tests/basics").
+    /// Regular files and symbolic links.
     pub path: String,
     /// File type and permission bits, as in `st_mode`.
     pub mode: u32,
     pub data: Vec<u8>,
 }
 
-/// Writes `files` (regular files), the (possibly empty) directories
+/// Writes `files` (regular files and links), the (possibly empty) directories
 /// `dirs`, and every directory above them, parents first. Timestamps are 0
 /// so archives are reproducible.
 pub fn write(files: &[Entry], dirs: &[&str]) -> Vec<u8> {

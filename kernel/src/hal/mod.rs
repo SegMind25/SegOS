@@ -5,12 +5,12 @@ pub mod apic;
 pub mod cpu;
 pub mod gdt;
 pub mod idt;
+pub mod ioapic;
 pub mod percpu;
 pub mod rtc;
 pub mod serial;
 pub mod smp;
 pub mod syscall;
-pub mod user;
 pub mod x86;
 
 /// Brings the CPU into a known state: segments, TSS, exception handlers,

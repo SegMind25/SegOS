@@ -69,3 +69,29 @@ pub fn write_unlocked(args: fmt::Arguments) {
     let mut serial = Serial::new(COM1);
     let _ = fmt::Write::write_fmt(&mut serial, args);
 }
+
+/// Interrupts when bytes arrive (they go to the console terminal).
+pub fn enable_rx_interrupt() {
+    let s = SERIAL.lock();
+    // Drain anything that arrived before.
+    while s.input(5) & 1 != 0 {
+        s.input(0);
+    }
+    s.out(1, 0x01);
+}
+
+/// Serial interrupt: hands received bytes to the console terminal.
+pub fn irq() {
+    let mut buf = [0u8; 64];
+    let mut n = 0;
+    {
+        let s = SERIAL.lock();
+        while n < buf.len() && s.input(5) & 1 != 0 {
+            buf[n] = s.input(0);
+            n += 1;
+        }
+    }
+    if n > 0 {
+        crate::tty::console().input_bytes(&buf[..n]);
+    }
+}

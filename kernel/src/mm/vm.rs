@@ -11,8 +11,9 @@
 //! looking each page up here ([`AddressSpace::copy_from`] and friends), so
 //! a bad pointer from a program becomes `EFAULT`, never a kernel fault.
 //!
-//! Every mapped frame belongs to exactly one address space (Phase 2 has no
-//! sharing; copy-on-write `fork` comes in Phase 3 with frame refcounts).
+//! `fork` shares every page between parent and child, read-only and marked
+//! copy-on-write; the first write to such a page copies it. Frames are
+//! reference counted, so the last address space to let go frees them.
 
 use super::paging::{self, flags};
 use super::{PAGE_SIZE, frame, phys_to_virt};
@@ -335,6 +336,9 @@ impl AddressSpace {
             return Err(Errno::EFAULT);
         }
         if let Some(e) = paging::user_entry(pml4, page) {
+            if write && e & flags::COW != 0 {
+                return Self::break_cow(pml4, page, e, vma.page_flags());
+            }
             return Ok(paging::entry_phys(e));
         }
         let phys = frame::alloc_zeroed().ok_or(Errno::ENOMEM)?;
@@ -343,6 +347,46 @@ impl AddressSpace {
             return Err(Errno::ENOMEM);
         }
         Ok(phys)
+    }
+
+    /// The first write to a copy-on-write page: copy it, unless this
+    /// address space is the last one holding the frame, which can simply
+    /// take it over. Returns the frame now mapped.
+    fn break_cow(pml4: u64, page: u64, entry: u64, page_flags: u64) -> KResult<u64> {
+        let old = paging::entry_phys(entry);
+        if frame::ref_count(old) == 1 {
+            paging::set_user_entry(pml4, page, old | page_flags | flags::PRESENT);
+            return Ok(old);
+        }
+        let new = frame::alloc_zeroed().ok_or(Errno::ENOMEM)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(phys_to_virt(old), phys_to_virt(new), PAGE_SIZE as usize)
+        };
+        paging::set_user_entry(pml4, page, new | page_flags | flags::PRESENT);
+        frame::free(old);
+        Ok(new)
+    }
+
+    /// A copy of this address space for `fork`: the same regions, every
+    /// page shared copy-on-write.
+    pub fn fork(&self) -> KResult<Arc<Self>> {
+        let r = self.inner.lock();
+        let pml4 = paging::new_user_pml4().ok_or(Errno::ENOMEM)?;
+        let child = Arc::new(Self {
+            pml4,
+            inner: Mutex::new(Regions {
+                vmas: r.vmas.clone(),
+                brk_start: r.brk_start,
+                brk: r.brk,
+            }),
+        });
+        let result = paging::fork_user(self.pml4, pml4);
+        // Our writable pages just became read-only: drop stale TLB entries.
+        if crate::hal::x86::read_cr3() & !0xfff == self.pml4 {
+            unsafe { crate::hal::x86::write_cr3(self.pml4) };
+        }
+        result.map_err(|_| Errno::ENOMEM)?;
+        Ok(child)
     }
 
     /// Resolves a user page fault. Returns false if the access is invalid
@@ -358,7 +402,10 @@ impl AddressSpace {
         if !vma.allows(write, exec) {
             return false;
         }
-        if paging::user_entry(self.pml4, page_down(addr)).is_some() {
+        if let Some(e) = paging::user_entry(self.pml4, page_down(addr)) {
+            if write && e & flags::COW != 0 {
+                return Self::break_cow(self.pml4, page_down(addr), e, vma.page_flags()).is_ok();
+            }
             // Present, and the region allows the access: the entry's flags
             // are stale (they should not be). Make them match and retry.
             paging::protect_user(self.pml4, page_down(addr), vma.page_flags());

@@ -18,6 +18,10 @@ pub mod flags {
     pub const WRITE_THROUGH: u64 = 1 << 3;
     pub const NO_CACHE: u64 = 1 << 4;
     pub const HUGE: u64 = 1 << 7;
+    /// Software bit: a page shared copy-on-write. It is mapped read-only;
+    /// the first write copies it (or, if it is no longer shared, just makes
+    /// it writable).
+    pub const COW: u64 = 1 << 9;
     pub const NO_EXECUTE: u64 = 1 << 63;
 }
 
@@ -226,14 +230,60 @@ pub fn unmap_user(pml4: u64, virt: u64) -> Option<u64> {
     Some(phys)
 }
 
-/// Changes the flags of a present user page.
+/// Changes the flags of a present user page. A copy-on-write page stays
+/// read-only (and copy-on-write) whatever `page_flags` asks.
 pub fn protect_user(pml4: u64, virt: u64, page_flags: u64) {
     if let Some(e) = walk(pml4, virt, false).ok().flatten()
         && *e & flags::PRESENT != 0
     {
-        *e = (*e & ADDR_MASK) | page_flags | flags::PRESENT;
+        let mut f = page_flags;
+        if *e & flags::COW != 0 {
+            f = (f & !flags::WRITABLE) | flags::COW;
+        }
+        *e = (*e & ADDR_MASK) | f | flags::PRESENT;
         flush_if_current(pml4, virt);
     }
+}
+
+/// Replaces a present user page's entry outright (breaking copy-on-write).
+pub fn set_user_entry(pml4: u64, virt: u64, entry: u64) {
+    if let Some(e) = walk(pml4, virt, false).ok().flatten() {
+        *e = entry;
+        flush_if_current(pml4, virt);
+    }
+}
+
+/// Copies the lower half of `parent` into the empty `child` for `fork`:
+/// every page becomes shared, and every writable one copy-on-write in both
+/// (read-only until written). The caller flushes the parent's TLB.
+pub fn fork_user(parent: u64, child: u64) -> Result<(), MapError> {
+    fn copy(parent: u64, child: u64, level: u32, base: u64) -> Result<(), MapError> {
+        let span = 1u64 << (12 + 9 * level);
+        let entries = if level == 3 { KERNEL_HALF } else { 512 };
+        for i in 0..entries {
+            let e = &mut table(parent)[i];
+            if *e & flags::PRESENT == 0 {
+                continue;
+            }
+            let virt = base + i as u64 * span;
+            if level > 0 {
+                let c = &mut table(child)[i];
+                if *c & flags::PRESENT == 0 {
+                    let t = frame::alloc_zeroed().ok_or(MapError::OutOfMemory)?;
+                    *c = t | (*e & !ADDR_MASK);
+                }
+                copy(*e & ADDR_MASK, *c & ADDR_MASK, level - 1, virt)?;
+            } else {
+                if *e & flags::WRITABLE != 0 {
+                    *e = (*e & !flags::WRITABLE) | flags::COW;
+                }
+                frame::get(*e & ADDR_MASK);
+                table(child)[i] = *e;
+            }
+        }
+        Ok(())
+    }
+    copy(parent, child, 3, 0)
 }
 
 /// Frees a process's table: every lower-half page and table, then the

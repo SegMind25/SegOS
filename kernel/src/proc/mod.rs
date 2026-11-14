@@ -4,77 +4,127 @@
 //! process, its address space, and the CPU state that is per thread but
 //! not saved by the kernel's own context switch (FS/GS base, x87/SSE
 //! registers). The scheduler is unchanged; [`switch_hook`] swaps that extra
-//! state on every switch. In Phase 2 every process has one thread; `clone`
-//! with threads comes in Phase 5.
+//! state on every switch. Every process has one thread until `clone` with
+//! threads comes in Phase 5.
+//!
+//! Processes form the usual Unix tree: `fork` makes a child, `exit` leaves
+//! a zombie holding the wait status until the parent reaps it with
+//! `wait4`, and orphans are handed to init (pid 1). Process groups and
+//! sessions are what job control and the terminal use.
 
 pub mod elf;
+pub mod exec;
+pub mod faults;
+pub mod signal;
 
 use crate::abi::{Errno, KResult};
 use crate::fs::{self, FdTable, File, Inode};
-use crate::hal::idt::{TrapFrame, vector};
+use crate::hal::idt::TrapFrame;
 use crate::hal::percpu::this_cpu;
 use crate::hal::x86::{self, FxArea};
 use crate::mm::paging;
 use crate::mm::vm::AddressSpace;
 use crate::sync::{Mutex, SpinLock};
+use crate::task::wait::{Completion, WaitQueue};
 use crate::task::{self, Task};
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+pub use signal::{SigAction, signo};
 
-/// Signal numbers used by the kernel itself.
-pub mod signal {
-    pub const SIGILL: i32 = 4;
-    pub const SIGTRAP: i32 = 5;
-    pub const SIGABRT: i32 = 6;
-    pub const SIGBUS: i32 = 7;
-    pub const SIGFPE: i32 = 8;
-    pub const SIGKILL: i32 = 9;
-    pub const SIGSEGV: i32 = 11;
-    pub const SIGSTOP: i32 = 19;
-    pub const NSIG: usize = 64;
+/// Where a process is in its life, as `wait4` reports it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunState {
+    Running,
+    /// Stopped by `sig`; `reported` once a `wait4(WUNTRACED)` saw it.
+    Stopped {
+        sig: i32,
+        reported: bool,
+    },
+    /// Exited; the wait status, until the parent reaps it.
+    Zombie(i32),
 }
-
-pub struct Cwd {
-    pub inode: Arc<dyn Inode>,
-    /// Absolute, normalised: what `getcwd` returns.
-    pub path: String,
-}
-
-/// `struct sigaction` as the kernel sees it (handler, flags, restorer,
-/// mask). Stored and returned; delivery comes with Phase 3.
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct SigAction {
-    pub handler: u64,
-    pub flags: u64,
-    pub restorer: u64,
-    pub mask: u64,
-}
-
-unsafe impl crate::abi::Pod for SigAction {}
 
 pub struct Process {
     pub pid: u32,
-    pub ppid: u32,
+    pub ppid: AtomicU32,
+    pub pgid: AtomicU32,
+    pub sid: AtomicU32,
+    /// `comm`: the executable's name, at most 15 bytes.
     pub name: SpinLock<String>,
+    /// Absolute path of the executable (`/proc/<pid>/exe`).
+    pub exe: SpinLock<String>,
+    pub cmdline: SpinLock<Vec<String>>,
     pub files: Mutex<FdTable>,
-    pub cwd: Mutex<Cwd>,
+    pub cwd: SpinLock<Arc<dyn Inode>>,
     pub umask: AtomicU32,
     pub sigactions: SpinLock<[SigAction; signal::NSIG]>,
-    exited: AtomicBool,
-    /// The wait status (as `wait4` reports it) once exited.
-    status: AtomicI32,
+    pub children: SpinLock<Vec<Arc<Process>>>,
+    /// Bumped and woken whenever a child changes state.
+    pub child_events: AtomicU64,
+    pub child_wait: WaitQueue,
+    state: SpinLock<RunState>,
+    /// A SIGCONT not yet reported to a `wait4(WCONTINUED)`.
+    continued: AtomicBool,
+    /// Woken when a stopped process is continued (or killed).
+    pub(crate) stop_wait: WaitQueue,
+    /// Signal sent to the parent on exit (normally SIGCHLD).
+    exit_signal: i32,
+    /// Whether the process has the console as its controlling terminal.
+    pub has_ctty: AtomicBool,
+    /// The (only) thread, while it runs.
+    thread: SpinLock<Weak<Task>>,
+    /// Monotonic ns at creation (for /proc).
+    pub start_ns: u64,
 }
 
 impl Process {
-    pub fn exit_status(&self) -> Option<i32> {
-        self.exited
-            .load(Ordering::Acquire)
-            .then(|| self.status.load(Ordering::Relaxed))
+    pub fn state(&self) -> RunState {
+        *self.state.lock()
     }
+
+    pub fn exit_status(&self) -> Option<i32> {
+        match self.state() {
+            RunState::Zombie(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn thread(&self) -> Option<Arc<Task>> {
+        self.thread.lock().upgrade()
+    }
+
+    pub fn pgid(&self) -> u32 {
+        self.pgid.load(Ordering::Relaxed)
+    }
+
+    pub fn sid(&self) -> u32 {
+        self.sid.load(Ordering::Relaxed)
+    }
+
+    /// Tells the parent (and its `wait4`) that this process changed state.
+    fn notify_parent(&self) {
+        if let Some(parent) = lookup(self.ppid.load(Ordering::Relaxed)) {
+            parent.child_events.fetch_add(1, Ordering::Release);
+            parent.child_wait.wake_all();
+        }
+    }
+}
+
+/// Every process by pid, until it is reaped.
+static TABLE: SpinLock<BTreeMap<u32, Arc<Process>>> = SpinLock::new(BTreeMap::new());
+static NEXT_PID: AtomicU32 = AtomicU32::new(1);
+
+pub fn lookup(pid: u32) -> Option<Arc<Process>> {
+    TABLE.lock().get(&pid).cloned()
+}
+
+/// All processes, in pid order.
+pub fn all() -> Vec<Arc<Process>> {
+    TABLE.lock().values().cloned().collect()
 }
 
 /// The per-thread state of a user thread.
@@ -89,20 +139,18 @@ pub struct UserThread {
     pub gs_base: AtomicU64,
     pub clear_child_tid: AtomicU64,
     pub robust_list: AtomicU64,
-    pub sigmask: AtomicU64,
-    /// Signals sent while blocked (bit n-1 for signal n).
-    pub sigpending: AtomicU64,
+    pub(crate) sig: signal::ThreadSignals,
     /// Saved x87/SSE state; only the CPU switching the thread touches it.
     fpu: UnsafeCell<FxArea>,
-    /// Where the thread starts in user mode: (rip, rsp).
-    start: (u64, u64),
     /// A wait status to exit with on the way back to user mode.
     pending_exit: AtomicI32,
+    /// Completed when a `vfork` child execs or exits.
+    vfork_done: SpinLock<Option<Arc<Completion>>>,
 }
 
-const NO_EXIT: i32 = i32::MIN;
-
 unsafe impl Sync for UserThread {}
+
+const NO_EXIT: i32 = i32::MIN;
 
 impl UserThread {
     pub fn mm(&self) -> Arc<AddressSpace> {
@@ -127,9 +175,29 @@ impl UserThread {
         let s = self.pending_exit.swap(NO_EXIT, Ordering::Relaxed);
         (s != NO_EXIT).then_some(s)
     }
-}
 
-static NEXT_PID: AtomicU32 = AtomicU32::new(1);
+    /// Switches this (running) thread to `mm`, returning the old one. The
+    /// caller drops it once nothing on this CPU uses it.
+    pub(crate) fn replace_mm(&self, mm: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
+        x86::without_interrupts(|| {
+            self.pml4.store(mm.pml4(), Ordering::Relaxed);
+            unsafe { x86::write_cr3(mm.pml4()) };
+            self.mm.lock().replace(mm)
+        })
+    }
+
+    /// Loads a fresh FPU state (for execve) into the CPU.
+    pub(crate) fn reset_fpu(&self) {
+        x86::fxrstor(&FxArea::initial());
+    }
+
+    /// Wakes a parent waiting in `vfork`.
+    pub(crate) fn release_vfork_parent(&self) {
+        if let Some(c) = self.vfork_done.lock().take() {
+            c.complete();
+        }
+    }
+}
 
 /// What a new process gets as descriptors 0, 1 and 2.
 pub fn console_stdio() -> KResult<[Arc<File>; 3]> {
@@ -139,72 +207,231 @@ pub fn console_stdio() -> KResult<[Arc<File>; 3]> {
     Ok([f.clone(), f.clone(), f])
 }
 
-/// Starts the program at `path` as a new process, with `stdio` as
-/// descriptors 0 to 2. Returns its thread (join it to wait for the exit).
-pub fn spawn(
-    path: &str,
-    argv: &[&str],
-    envp: &[&str],
-    stdio: [Arc<File>; 3],
-) -> KResult<Arc<Task>> {
-    let root = fs::root();
-    let inode = fs::lookup(&root, path)?;
-    if inode.file_type() != fs::FileType::Regular {
-        return Err(Errno::EACCES);
+/// A user-mode register frame starting at `rip` with stack `rsp`, every
+/// general register zero.
+pub fn initial_frame(rip: u64, rsp: u64) -> TrapFrame {
+    use crate::hal::gdt::{USER_CODE, USER_DATA};
+    TrapFrame {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        vector: 0,
+        error_code: 0,
+        rip,
+        cs: USER_CODE as u64,
+        rflags: 0x202,
+        rsp,
+        ss: USER_DATA as u64,
     }
-    let mut bytes = alloc::vec![0u8; inode.size() as usize];
-    let n = inode.read_at(0, &mut bytes)?;
-    bytes.truncate(n);
+}
 
-    let mm = AddressSpace::new()?;
-    let image = elf::load(&mm, &bytes)?;
-    drop(bytes);
-    mm.init_brk(image.end);
-    let rsp = elf::build_stack(&mm, &image, path, argv, envp)?;
-
-    let mut files = FdTable::default();
-    for (fd, f) in stdio.into_iter().enumerate() {
-        files.set(fd, f, false);
-    }
-    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let process = Arc::new(Process {
+fn new_process(
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    sid: u32,
+    files: FdTable,
+    cwd: Arc<dyn Inode>,
+) -> Process {
+    Process {
         pid,
-        ppid: 0,
-        name: SpinLock::new(name.to_string()),
+        ppid: AtomicU32::new(ppid),
+        pgid: AtomicU32::new(pgid),
+        sid: AtomicU32::new(sid),
+        name: SpinLock::new(String::new()),
+        exe: SpinLock::new(String::new()),
+        cmdline: SpinLock::new(Vec::new()),
         files: Mutex::new(files),
-        cwd: Mutex::new(Cwd {
-            inode: root,
-            path: "/".to_string(),
-        }),
+        cwd: SpinLock::new(cwd),
         umask: AtomicU32::new(0o022),
         sigactions: SpinLock::new([SigAction::default(); signal::NSIG]),
-        exited: AtomicBool::new(false),
-        status: AtomicI32::new(0),
-    });
-    let thread = UserThread {
+        children: SpinLock::new(Vec::new()),
+        child_events: AtomicU64::new(0),
+        child_wait: WaitQueue::new(),
+        state: SpinLock::new(RunState::Running),
+        continued: AtomicBool::new(false),
+        stop_wait: WaitQueue::new(),
+        exit_signal: signo::SIGCHLD,
+        has_ctty: AtomicBool::new(false),
+        thread: SpinLock::new(Weak::new()),
+        start_ns: crate::time::monotonic_ns(),
+    }
+}
+
+fn new_thread(process: Arc<Process>, mm: Arc<AddressSpace>) -> UserThread {
+    UserThread {
+        tid: process.pid,
         process,
-        tid: pid,
         pml4: AtomicU64::new(mm.pml4()),
         mm: SpinLock::new(Some(mm)),
         fs_base: AtomicU64::new(0),
         gs_base: AtomicU64::new(0),
         clear_child_tid: AtomicU64::new(0),
         robust_list: AtomicU64::new(0),
-        sigmask: AtomicU64::new(0),
-        sigpending: AtomicU64::new(0),
+        sig: signal::ThreadSignals::default(),
         fpu: UnsafeCell::new(FxArea::initial()),
-        start: (image.entry, rsp),
         pending_exit: AtomicI32::new(NO_EXIT),
-    };
-    Ok(task::spawn_user(thread))
+        vfork_done: SpinLock::new(None),
+    }
 }
 
-/// First run of a user thread, on its kernel stack (called by the
-/// scheduler's task start-up, with the thread's state already loaded).
-pub fn start_user(t: &UserThread) -> ! {
-    let (rip, rsp) = t.start;
-    crate::hal::user::enter_user(rip, rsp)
+/// Starts the program at `path` as a new process (a new session and
+/// process group, child of nobody: the kernel starts it), with `stdio` as
+/// descriptors 0 to 2 and, with `controlling_tty`, the console as its
+/// terminal. Returns its thread (join it to wait for the exit).
+pub fn spawn(
+    path: &str,
+    argv: &[&str],
+    envp: &[&str],
+    stdio: [Arc<File>; 3],
+    controlling_tty: bool,
+) -> KResult<Arc<Task>> {
+    let root = fs::root();
+    let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    let envp: Vec<String> = envp.iter().map(|s| s.to_string()).collect();
+    let image = exec::prepare(&root, path, argv, envp)?;
+
+    let mut files = FdTable::default();
+    for (fd, f) in stdio.into_iter().enumerate() {
+        files.set(fd, f, false);
+    }
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let process = Arc::new(new_process(pid, 0, pid, pid, files, root));
+    exec::set_identity(&process, &image);
+    if controlling_tty {
+        crate::tty::console().make_controlling(&process);
+    }
+    let mm = image.mm.clone();
+    let frame = initial_frame(image.entry, image.rsp);
+    let thread = new_thread(process.clone(), mm);
+    TABLE.lock().insert(pid, process.clone());
+    let task = task::spawn_user(thread, frame);
+    *process.thread.lock() = Arc::downgrade(&task);
+    Ok(task)
+}
+
+/// `clone` flags (sched.h).
+pub mod clone_flags {
+    pub const CSIGNAL: u64 = 0xff;
+    pub const CLONE_VM: u64 = 0x100;
+    pub const CLONE_FS: u64 = 0x200;
+    pub const CLONE_FILES: u64 = 0x400;
+    pub const CLONE_SIGHAND: u64 = 0x800;
+    pub const CLONE_VFORK: u64 = 0x4000;
+    pub const CLONE_PARENT: u64 = 0x8000;
+    pub const CLONE_THREAD: u64 = 0x10000;
+    pub const CLONE_SETTLS: u64 = 0x80000;
+    pub const CLONE_PARENT_SETTID: u64 = 0x100000;
+    pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+    pub const CLONE_CHILD_SETTID: u64 = 0x1000000;
+    /// Namespaces and the like: Phase 8.
+    pub const UNSUPPORTED: u64 = 0x7e02_0000 | 0x2000_0000;
+}
+
+/// `fork`, `vfork` and `clone` (processes, not threads yet). `frame` is the
+/// parent's saved user state; the child resumes from a copy of it with
+/// RAX = 0. Returns the child's pid.
+pub fn clone(
+    t: &UserThread,
+    frame: &TrapFrame,
+    flags: u64,
+    stack: u64,
+    ptid: u64,
+    ctid: u64,
+    tls: u64,
+) -> KResult<u32> {
+    use clone_flags::*;
+    if flags & CLONE_THREAD != 0 {
+        // Threads come with glibc support in Phase 5.
+        return Err(Errno::ENOSYS);
+    }
+    if flags & UNSUPPORTED != 0 || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0) {
+        return Err(Errno::EINVAL);
+    }
+    let parent = &t.process;
+    let parent_mm = t.mm();
+    let mm = if flags & CLONE_VM != 0 {
+        parent_mm.clone()
+    } else {
+        parent_mm.fork()?
+    };
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let ppid = if flags & CLONE_PARENT != 0 {
+        parent.ppid.load(Ordering::Relaxed)
+    } else {
+        parent.pid
+    };
+    let files = parent.files.lock().clone();
+    let cwd = parent.cwd.lock().clone();
+    let mut child = new_process(pid, ppid, parent.pgid(), parent.sid(), files, cwd);
+    child.exit_signal = (flags & CSIGNAL) as i32;
+    *child.name.get_mut() = parent.name.lock().clone();
+    *child.exe.get_mut() = parent.exe.lock().clone();
+    *child.cmdline.get_mut() = parent.cmdline.lock().clone();
+    child.umask = AtomicU32::new(parent.umask.load(Ordering::Relaxed));
+    *child.sigactions.get_mut() = *parent.sigactions.lock();
+    child
+        .has_ctty
+        .store(parent.has_ctty.load(Ordering::Relaxed), Ordering::Relaxed);
+    let child = Arc::new(child);
+
+    let thread = new_thread(child.clone(), mm.clone());
+    thread.fs_base.store(
+        if flags & CLONE_SETTLS != 0 {
+            tls
+        } else {
+            t.fs_base.load(Ordering::Relaxed)
+        },
+        Ordering::Relaxed,
+    );
+    thread
+        .gs_base
+        .store(t.gs_base.load(Ordering::Relaxed), Ordering::Relaxed);
+    thread.sig.inherit(&t.sig);
+    // The parent's FPU registers are live in the CPU (the kernel never
+    // touches them): copy them.
+    x86::fxsave(unsafe { &mut *thread.fpu.get() });
+    if flags & CLONE_CHILD_CLEARTID != 0 {
+        thread.clear_child_tid.store(ctid, Ordering::Relaxed);
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
+        mm.write(ctid, &pid)?;
+    }
+    if flags & CLONE_PARENT_SETTID != 0 {
+        parent_mm.write(ptid, &pid)?;
+    }
+    let vfork = (flags & CLONE_VFORK != 0).then(|| Arc::new(Completion::default()));
+    *thread.vfork_done.lock() = vfork.clone();
+
+    let mut child_frame = *frame;
+    child_frame.rax = 0;
+    if stack != 0 {
+        child_frame.rsp = stack;
+    }
+    if let Some(p) = lookup(ppid) {
+        p.children.lock().push(child.clone());
+    }
+    TABLE.lock().insert(pid, child.clone());
+    let task = task::spawn_user(thread, child_frame);
+    *child.thread.lock() = Arc::downgrade(&task);
+    drop(task);
+    if let Some(done) = vfork {
+        // The child borrows our memory until it execs or exits.
+        done.wait();
+    }
+    Ok(pid)
 }
 
 /// Swaps the per-thread CPU state that `switch_context` does not: the
@@ -265,66 +492,198 @@ pub fn exit(status: i32) -> ! {
         });
         let mm = u.mm.lock().take();
         drop(mm);
-        p.status.store(status, Ordering::Relaxed);
-        p.exited.store(true, Ordering::Release);
-        crate::debug!(
-            "process {} ({}) exited, status {:#x}",
-            p.pid,
-            p.name.lock().as_str(),
-            status
-        );
+        u.release_vfork_parent();
+        // Orphans go to init.
+        let orphans = core::mem::take(&mut *p.children.lock());
+        if !orphans.is_empty() {
+            if let Some(init) = lookup(1).filter(|i| i.pid != p.pid) {
+                let mut any_zombie = false;
+                for c in &orphans {
+                    c.ppid.store(1, Ordering::Relaxed);
+                    any_zombie |= c.exit_status().is_some();
+                }
+                init.children.lock().extend(orphans);
+                if any_zombie {
+                    init.child_events.fetch_add(1, Ordering::Release);
+                    init.child_wait.wake_all();
+                }
+            } else {
+                for c in orphans {
+                    c.ppid.store(0, Ordering::Relaxed);
+                    if c.exit_status().is_some() {
+                        TABLE.lock().remove(&c.pid);
+                    }
+                }
+            }
+        }
+        *p.state.lock() = RunState::Zombie(status);
+        let parent = lookup(p.ppid.load(Ordering::Relaxed));
+        match parent {
+            Some(parent) => {
+                let auto_reap = signal::parent_ignores_children(&parent);
+                if p.exit_signal != 0 {
+                    signal::send(&parent, p.exit_signal, signal::SigInfo::child(p, status));
+                }
+                if auto_reap {
+                    parent.children.lock().retain(|c| c.pid != p.pid);
+                    TABLE.lock().remove(&p.pid);
+                }
+                p.notify_parent();
+            }
+            // Started by the kernel: nobody will reap it but the kernel's
+            // `join`; keep the status readable through the Arc.
+            None => {
+                TABLE.lock().remove(&p.pid);
+            }
+        }
     }
     task::exit()
 }
 
-/// Terminates the current process by signal `sig`, as the default action
-/// of a fatal signal does.
-pub fn kill_self(sig: i32) -> ! {
-    exit(sig & 0x7f)
+/// `wait4` options.
+pub mod wait_flags {
+    pub const WNOHANG: u32 = 1;
+    pub const WUNTRACED: u32 = 2;
+    pub const WCONTINUED: u32 = 8;
 }
 
-/// An exception in user mode: a page fault to resolve, or a fatal signal.
-pub fn user_exception(frame: &mut TrapFrame) {
-    // CR2 first: a page fault elsewhere would overwrite it once interrupts
-    // are on and another thread runs.
-    let cr2 = x86::read_cr2();
-    x86::enable_interrupts();
-    let task = current();
-    let u = task.user().unwrap();
-    let sig = match frame.vector {
-        vector::PAGE_FAULT => {
-            let write = frame.error_code & 2 != 0;
-            let exec = frame.error_code & 16 != 0;
-            if u.mm().handle_fault(cr2, write, exec) {
-                x86::disable_interrupts();
-                return;
-            }
-            signal::SIGSEGV
-        }
-        vector::DIVIDE_ERROR | 16 | 19 => signal::SIGFPE,
-        vector::INVALID_OPCODE => signal::SIGILL,
-        vector::BREAKPOINT | 1 => signal::SIGTRAP,
-        17 => signal::SIGBUS,
-        _ => signal::SIGSEGV,
+/// What `wait4` found: (pid, wait status).
+pub fn wait(me: &Arc<Process>, pid: i32, options: u32) -> KResult<Option<(u32, i32)>> {
+    use wait_flags::*;
+    let matches = |c: &Process| match pid {
+        -1 => true,
+        0 => c.pgid() == me.pgid(),
+        p if p > 0 => c.pid == p as u32,
+        p => c.pgid() == p.unsigned_abs(),
     };
-    let p = &u.process;
-    crate::info!(
-        "{}[{}]: {} at rip {:#x}{} (vector {}, error {:#x}): killed by signal {}",
-        p.name.lock().as_str(),
-        p.pid,
-        crate::hal::idt::exception_name(frame.vector),
-        frame.rip,
-        if frame.vector == vector::PAGE_FAULT {
-            alloc::format!(", address {cr2:#x}")
+    loop {
+        let seen = me.child_events.load(Ordering::Acquire);
+        let mut found = false;
+        {
+            let mut children = me.children.lock();
+            let mut reap = None;
+            for (i, c) in children.iter().enumerate() {
+                if !matches(c) {
+                    continue;
+                }
+                found = true;
+                let mut st = c.state.lock();
+                match *st {
+                    RunState::Zombie(status) => {
+                        reap = Some((i, c.pid, status));
+                        break;
+                    }
+                    RunState::Stopped { sig, reported }
+                        if options & WUNTRACED != 0 && !reported =>
+                    {
+                        *st = RunState::Stopped {
+                            sig,
+                            reported: true,
+                        };
+                        return Ok(Some((c.pid, (sig << 8) | 0x7f)));
+                    }
+                    RunState::Running
+                        if options & WCONTINUED != 0
+                            && c.continued.swap(false, Ordering::Relaxed) =>
+                    {
+                        return Ok(Some((c.pid, 0xffff)));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((i, pid, status)) = reap {
+                children.remove(i);
+                drop(children);
+                TABLE.lock().remove(&pid);
+                return Ok(Some((pid, status)));
+            }
+        }
+        if !found {
+            return Err(Errno::ECHILD);
+        }
+        if options & WNOHANG != 0 {
+            return Ok(None);
+        }
+        me.child_wait
+            .wait_interruptible(|| me.child_events.load(Ordering::Acquire) != seen)?;
+    }
+}
+
+/// Stops the current process (the default action of SIGSTOP and friends)
+/// until SIGCONT or SIGKILL.
+pub(crate) fn stop_self(p: &Arc<Process>, sig: i32) {
+    *p.state.lock() = RunState::Stopped {
+        sig,
+        reported: false,
+    };
+    if let Some(parent) = lookup(p.ppid.load(Ordering::Relaxed))
+        && !signal::parent_ignores_stops(&parent)
+    {
+        signal::send(
+            &parent,
+            signo::SIGCHLD,
+            signal::SigInfo::child_stopped(p, sig),
+        );
+    }
+    p.notify_parent();
+    p.stop_wait.wait_until(|| {
+        !matches!(*p.state.lock(), RunState::Stopped { .. }) || signal::kill_pending()
+    });
+}
+
+/// SIGCONT: lets a stopped process run again.
+pub(crate) fn continue_process(p: &Arc<Process>) {
+    let was_stopped = {
+        let mut st = p.state.lock();
+        if matches!(*st, RunState::Stopped { .. }) {
+            *st = RunState::Running;
+            true
         } else {
-            String::new()
-        },
-        frame.vector,
-        frame.error_code,
-        sig
-    );
-    drop(task);
-    kill_self(sig)
+            false
+        }
+    };
+    if was_stopped {
+        p.continued.store(true, Ordering::Relaxed);
+        p.stop_wait.wake_all();
+        p.notify_parent();
+    }
+}
+
+/// Process groups and sessions.
+pub fn setpgid(me: &Arc<Process>, pid: u32, pgid: u32) -> KResult<()> {
+    let target = if pid == 0 || pid == me.pid {
+        me.clone()
+    } else {
+        let t = lookup(pid).ok_or(Errno::ESRCH)?;
+        if t.ppid.load(Ordering::Relaxed) != me.pid {
+            return Err(Errno::ESRCH);
+        }
+        t
+    };
+    let pgid = if pgid == 0 { target.pid } else { pgid };
+    if target.sid() != me.sid() || target.sid() == target.pid {
+        // Another session's process, or a session leader.
+        return Err(Errno::EPERM);
+    }
+    if pgid != target.pid
+        && !all()
+            .iter()
+            .any(|p| p.pgid() == pgid && p.sid() == me.sid())
+    {
+        return Err(Errno::EPERM);
+    }
+    target.pgid.store(pgid, Ordering::Relaxed);
+    Ok(())
+}
+
+pub fn setsid(me: &Arc<Process>) -> KResult<u32> {
+    if all().iter().any(|p| p.pgid() == me.pid) {
+        return Err(Errno::EPERM);
+    }
+    me.sid.store(me.pid, Ordering::Relaxed);
+    me.pgid.store(me.pid, Ordering::Relaxed);
+    me.has_ctty.store(false, Ordering::Relaxed);
+    Ok(me.pid)
 }
 
 /// Reads a NULL-terminated array of string pointers (argv, envp).

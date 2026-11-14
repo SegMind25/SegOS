@@ -53,10 +53,9 @@ const TESTS: &[(&str, fn())] = &[
         user_exit_code,
     ),
     ("user: a null write is SIGSEGV, ud2 is SIGILL", user_faults),
-    (
-        "user: /init (musl hello world) prints and exits 0",
-        user_hello,
-    ),
+    ("user: musl hello world prints and exits 0", user_hello),
+    ("user: BusyBox sh runs ls | grep | wc", user_pipeline),
+    ("user: fork shares pages copy-on-write", user_cow_frames),
     (
         "user: conformance tests print what Linux printed",
         user_conformance,
@@ -384,13 +383,21 @@ fn path_lookup() {
 }
 
 fn initramfs_present() {
-    let init = fs::lookup(&fs::root(), "/init").expect("no /init in the initramfs");
+    let root = fs::root();
+    let init = fs::lookup(&root, "/init").expect("no /init in the initramfs");
     assert_eq!(init.file_type(), FileType::Regular);
     assert_eq!(init.perm() & 0o111, 0o111);
+    let bb = fs::lookup(&root, "/bin/busybox").expect("no BusyBox");
     let mut magic = [0u8; 4];
-    init.read_at(0, &mut magic).unwrap();
+    bb.read_at(0, &mut magic).unwrap();
     assert_eq!(&magic, b"\x7fELF");
-    assert!(fs::lookup(&fs::root(), "/tests").is_ok());
+    // Applets are symbolic links to it.
+    let sh = fs::lookup_nofollow(&root, "/bin/sh").unwrap();
+    assert_eq!(sh.file_type(), FileType::Symlink);
+    assert_eq!(sh.readlink().unwrap(), "/bin/busybox");
+    let (target, path) = fs::resolve(&root, "/bin/sh", true).unwrap();
+    assert_eq!((target.ino(), path.as_str()), (bb.ino(), "/bin/busybox"));
+    assert!(fs::lookup(&root, "/tests").is_ok());
 }
 
 /// A minimal static ELF executable around `code`, loaded at 0x400000.
@@ -420,26 +427,47 @@ fn tiny_elf(code: &[u8]) -> Vec<u8> {
 
 /// Runs `path` with stdout and stderr captured; returns (wait status,
 /// output).
+/// Runs `path` with stdout captured (what is compared with Linux) and
+/// stderr shown on the kernel log; returns (wait status, stdout).
 fn run_captured(path: &str, argv: &[&str]) -> (i32, Vec<u8>) {
     let root = fs::root();
     let tmp = fs::lookup(&root, "/tmp").unwrap();
-    let name = alloc::format!("ktest-{}.out", NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed));
-    let out = tmp.create(&name, FileType::Regular, 0o600).unwrap();
+    let n = NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed);
+    let (out_name, err_name) = (
+        alloc::format!("ktest-{n}.out"),
+        alloc::format!("ktest-{n}.err"),
+    );
+    let out = tmp.create(&out_name, FileType::Regular, 0o600).unwrap();
+    let err = tmp.create(&err_name, FileType::Regular, 0o600).unwrap();
     let null = fs::lookup(&root, "/dev/null").unwrap();
     let stdin = fs::File::new(null, open::O_RDONLY);
     let stdout = fs::File::new(out.clone(), open::O_WRONLY);
+    let stderr = fs::File::new(err.clone(), open::O_WRONLY);
     let t = proc::spawn(
         path,
         argv,
-        &["HOME=/", "PATH=/bin"],
-        [stdin, stdout.clone(), stdout],
+        &["HOME=/", "PATH=/usr/sbin:/usr/bin:/sbin:/bin"],
+        [stdin, stdout, stderr],
+        false,
     )
     .unwrap_or_else(|e| panic!("cannot start {path}: {e:?}"));
     t.join();
     let status = t.user().unwrap().process.exit_status().unwrap();
-    let mut data = alloc::vec![0u8; out.size() as usize];
-    out.read_at(0, &mut data).unwrap();
-    tmp.remove(&name, false).unwrap();
+    let read_all = |f: &Arc<dyn fs::Inode>| {
+        let mut data = alloc::vec![0u8; f.size() as usize];
+        f.read_at(0, &mut data).unwrap();
+        data
+    };
+    let data = read_all(&out);
+    let errors = read_all(&err);
+    if !errors.is_empty() {
+        crate::console::print(format_args!(
+            "[stderr of {path}: {}] ",
+            String::from_utf8_lossy(&errors).trim_end()
+        ));
+    }
+    tmp.remove(&out_name, false).unwrap();
+    tmp.remove(&err_name, false).unwrap();
     (status, data)
 }
 
@@ -475,7 +503,7 @@ fn user_faults() {
 }
 
 fn user_hello() {
-    let (status, out) = run_captured("/init", &["/init"]);
+    let (status, out) = run_captured("/usr/bin/hello", &["hello"]);
     assert_eq!(String::from_utf8_lossy(&out), "Hello, world!\n");
     assert_eq!(status, 0);
 }
@@ -487,25 +515,37 @@ fn user_conformance() {
         if name.ends_with(".expected") || inode.file_type() != FileType::Regular {
             continue;
         }
-        let expected = fs::lookup(&tests, &alloc::format!("{name}.expected"))
+        let base = name.trim_end_matches(".sh");
+        let expected = fs::lookup(&tests, &alloc::format!("{base}.expected"))
             .unwrap_or_else(|_| panic!("/tests/{name} has no .expected"));
         let mut want = alloc::vec![0u8; expected.size() as usize];
         expected.read_at(0, &mut want).unwrap();
         let path = alloc::format!("/tests/{name}");
-        let (status, got) = run_captured(&path, &[&path]);
+        crate::console::print(format_args!("{name} "));
+        // Scripts run with BusyBox's sh, programs directly.
+        let (status, got) = if name.ends_with(".sh") {
+            run_captured("/bin/sh", &["sh", &path])
+        } else {
+            run_captured(&path, &[&path])
+        };
         if got != want {
             let (g, w) = (
                 String::from_utf8_lossy(&got),
                 String::from_utf8_lossy(&want),
             );
-            for (i, (a, b)) in g.lines().zip(w.lines()).enumerate() {
-                if a != b {
-                    kprintln!(
-                        "\n  line {}: got      {a}\n  line {}: expected {b}",
-                        i + 1,
-                        i + 1
-                    );
-                }
+            let first = g
+                .lines()
+                .zip(w.lines())
+                .position(|(a, b)| a != b)
+                .unwrap_or(g.lines().count().min(w.lines().count()));
+            kprintln!(
+                "\n  first difference at line {}:\n  got      {:?}\n  expected {:?}\n  full output:",
+                first + 1,
+                g.lines().nth(first).unwrap_or("(end)"),
+                w.lines().nth(first).unwrap_or("(end)")
+            );
+            for line in g.lines() {
+                kprintln!("  | {line}");
             }
             panic!(
                 "{path}: output differs from Linux ({} lines, expected {})",
@@ -521,14 +561,52 @@ fn user_conformance() {
 
 fn user_memory_freed() {
     // Warm up (heap growth, capture file names), then measure.
-    run_captured("/init", &["/init"]);
+    run_captured("/usr/bin/hello", &["hello"]);
     time::sleep_ms(20);
     let free = mm::frame::free_count();
     for _ in 0..5 {
-        assert_eq!(run_captured("/init", &["/init"]).0, 0);
+        assert_eq!(run_captured("/usr/bin/hello", &["hello"]).0, 0);
     }
     time::sleep_ms(20);
     let lost = free.saturating_sub(mm::frame::free_count());
     // Kernel stacks' page tables may stay; process memory must not.
     assert!(lost < 16, "{lost} frames not returned after 5 runs");
+}
+
+fn user_pipeline() {
+    // The Phase 3 demo, in BusyBox's shell.
+    let script = "mkdir -p /tmp/demo && cd /tmp/demo && touch apple banana cherry \
+                  && ls | grep an | wc -l && cd / && rm -r /tmp/demo";
+    let (status, out) = run_captured("/bin/sh", &["sh", "-c", script]);
+    assert_eq!(String::from_utf8_lossy(&out), "1\n");
+    assert_eq!(status, 0);
+}
+
+fn user_cow_frames() {
+    // After fork, parent and child share every page until one writes.
+    let parent = AddressSpace::new().unwrap();
+    parent
+        .map(0x40_0000, 0x2000, PROT_READ | PROT_WRITE, Kind::Anon, false)
+        .unwrap();
+    parent.copy_to(0x40_0000, b"parent").unwrap();
+    let child = parent.fork().unwrap();
+    let e = mm::paging::user_entry(parent.pml4(), 0x40_0000).unwrap();
+    let phys = mm::paging::entry_phys(e);
+    assert_eq!(mm::frame::ref_count(phys), 2);
+    assert_eq!(
+        e & mm::paging::flags::WRITABLE,
+        0,
+        "shared pages are read-only"
+    );
+    child.copy_to(0x40_0000, b"child!").unwrap();
+    let mut b = [0u8; 6];
+    parent.copy_from(0x40_0000, &mut b).unwrap();
+    assert_eq!(&b, b"parent");
+    child.copy_from(0x40_0000, &mut b).unwrap();
+    assert_eq!(&b, b"child!");
+    assert_eq!(mm::frame::ref_count(phys), 1, "the child got its own copy");
+    // The last holder writes in place, without copying.
+    assert!(parent.handle_fault(0x40_0000, true, false));
+    let e2 = mm::paging::user_entry(parent.pml4(), 0x40_0000).unwrap();
+    assert_eq!(mm::paging::entry_phys(e2), phys);
 }

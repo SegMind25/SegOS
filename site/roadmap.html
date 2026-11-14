@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Roadmap: SegOS</title>
-  <meta name="description" content="The SegOS roadmap: 11 phases from kernel bring-up to running Steam and Proton games on a from-scratch Rust kernel that implements the Linux ABI. Phases 0, 1 and 2 are done: a Linux program built with musl runs unmodified. Phase 3, a shell, is next.">
+  <meta name="description" content="The SegOS roadmap: 11 phases from kernel bring-up to running Steam and Proton games on a from-scratch Rust kernel that implements the Linux ABI. Phases 0 to 3 are done: Ubuntu's BusyBox runs unmodified as an interactive shell. Phase 4, real disks, is next.">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f7f5f1" media="(prefers-color-scheme: light)">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="SegOS">
   <meta property="og:title" content="SegOS roadmap: from bring-up to Steam">
-  <meta property="og:description" content="11 phases, each ending in a working demo. Phases 0 to 2 done: bring-up, multitasking on every CPU, and the first unmodified Linux program. Phase 3, a shell, next.">
+  <meta property="og:description" content="11 phases, each ending in a working demo. Phases 0 to 3 done: bring-up, multitasking, the first Linux program, and a shell (BusyBox, unmodified). Phase 4, real disks, next.">
   <meta property="og:image" content="/assets/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -41,7 +41,7 @@
   <main id="main">
     <div class="wrap">
       <section class="hero" aria-labelledby="hero-title" style="padding-bottom:1.5rem">
-        <p class="eyebrow"><span class="dot" aria-hidden="true"></span><span>3 of 11 phases done</span></p>
+        <p class="eyebrow"><span class="dot" aria-hidden="true"></span><span>4 of 11 phases done</span></p>
         <h1 id="hero-title">From bring-up to Steam, one demo at a time.</h1>
         <p class="lede">
           Every phase ends with a demo that must work in QEMU and in CI, and no
@@ -51,10 +51,10 @@
         </p>
       </section>
 
-      <div class="progress" role="img" aria-label="Progress: phases 0 to 2 done, phase 3 next, phases 4 to 10 planned">
-        <span class="done"></span><span class="done"></span><span class="done"></span><span class="wip"></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+      <div class="progress" role="img" aria-label="Progress: phases 0 to 3 done, phase 4 next, phases 5 to 10 planned">
+        <span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="wip"></span><span></span><span></span><span></span><span></span><span></span><span></span>
       </div>
-      <p class="progress-legend">Phases 0&ndash;2 done &middot; Phase 3 next &middot; Phases 4&ndash;10 planned</p>
+      <p class="progress-legend">Phases 0&ndash;3 done &middot; Phase 4 next &middot; Phases 5&ndash;10 planned</p>
 
       <div class="table-wrap">
         <table class="phases">
@@ -90,19 +90,19 @@
               <td data-label="Effort" class="effort">1&ndash;2 months</td>
               <td class="status"><span class="badge done">Done</span></td>
             </tr>
-            <tr class="is-wip">
+            <tr class="is-done">
               <th scope="row"><span class="num">3</span> A shell</th>
               <td data-label="What gets built"><code>fork</code> with copy-on-write, <code>execve</code>, <code>wait4</code>, pipes, signals, TTY + line discipline, <code>ioctl(TCGETS&hellip;)</code>, devfs, procfs basics</td>
               <td data-label="Done when">BusyBox <code>sh</code> runs; <code>ls | grep | wc</code> works</td>
               <td data-label="Effort" class="effort">2&ndash;3 months</td>
-              <td class="status"><span class="badge wip">Next</span></td>
+              <td class="status"><span class="badge done">Done</span></td>
             </tr>
-            <tr>
+            <tr class="is-wip">
               <th scope="row"><span class="num">4</span> Real storage</th>
               <td data-label="What gets built">PCI, virtio-blk, NVMe, AHCI, page cache, ext4 (read, then write), fat32 for the EFI partition</td>
               <td data-label="Done when">Boots from a disk with a full rootfs</td>
               <td data-label="Effort" class="effort">2&ndash;3 months</td>
-              <td class="status"><span class="badge planned">Planned</span></td>
+              <td class="status"><span class="badge wip">Next</span></td>
             </tr>
             <tr>
               <th scope="row"><span class="num">5</span> glibc and dynamic linking</th>

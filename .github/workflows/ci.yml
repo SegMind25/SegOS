@@ -10,7 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       # musl-tools: the userland test programs are built for Linux with
-      # musl-gcc, exactly as a Linux user would build them.
+      # musl-gcc, exactly as a Linux user would build them. (xtask also
+      # fetches Ubuntu's busybox-static with apt-get download.)
       - name: Install QEMU, OVMF and musl
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf musl-tools
       - name: Allow KVM (faster QEMU)
@@ -27,6 +28,7 @@ jobs:
           cargo clippy -p xtask -- -D warnings
           cargo clippy -p segboot --target x86_64-unknown-uefi -- -D warnings
           cargo clippy -p segkernel --target x86_64-unknown-none -- -D warnings
+      # Tests on Linux, in-kernel tests, then a shell session over serial.
       - name: Kernel tests in QEMU
         run: cargo xtask test
       # Optimised code exposes bugs (inline asm register sharing, UB) that

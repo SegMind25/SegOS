@@ -1,0 +1,55 @@
+# the Phase 3 demo: ls | grep | wc
+1
+1
+grape
+cherry
+# pipelines and filters
+2 a
+1 b
+1 c
+WORLD
+sum 55
+3
+# redirection
+hello
+world
+12
+ls failed with 1
+stderr went to err.txt
+via fd 3
+# exit status, && and ||
+false failed
+true succeeded
+status 3
+killed: status 143
+# substitution, arithmetic, loops, functions
+SUB
+4
+sum 15
+square 144
+starts with b
+# background jobs and wait
+waited: status 0
+background exit 4
+# traps and signals
+trapped USR1
+child got TERM
+# files, links, permissions
+fruit/apple
+is a symlink
+2 links
+hello
+640
+a/b/c/deep
+a removed
+copies match
+# here-document and read
+line one
+line two
+second first
+# /proc
+/proc/self is a pid
+1
+cat
+done
+exit trap

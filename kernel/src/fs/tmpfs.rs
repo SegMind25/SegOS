@@ -1,5 +1,5 @@
-//! tmpfs: files and directories that live in kernel memory. The root file
-//! system in Phase 2 (filled from the initramfs) and later `/tmp`.
+//! tmpfs: files, directories and symbolic links that live in kernel
+//! memory. The root file system (filled from the initramfs) and `/tmp`.
 
 use super::{FileType, Inode, new_ino};
 use crate::abi::{Errno, KResult};
@@ -17,27 +17,22 @@ fn now() -> u64 {
     crate::time::realtime_ns() / crate::time::NS_PER_SEC
 }
 
-pub struct Dir {
+/// What every tmpfs inode has.
+struct Meta {
     ino: u64,
     perm: AtomicU32,
     mtime: AtomicU64,
-    entries: SpinLock<BTreeMap<String, Arc<dyn Inode>>>,
-    /// The containing directory; the root's own (dangling) Weak means
-    /// "this is the root".
-    parent: Weak<dyn Inode>,
-    me: Weak<Dir>,
+    nlink: AtomicU32,
 }
 
-impl Dir {
-    pub fn new_root(perm: u32) -> Arc<dyn Inode> {
-        Arc::new_cyclic(|me: &Weak<Dir>| Dir {
+impl Meta {
+    fn new(perm: u32) -> Self {
+        Self {
             ino: new_ino(),
-            perm: AtomicU32::new(perm),
+            perm: AtomicU32::new(perm & 0o7777),
             mtime: AtomicU64::new(now()),
-            entries: SpinLock::new(BTreeMap::new()),
-            parent: Weak::<Dir>::new(),
-            me: me.clone(),
-        })
+            nlink: AtomicU32::new(1),
+        }
     }
 
     fn touch(&self) {
@@ -45,21 +40,87 @@ impl Dir {
     }
 }
 
+macro_rules! meta_methods {
+    () => {
+        fn ino(&self) -> u64 {
+            self.meta.ino
+        }
+        fn perm(&self) -> u32 {
+            self.meta.perm.load(Ordering::Relaxed)
+        }
+        fn set_perm(&self, perm: u32) -> KResult<()> {
+            self.meta.perm.store(perm & 0o7777, Ordering::Relaxed);
+            Ok(())
+        }
+        fn mtime(&self) -> u64 {
+            self.meta.mtime.load(Ordering::Relaxed)
+        }
+        fn set_mtime(&self, secs: u64) {
+            self.meta.mtime.store(secs, Ordering::Relaxed);
+        }
+        fn link_added(&self) {
+            self.meta.nlink.fetch_add(1, Ordering::Relaxed);
+        }
+        fn link_removed(&self) {
+            self.meta.nlink.fetch_sub(1, Ordering::Relaxed);
+        }
+    };
+}
+
+pub struct Dir {
+    meta: Meta,
+    entries: SpinLock<BTreeMap<String, Arc<dyn Inode>>>,
+    /// The containing directory; the root's dangling Weak means "this is
+    /// the root".
+    parent: SpinLock<Weak<dyn Inode>>,
+    me: Weak<Dir>,
+}
+
+impl Dir {
+    pub fn new_root(perm: u32) -> Arc<dyn Inode> {
+        Arc::new_cyclic(|me: &Weak<Dir>| Dir {
+            meta: Meta::new(perm),
+            entries: SpinLock::new(BTreeMap::new()),
+            parent: SpinLock::new(Weak::<Dir>::new()),
+            me: me.clone(),
+        })
+    }
+
+    fn new_child(&self, perm: u32) -> Arc<dyn Inode> {
+        let parent: Weak<dyn Inode> = self.me.clone();
+        Arc::new_cyclic(|me: &Weak<Dir>| Dir {
+            meta: Meta::new(perm),
+            entries: SpinLock::new(BTreeMap::new()),
+            parent: SpinLock::new(parent),
+            me: me.clone(),
+        })
+    }
+
+    fn check_name(name: &str) -> KResult<()> {
+        if name == "." || name == ".." || name.is_empty() {
+            return Err(Errno::EEXIST);
+        }
+        Ok(())
+    }
+}
+
 impl Inode for Dir {
+    meta_methods!();
+
     fn file_type(&self) -> FileType {
         FileType::Directory
-    }
-    fn ino(&self) -> u64 {
-        self.ino
-    }
-    fn perm(&self) -> u32 {
-        self.perm.load(Ordering::Relaxed)
     }
     fn size(&self) -> u64 {
         4096
     }
-    fn mtime(&self) -> u64 {
-        self.mtime.load(Ordering::Relaxed)
+    fn nlink(&self) -> u64 {
+        let subdirs = self
+            .entries
+            .lock()
+            .values()
+            .filter(|i| i.file_type() == FileType::Directory)
+            .count();
+        2 + subdirs as u64
     }
 
     fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
@@ -67,52 +128,64 @@ impl Inode for Dir {
     }
 
     fn parent(&self) -> Option<Arc<dyn Inode>> {
-        self.parent.upgrade().or_else(|| {
+        self.parent.lock().upgrade().or_else(|| {
             // The root is its own parent.
             self.me.upgrade().map(|d| d as Arc<dyn Inode>)
         })
     }
 
+    fn set_parent(&self, parent: &Arc<dyn Inode>) {
+        *self.parent.lock() = Arc::downgrade(parent);
+    }
+
     fn create(&self, name: &str, ty: FileType, perm: u32) -> KResult<Arc<dyn Inode>> {
-        if name == "." || name == ".." {
-            return Err(Errno::EEXIST);
-        }
+        Self::check_name(name)?;
         let mut entries = self.entries.lock();
         if entries.contains_key(name) {
             return Err(Errno::EEXIST);
         }
         let inode: Arc<dyn Inode> = match ty {
             FileType::Regular => Arc::new(File {
-                ino: new_ino(),
-                perm: AtomicU32::new(perm),
-                mtime: AtomicU64::new(now()),
+                meta: Meta::new(perm),
                 data: Mutex::new(Vec::new()),
             }),
-            FileType::Directory => {
-                let parent: Weak<dyn Inode> = self.me.clone();
-                Arc::new_cyclic(|me: &Weak<Dir>| Dir {
-                    ino: new_ino(),
-                    perm: AtomicU32::new(perm),
-                    mtime: AtomicU64::new(now()),
-                    entries: SpinLock::new(BTreeMap::new()),
-                    parent,
-                    me: me.clone(),
-                })
-            }
-            FileType::CharDevice => return Err(Errno::EPERM),
+            FileType::Directory => self.new_child(perm),
+            FileType::Fifo => super::pipe::Fifo::create(perm),
+            FileType::CharDevice | FileType::Symlink => return Err(Errno::EPERM),
         };
         entries.insert(name.to_string(), inode.clone());
         drop(entries);
-        self.touch();
+        self.meta.touch();
         Ok(inode)
     }
 
+    fn symlink(&self, name: &str, target: &str) -> KResult<()> {
+        Self::check_name(name)?;
+        let mut entries = self.entries.lock();
+        if entries.contains_key(name) {
+            return Err(Errno::EEXIST);
+        }
+        entries.insert(
+            name.to_string(),
+            Arc::new(Symlink {
+                meta: Meta::new(0o777),
+                target: target.to_string(),
+            }),
+        );
+        drop(entries);
+        self.meta.touch();
+        Ok(())
+    }
+
     fn insert(&self, name: &str, inode: Arc<dyn Inode>) -> KResult<()> {
+        Self::check_name(name)?;
         let mut entries = self.entries.lock();
         if entries.contains_key(name) {
             return Err(Errno::EEXIST);
         }
         entries.insert(name.to_string(), inode);
+        drop(entries);
+        self.meta.touch();
         Ok(())
     }
 
@@ -132,10 +205,17 @@ impl Inode for Dir {
             (true, true) if !inode.is_empty_dir() => return Err(Errno::ENOTEMPTY),
             _ => {}
         }
-        entries.remove(name);
+        let inode = entries.remove(name).unwrap();
         drop(entries);
-        self.touch();
+        inode.link_removed();
+        self.meta.touch();
         Ok(())
+    }
+
+    fn take(&self, name: &str) -> KResult<Arc<dyn Inode>> {
+        let inode = self.entries.lock().remove(name).ok_or(Errno::ENOENT)?;
+        self.meta.touch();
+        Ok(inode)
     }
 
     fn entries(&self) -> KResult<Vec<(String, Arc<dyn Inode>)>> {
@@ -153,27 +233,21 @@ impl Inode for Dir {
 }
 
 pub struct File {
-    ino: u64,
-    perm: AtomicU32,
-    mtime: AtomicU64,
+    meta: Meta,
     data: Mutex<Vec<u8>>,
 }
 
 impl Inode for File {
+    meta_methods!();
+
     fn file_type(&self) -> FileType {
         FileType::Regular
-    }
-    fn ino(&self) -> u64 {
-        self.ino
-    }
-    fn perm(&self) -> u32 {
-        self.perm.load(Ordering::Relaxed)
     }
     fn size(&self) -> u64 {
         self.data.lock().len() as u64
     }
-    fn mtime(&self) -> u64 {
-        self.mtime.load(Ordering::Relaxed)
+    fn nlink(&self) -> u64 {
+        self.meta.nlink.load(Ordering::Relaxed) as u64
     }
 
     fn read_at(&self, off: u64, buf: &mut [u8]) -> KResult<usize> {
@@ -203,7 +277,7 @@ impl Inode for File {
         }
         data[off..end].copy_from_slice(src);
         drop(data);
-        self.mtime.store(now(), Ordering::Relaxed);
+        self.meta.touch();
         Ok(src.len())
     }
 
@@ -222,7 +296,26 @@ impl Inode for File {
             data.shrink_to_fit();
         }
         drop(data);
-        self.mtime.store(now(), Ordering::Relaxed);
+        self.meta.touch();
         Ok(())
+    }
+}
+
+pub struct Symlink {
+    meta: Meta,
+    target: String,
+}
+
+impl Inode for Symlink {
+    meta_methods!();
+
+    fn file_type(&self) -> FileType {
+        FileType::Symlink
+    }
+    fn size(&self) -> u64 {
+        self.target.len() as u64
+    }
+    fn readlink(&self) -> KResult<String> {
+        Ok(self.target.clone())
     }
 }

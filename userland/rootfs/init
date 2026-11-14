@@ -1,0 +1,9 @@
+#!/bin/sh
+# SegOS runs this as process 1: set up, then keep a shell on the console.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=linux
+cd /root
+cat /etc/motd
+while true; do
+	/bin/sh -l
+	echo "The shell has exited; starting a new one (type 'poweroff -f' to stop)."
+done

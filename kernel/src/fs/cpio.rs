@@ -1,5 +1,5 @@
 //! Unpacks a `newc` cpio archive (Linux's initramfs format) into the root
-//! file system.
+//! file system: directories, files and symbolic links.
 
 use super::{FileType, Inode, lookup_parent, root};
 use crate::abi::{Errno, KResult, mode};
@@ -21,6 +21,7 @@ fn align4(n: usize) -> usize {
 pub struct Summary {
     pub files: usize,
     pub dirs: usize,
+    pub links: usize,
     pub bytes: usize,
     pub skipped: usize,
 }
@@ -71,7 +72,15 @@ pub fn unpack(archive: &[u8]) -> KResult<Summary> {
                 s.files += 1;
                 s.bytes += data.len();
             }
-            // Symbolic links, device nodes, FIFOs: Phase 3.
+            mode::S_IFLNK => {
+                let target = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+                match dir.symlink(&last, target) {
+                    Ok(()) | Err(Errno::EEXIST) => {}
+                    Err(e) => return Err(e),
+                }
+                s.links += 1;
+            }
+            // Device nodes, FIFOs: /dev is the kernel's.
             _ => {
                 crate::warn!("initramfs: skipping {path} (mode {m:o})");
                 s.skipped += 1;

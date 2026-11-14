@@ -17,6 +17,7 @@ use wait::WaitQueue;
 
 #[allow(unused_imports)]
 pub use sched::{current, exit, schedule as yield_now, spawn};
+pub use wait::kick;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -79,10 +80,10 @@ impl Task {
         Self::build(name, Some(stack), rsp, Some(f), None)
     }
 
-    /// A user thread: on first run it drops to user mode (`proc::start_user`).
-    pub(crate) fn new_user(user: UserThread) -> Self {
+    /// A user thread: its first run returns to user mode with `frame`.
+    pub(crate) fn new_user(user: UserThread, frame: &crate::hal::idt::TrapFrame) -> Self {
         let stack = KernelStack::new().expect("out of memory for a kernel stack");
-        let rsp = sched::initial_stack(stack.top);
+        let rsp = sched::initial_user_stack(stack.top, frame);
         Self::build("user", Some(stack), rsp, None, Some(Box::new(user)))
     }
 
@@ -168,7 +169,7 @@ pub fn spawn_named(name: &'static str, f: impl FnOnce() + Send + 'static) -> Arc
     sched::spawn_task(Task::new(name, Box::new(f)))
 }
 
-/// Makes a user thread runnable.
-pub fn spawn_user(user: UserThread) -> Arc<Task> {
-    sched::spawn_task(Task::new_user(user))
+/// Makes a user thread runnable; it starts in user mode with `frame`.
+pub fn spawn_user(user: UserThread, frame: crate::hal::idt::TrapFrame) -> Arc<Task> {
+    sched::spawn_task(Task::new_user(user, &frame))
 }

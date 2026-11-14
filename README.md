@@ -4,27 +4,31 @@ An operating system written from scratch in Rust, aiming to run **unmodified
 Linux applications** (and, through Wine/Proton, Windows ones) by implementing
 the Linux system call interface in a new kernel.
 
-Status: **Phase 2 (first user program) done**. SegOS boots on UEFI with its
-own bootloader, segboot, starts every CPU, and runs **unmodified Linux
-programs**: a static "hello world" compiled with musl on Linux runs as
-`/init`, and a conformance test prints exactly what it prints on Linux.
-The kernel has user address spaces with demand paging, an ELF loader, an
-initramfs unpacked into tmpfs, `/dev`, and answers 79 Linux system call
-numbers. Next is Phase 3: `fork`, `execve`, pipes and a shell.
+Status: **Phase 3 (a shell) done**. SegOS boots on UEFI with its own
+bootloader, starts every CPU, and gives you **a shell**: BusyBox, the
+statically linked binary exactly as Ubuntu ships it, runs on the console,
+and `ls | grep | wc` works. Behind it: `fork` with copy-on-write,
+`execve`, `wait4`, process groups and sessions, signals delivered to
+handlers, pipes, `poll`/`select`, symbolic links, `/proc`, and a terminal
+with keyboard and serial input, line editing and `^C`. The kernel answers
+140 Linux system call numbers, and three conformance tests print byte for
+byte what they print on Linux. Next is Phase 4: real disks.
 
-Everything it runs is in this repository: the bootloader, the kernel and
-the build tool use no third-party crates, only Rust's `core`, `alloc` and
-(for the build tool) `std`. The only C is in `userland/`: test programs for
-Linux, built with the ordinary Linux toolchain (`musl-gcc`), because the
-point is that SegOS runs what Linux compilers produce.
+The operating system itself is all in this repository: the bootloader, the
+kernel and the build tool use no third-party crates, only Rust's `core`,
+`alloc` and (for the build tool) `std`. What runs *on* it is ordinary
+Linux software, unmodified: BusyBox from Ubuntu, and test programs in
+`userland/` written in C and built with the normal Linux toolchain
+(`musl-gcc`), because the point is that SegOS runs what Linux compilers
+produce.
 
 The whole roadmap, from here to Steam: [docs/plan.md](docs/plan.md).
 
-![SegOS in QEMU running a musl hello world as /init](docs/images/console.png)
+![A BusyBox shell session on SegOS's own screen console](docs/images/console.png)
 
-*SegOS today, booted in QEMU on 4 CPUs: it unpacks the initramfs and runs
-`/init`, a hello world compiled for Linux with musl, unmodified. "Hello,
-world!" is the program's own output.*
+*SegOS today, in QEMU: Ubuntu's BusyBox shell on the kernel's framebuffer
+console. `ls /bin | grep sh | wc -l` is the Phase 3 demo; `ps` and `free`
+read `/proc`; `hello` is a musl program built on Linux.*
 
 ## How SegOS works
 
@@ -65,7 +69,7 @@ flowchart LR
     D --> E["Screen console<br/>APIC timer"]
     E --> F["All CPUs start<br/>scheduler runs"]
     F --> G["initramfs<br/>unpacked to tmpfs"]
-    G --> H["/init runs<br/>in user mode"]
+    G --> H["/init: a shell script,<br/>BusyBox sh"]
 ```
 
 segboot is a UEFI application (`EFI/BOOT/BOOTX64.EFI` on the disk). It
@@ -127,9 +131,36 @@ sequenceDiagram
 
 Memory is mapped lazily: the program's regions (code, data, heap, stack,
 `mmap`) are recorded, and the first touch of a page faults and gets a
-zeroed frame. A touch outside every region kills the program with
-SIGSEGV, as on Linux; the kernel carries on. Unknown system calls return
-`ENOSYS` and are logged once, which is the to-do list for what comes next.
+zeroed frame. A touch outside every region is SIGSEGV, as on Linux: the
+program's handler runs if it has one, otherwise it dies and the kernel
+carries on. Unknown system calls return `ENOSYS` and are logged once,
+which is the to-do list for what comes next.
+
+### How the shell runs `ls | grep | wc`
+
+```mermaid
+sequenceDiagram
+    participant S as sh (BusyBox)
+    participant K as kernel
+    participant L as ls
+    participant G as grep, wc
+    S->>K: pipe2 ×2, then fork ×3
+    Note over K: fork copies nothing: every page is shared<br/>read-only, and copied on the first write
+    K-->>L: child: dup2 pipe → stdout, runs ls
+    K-->>G: children: execve("/proc/self/exe", ["grep", ...])
+    L->>K: write → pipe (sleeps when full)
+    G->>K: read ← pipe (sleeps when empty, EOF when the writer exits)
+    K-->>S: SIGCHLD (the shell's handler runs), wait4 → exit statuses
+```
+
+BusyBox is one binary with a symbolic link per command (`/bin/ls →
+/bin/busybox`); it runs its own commands by executing `/proc/self/exe`.
+Signals are delivered the way Linux does it, down to the byte layout of the
+frame built on the program's stack, so the C library's handlers and
+`sigreturn` work unchanged; a system call interrupted by a signal is
+restarted or fails with EINTR, as SA_RESTART says. The terminal does
+Linux's line discipline: editing keys, echo, and `^C`/`^Z` becoming
+SIGINT/SIGTSTP for the foreground process group.
 
 ### Where things live in memory
 
@@ -161,11 +192,11 @@ install Steam and play.
 flowchart TB
     subgraph F["Foundation"]
         direction LR
-        P0["0 · Bring-up<br/>boot, console, memory"]:::done --> P1["1 · Multitasking<br/>timer, threads, all CPUs"]:::done --> P2["2 · First program<br/>user mode, ELF, syscalls"]:::done --> P3["3 · A shell<br/>fork, exec, pipes"]:::next
+        P0["0 · Bring-up<br/>boot, console, memory"]:::done --> P1["1 · Multitasking<br/>timer, threads, all CPUs"]:::done --> P2["2 · First program<br/>user mode, ELF, syscalls"]:::done --> P3["3 · A shell<br/>fork, exec, pipes"]:::done
     end
     subgraph L["Linux userland"]
         direction LR
-        P4["4 · Real disks<br/>NVMe, SATA, ext4"] --> P5["5 · Full userland<br/>glibc: bash, python, gcc"] --> P6["6 · Networking<br/>TCP/IP: curl, ssh"]
+        P4["4 · Real disks<br/>NVMe, SATA, ext4"]:::next --> P5["5 · Full userland<br/>glibc: bash, python, gcc"] --> P6["6 · Networking<br/>TCP/IP: curl, ssh"]
     end
     subgraph D["Desktop and games"]
         direction LR
@@ -205,22 +236,29 @@ Debian/Ubuntu:
 sudo apt install qemu-system-x86 ovmf musl-tools git
 ```
 
+The first image build also fetches Ubuntu's `busybox-static` package with
+`apt-get download` (no root needed) into `target/busybox`. Elsewhere, set
+`BUSYBOX` to any statically linked x86-64 busybox.
+
 ```bash
-cargo xtask run          # build the disk image and boot it in QEMU
+cargo xtask run          # build the disk image and boot it in QEMU: a shell
 ```
 
 ```bash
-cargo xtask test         # userland tests on this Linux, then kernel tests in QEMU
+cargo xtask test         # userland tests on Linux, kernel tests, a scripted shell session
 ```
 
 ```bash
 cargo xtask image        # target/segos.img
 ```
 
-Nothing is downloaded. `target/segos.img` is a GPT disk with one FAT32 EFI
-system partition, written by `xtask` itself: segboot, the kernel and the
-initramfs (a `newc` cpio archive of `userland/`, built with musl-gcc). To boot a real PC from a USB
-stick (UEFI only, Secure Boot off; this erases the stick):
+`target/segos.img` is a GPT disk with one FAT32 EFI system partition,
+written by `xtask` itself: segboot, the kernel and the initramfs (a `newc`
+cpio archive of `userland/rootfs`, BusyBox with its applet links, and the
+test programs). In QEMU the shell is on the window and on the terminal you
+started it from (serial); type `poweroff -f` to turn it off. To boot a
+real PC from a USB stick (UEFI only, Secure Boot off; this erases the
+stick):
 
 ```bash
 sudo dd if=target/segos.img of=/dev/sdX bs=4M conv=fsync
@@ -232,12 +270,23 @@ name.
 
 ### Testing against Linux
 
-Every program in `userland/tests/` has a `.expected` file: its exact
-output. `cargo xtask test` first runs each one **on the Linux machine
-doing the build** and fails if Linux does not print exactly that (so the
-expectations are Linux's behaviour, not SegOS's), then boots SegOS, where
-the kernel test suite runs each one again and compares. To add a test,
-write the C program, run it on Linux, and save its output:
+Every test in `userland/tests/` (C programs and shell scripts) has a
+`.expected` file: its exact output. `cargo xtask test` first runs each one
+**on the Linux machine doing the build** (scripts with the same BusyBox)
+and fails if Linux does not print exactly that, so the expectations are
+Linux's behaviour, not SegOS's. Then it boots SegOS, where the kernel
+test suite runs each one again and compares. Finally it boots SegOS
+normally, types commands into the shell over the serial port as a user
+would, checks what they print, and turns the machine off with
+`poweroff -f`.
+
+| Test | What it covers |
+|---|---|
+| `basics.c` | arguments and auxv, `brk`/`mmap`/`mprotect`, files and directories, time, randomness |
+| `process.c` | `fork`, copy-on-write, pipes, `poll`, signal handlers, SA_RESTART, SIGSEGV handlers, stop/continue, `sigsuspend`, `execve`, `vfork`, `posix_spawn`, close-on-exec, process groups |
+| `shell.sh` | BusyBox: pipelines, redirection, exit statuses, subshells, jobs, `trap`, links, `chmod`, `find`, here-documents, `/proc` |
+
+To add a C test, write it, run it on Linux, and save its output:
 
 ```bash
 musl-gcc -static -O2 -o /tmp/t userland/tests/NAME.c && /tmp/t > userland/tests/NAME.expected
@@ -249,21 +298,23 @@ musl-gcc -static -O2 -o /tmp/t userland/tests/NAME.c && /tmp/t > userland/tests/
 |---|---|
 | `boot/` | segboot, the UEFI bootloader: loads the kernel ELF, page tables, memory map, framebuffer |
 | `bootinfo/` | the boot protocol: what segboot hands the kernel |
-| `kernel/src/hal/` | x86-64: instructions, serial, GDT/TSS, IDT and the trap path, `syscall` entry, entering user mode, ACPI tables, local APIC and timer, RTC, per-CPU data, starting CPUs |
-| `kernel/src/mm/` | frame allocator, page tables, kernel heap allocator, process address spaces (`vm.rs`) |
-| `kernel/src/proc/` | processes and user threads, the ELF loader and initial stack, user faults |
+| `kernel/src/hal/` | x86-64: instructions, serial, GDT/TSS, IDT and the trap path, `syscall` entry, ACPI tables (CPUs, I/O APIC, power off), local APIC and timer, I/O APIC, RTC, per-CPU data, starting CPUs |
+| `kernel/src/mm/` | frame allocator with reference counts, page tables, kernel heap allocator, process address spaces with copy-on-write (`vm.rs`) |
+| `kernel/src/proc/` | processes: `fork`/`clone`, `execve` (with `#!`), exit and `wait4`, process groups and sessions, signals, the ELF loader, user faults |
 | `kernel/src/syscall/` | the Linux system calls, by Linux number |
-| `kernel/src/fs/` | the VFS, tmpfs, `/dev` devices, the initramfs (cpio) unpacker |
+| `kernel/src/fs/` | the VFS with symbolic links, tmpfs, `/dev` devices, pipes, `/proc`, the initramfs (cpio) unpacker |
+| `kernel/src/tty.rs` | the console terminal: line discipline, termios, job control |
+| `kernel/src/drivers/` | PS/2 keyboard |
 | `kernel/src/abi.rs` | Linux's error numbers, flags and structure layouts |
 | `kernel/src/task/` | kernel threads, scheduler and context switch, wait queues |
 | `kernel/src/sync.rs` | interrupt-safe spinlock, sleeping mutex |
 | `kernel/src/time.rs` | TSC clock, wall-clock time from the RTC, sleeping |
-| `kernel/src/console.rs` | framebuffer text console |
+| `kernel/src/console.rs` | framebuffer text console with VT100/ANSI escape sequences |
 | `kernel/src/font.rs` | the console's 8×16 bitmap font |
 | `kernel/src/klog.rs` | kernel log levels and macros |
 | `kernel/src/ktest.rs` | in-kernel tests |
 | `xtask/` | build tool: builds segboot, the kernel and `userland/`, writes the initramfs and the GPT/FAT32 disk image, runs QEMU |
-| `userland/` | Linux programs SegOS runs: `hello/` (the `/init` demo) and `tests/` (conformance tests with their Linux output) |
+| `userland/` | what SegOS runs: `rootfs/` (`/init`, `/etc`), `hello/` (the Phase 2 demo, `/usr/bin/hello`) and `tests/` (conformance tests with their Linux output) |
 | `site/` | the website, deployed by Vercel (`vercel.json`) |
 
 Subsystems become their own crates once they grow (see the plan).
@@ -271,6 +322,10 @@ Subsystems become their own crates once they grow (see the plan).
 ## Licence
 
 MIT or Apache-2.0, at your option.
+
+The disk image also contains BusyBox, unmodified, from Ubuntu's
+`busybox-static` package (GPL-2.0; its source is Ubuntu's `busybox` source
+package, `apt-get source busybox`). It is not part of this repository.
 
 The previous project in this repository, SegLinux (a Linux distribution),
 is in the git history up to its 1.0.0 release: commit

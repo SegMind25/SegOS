@@ -17,6 +17,20 @@ pub unsafe fn inb(port: u16) -> u8 {
     v
 }
 
+pub unsafe fn inw(port: u16) -> u16 {
+    let v: u16;
+    unsafe {
+        asm!("in ax, dx", out("ax") v, in("dx") port, options(nomem, nostack, preserves_flags))
+    };
+    v
+}
+
+pub unsafe fn outw(port: u16, value: u16) {
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags))
+    }
+}
+
 pub unsafe fn outl(port: u16, value: u32) {
     unsafe {
         asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags))
@@ -162,6 +176,24 @@ impl FxArea {
         // MXCSR_MASK 0: the CPU's default mask applies on fxrstor.
         FxArea(a)
     }
+}
+
+/// The MXCSR bits this CPU supports (from fxsave's MXCSR_MASK field;
+/// 0xffbf when the CPU reports 0).
+pub fn mxcsr_mask() -> u32 {
+    static MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let m = MASK.load(core::sync::atomic::Ordering::Relaxed);
+    if m != 0 {
+        return m;
+    }
+    let mut a = FxArea::initial();
+    fxsave(&mut a);
+    let mut m = u32::from_le_bytes(a.0[28..32].try_into().unwrap());
+    if m == 0 {
+        m = 0xffbf;
+    }
+    MASK.store(m, core::sync::atomic::Ordering::Relaxed);
+    m
 }
 
 pub fn fxsave(area: &mut FxArea) {

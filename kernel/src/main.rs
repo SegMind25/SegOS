@@ -14,6 +14,7 @@ extern crate alloc;
 mod abi;
 #[macro_use]
 mod console;
+mod drivers;
 mod font;
 mod fs;
 mod hal;
@@ -29,6 +30,7 @@ mod sync;
 mod syscall;
 mod task;
 mod time;
+mod tty;
 
 use bootinfo::BootInfo;
 use core::panic::PanicInfo;
@@ -76,6 +78,9 @@ extern "sysv64" fn kmain(boot: &'static BootInfo) -> ! {
     hal::smp::start_aps(boot.rsdp);
     // The AP trampoline was the last user of segboot's identity map.
     mm::paging::remove_identity_map();
+    hal::acpi::set_rsdp(boot.rsdp);
+    // Keyboard and serial input, through the I/O APIC to this CPU.
+    drivers::init(boot.rsdp);
 
     #[cfg(feature = "ktest")]
     task::spawn_named("ktest", move || ktest::run(boot));
@@ -95,10 +100,11 @@ fn load_initramfs(boot: &BootInfo) {
     }
     match fs::cpio::unpack(archive) {
         Ok(s) => info!(
-            "initramfs: {} files ({} KiB), {} directories",
+            "initramfs: {} files ({} KiB), {} directories, {} links",
             s.files,
             s.bytes / 1024,
-            s.dirs
+            s.dirs,
+            s.links
         ),
         Err(e) => error!("initramfs: not a valid newc cpio archive ({e:?})"),
     }
@@ -119,8 +125,13 @@ fn kernel_init(boot: &'static BootInfo) {
         proc::spawn(
             "/init",
             &["/init"],
-            &["HOME=/", "TERM=linux", "PATH=/bin:/sbin:/usr/bin:/usr/sbin"],
+            &[
+                "HOME=/root",
+                "TERM=linux",
+                "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+            ],
             stdio,
+            true,
         )
     });
     let init = match started {
@@ -138,7 +149,7 @@ fn kernel_init(boot: &'static BootInfo) {
     } else {
         warn!("/init was killed by signal {}", status & 0x7f);
     }
-    info!("nothing left to run (a shell arrives in Phase 3)");
+    info!("init has exited; nothing left to run");
 }
 
 #[panic_handler]

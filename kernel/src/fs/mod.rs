@@ -1,22 +1,27 @@
 //! Files: a small virtual file system.
 //!
-//! Everything is an [`Inode`]: tmpfs files and directories (the root file
-//! system, filled from the initramfs at boot), and device files in `/dev`.
-//! A [`File`] is an open file (Linux's "open file description": the inode,
-//! the offset, the status flags), shared by every descriptor `dup` makes;
-//! an [`FdTable`] maps a process's descriptors to them.
+//! Everything is an [`Inode`]: tmpfs files, directories and symbolic links
+//! (the root file system, filled from the initramfs at boot), device files
+//! in `/dev`, pipes, and the generated files of `/proc`. A [`File`] is an
+//! open file (Linux's "open file description": the inode, the offset, the
+//! status flags), shared by every descriptor `dup` and `fork` make; an
+//! [`FdTable`] maps a process's descriptors to them.
 //!
-//! Phase 2 needs no mount table: `/dev` is a tmpfs directory holding the
-//! device inodes. Real file systems (ext4, FAT32) and mounts come in
+//! There is no mount table yet: `/dev` and `/proc` are directories of the
+//! root holding their own inodes. Real file systems and mounts come in
 //! Phase 4.
 
 pub mod cpio;
 pub mod dev;
+pub mod pipe;
+pub mod procfs;
 pub mod tmpfs;
 
 use crate::abi::{Errno, KResult, Stat, mode};
 use crate::mm::vm::AddressSpace;
 use crate::sync::{Mutex, Once, SpinLock};
+use crate::task::wait::WaitQueue;
+use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -27,6 +32,8 @@ pub enum FileType {
     Regular,
     Directory,
     CharDevice,
+    Symlink,
+    Fifo,
 }
 
 impl FileType {
@@ -35,14 +42,53 @@ impl FileType {
             Self::Regular => mode::S_IFREG,
             Self::Directory => mode::S_IFDIR,
             Self::CharDevice => mode::S_IFCHR,
+            Self::Symlink => mode::S_IFLNK,
+            Self::Fifo => mode::S_IFIFO,
+        }
+    }
+
+    /// The `d_type` of a directory entry.
+    pub fn dirent_type(self) -> u8 {
+        match self {
+            Self::Fifo => 1,
+            Self::CharDevice => 2,
+            Self::Directory => 4,
+            Self::Regular => 8,
+            Self::Symlink => 10,
         }
     }
 }
 
 static NEXT_INO: AtomicU64 = AtomicU64::new(1);
 
+/// `st_dev` of each file system (anonymous device numbers, as Linux gives
+/// in-memory file systems).
+pub const DEV_TMPFS: u64 = 0x1;
+pub const DEV_PIPEFS: u64 = 0xc;
+pub const DEV_PROC: u64 = 0x16;
+
 pub fn new_ino() -> u64 {
     NEXT_INO.fetch_add(1, Ordering::Relaxed)
+}
+
+/// What `poll` reports.
+pub mod poll {
+    pub const POLLIN: u16 = 0x001;
+    pub const POLLPRI: u16 = 0x002;
+    pub const POLLOUT: u16 = 0x004;
+    pub const POLLERR: u16 = 0x008;
+    pub const POLLHUP: u16 = 0x010;
+    pub const POLLNVAL: u16 = 0x020;
+}
+
+/// Woken whenever something a `poll` could be waiting for changes (pipe or
+/// terminal data, a closed end). Pollers re-check their descriptors.
+pub static POLL_WAIT: WaitQueue = WaitQueue::new();
+pub static POLL_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn poll_notify() {
+    POLL_EVENTS.fetch_add(1, Ordering::Release);
+    POLL_WAIT.wake_all();
 }
 
 /// What every file system object can do. Defaults answer as Linux does for
@@ -52,6 +98,9 @@ pub trait Inode: Send + Sync {
     fn ino(&self) -> u64;
     /// Permission bits (the low 12 bits of `st_mode`).
     fn perm(&self) -> u32;
+    fn set_perm(&self, _perm: u32) -> KResult<()> {
+        Err(Errno::EPERM)
+    }
     fn size(&self) -> u64 {
         0
     }
@@ -59,27 +108,70 @@ pub trait Inode: Send + Sync {
     fn rdev(&self) -> u64 {
         0
     }
+    /// The file system it is on (`st_dev`; one number per file system, so
+    /// `df` and `find -xdev` can tell them apart).
+    fn dev(&self) -> u64 {
+        DEV_TMPFS
+    }
     /// Seconds since 1970 of the last change.
     fn mtime(&self) -> u64 {
         0
     }
+    fn set_mtime(&self, _secs: u64) {}
+    /// Number of names (hard links) the inode has.
+    fn nlink(&self) -> u64 {
+        if self.file_type() == FileType::Directory {
+            2
+        } else {
+            1
+        }
+    }
+    fn link_added(&self) {}
+    fn link_removed(&self) {}
 
+    /// Data at an offset (regular files).
     fn read_at(&self, _off: u64, _buf: &mut [u8]) -> KResult<usize> {
         Err(self.not_a_file())
     }
     fn write_at(&self, _off: u64, _data: &[u8]) -> KResult<usize> {
         Err(self.not_a_file())
     }
+    /// Data from a stream (devices, pipes, terminals): no offset, may
+    /// block unless `nonblock`.
+    fn read_stream(&self, buf: &mut [u8], _nonblock: bool) -> KResult<usize> {
+        self.read_at(0, buf)
+    }
+    fn write_stream(&self, data: &[u8], _nonblock: bool) -> KResult<usize> {
+        self.write_at(0, data)
+    }
     fn truncate(&self, _len: u64) -> KResult<()> {
         Err(self.not_a_file())
     }
-    /// Whether reads and writes use the file offset (false for devices:
-    /// `lseek` on them is allowed but meaningless, as on Linux).
+    /// Whether reads and writes use the file offset (false for devices,
+    /// pipes and terminals).
     fn seekable(&self) -> bool {
         self.file_type() == FileType::Regular
     }
     fn ioctl(&self, _req: u32, _arg: u64, _mm: &AddressSpace) -> KResult<u64> {
         Err(Errno::ENOTTY)
+    }
+    /// Which of POLLIN/POLLOUT/POLLHUP/POLLERR hold now.
+    fn poll(&self) -> u16 {
+        poll::POLLIN | poll::POLLOUT
+    }
+    /// Called when the inode is opened (terminals take a controlling
+    /// terminal here).
+    fn opened(&self, _flags: u32) -> KResult<()> {
+        Ok(())
+    }
+    /// A named pipe: the pipe end an open with `flags` gets.
+    fn open_fifo(&self, _flags: u32) -> Option<Arc<dyn Inode>> {
+        None
+    }
+
+    // Symbolic links.
+    fn readlink(&self) -> KResult<String> {
+        Err(Errno::EINVAL)
     }
 
     // Directories.
@@ -92,7 +184,10 @@ pub trait Inode: Send + Sync {
     fn create(&self, _name: &str, _ty: FileType, _perm: u32) -> KResult<Arc<dyn Inode>> {
         Err(Errno::ENOTDIR)
     }
-    /// Adds an existing inode (a device) under `name`.
+    fn symlink(&self, _name: &str, _target: &str) -> KResult<()> {
+        Err(Errno::ENOTDIR)
+    }
+    /// Adds an existing inode under `name` (devices, hard links).
     fn insert(&self, _name: &str, _inode: Arc<dyn Inode>) -> KResult<()> {
         Err(Errno::ENOTDIR)
     }
@@ -101,11 +196,21 @@ pub trait Inode: Send + Sync {
     fn remove(&self, _name: &str, _dir: bool) -> KResult<()> {
         Err(Errno::ENOTDIR)
     }
+    /// Takes `name` out of this directory (for rename); no checks.
+    fn take(&self, _name: &str) -> KResult<Arc<dyn Inode>> {
+        Err(Errno::ENOTDIR)
+    }
+    /// For rename: the directory `self` was moved into.
+    fn set_parent(&self, _parent: &Arc<dyn Inode>) {}
     fn entries(&self) -> KResult<Vec<(String, Arc<dyn Inode>)>> {
         Err(Errno::ENOTDIR)
     }
     fn is_empty_dir(&self) -> bool {
         false
+    }
+    /// Whether this directory can change (false for /proc).
+    fn writable_dir(&self) -> bool {
+        true
     }
 
     fn not_a_file(&self) -> Errno {
@@ -120,13 +225,9 @@ pub trait Inode: Send + Sync {
         let size = self.size();
         let t = self.mtime() as i64;
         Stat {
-            st_dev: 1,
+            st_dev: self.dev(),
             st_ino: self.ino(),
-            st_nlink: if self.file_type() == FileType::Directory {
-                2
-            } else {
-                1
-            },
+            st_nlink: self.nlink(),
             st_mode: self.file_type().mode_bits() | self.perm(),
             st_rdev: self.rdev(),
             st_size: size as i64,
@@ -142,12 +243,14 @@ pub trait Inode: Send + Sync {
 
 static ROOT: Once<Arc<dyn Inode>> = Once::new();
 
-/// The root directory. Created (empty, with `/dev`) on first use.
+/// The root directory. Created (empty, with `/dev` and `/proc`) on first
+/// use.
 pub fn root() -> Arc<dyn Inode> {
     ROOT.call_once(|| {
         let root = tmpfs::Dir::new_root(0o755);
         let devdir = root.create("dev", FileType::Directory, 0o755).unwrap();
         dev::populate(&devdir);
+        root.insert("proc", procfs::root(&root)).unwrap();
         root
     })
     .clone()
@@ -156,42 +259,125 @@ pub fn root() -> Arc<dyn Inode> {
 /// Longest path accepted, as Linux's PATH_MAX.
 pub const PATH_MAX: usize = 4096;
 const NAME_MAX: usize = 255;
+/// Symbolic links followed in one lookup before ELOOP (Linux: 40).
+const MAX_SYMLINKS: usize = 40;
 
-/// Resolves `path` from `cwd` (absolute paths from the root).
-pub fn lookup(cwd: &Arc<dyn Inode>, path: &str) -> KResult<Arc<dyn Inode>> {
+/// The absolute path of a directory (or other inode), found by walking up
+/// the tree and looking each step's name up in its parent.
+pub fn path_of(inode: &Arc<dyn Inode>) -> String {
+    let mut parts = Vec::new();
+    let mut cur = inode.clone();
+    for _ in 0..256 {
+        let Some(parent) = cur.parent() else { break };
+        if parent.ino() == cur.ino() {
+            break; // the root
+        }
+        let Ok(entries) = parent.entries() else { break };
+        match entries.into_iter().find(|(_, i)| i.ino() == cur.ino()) {
+            Some((name, _)) => parts.push(name),
+            None => break,
+        }
+        cur = parent;
+    }
+    let mut out = String::new();
+    for p in parts.iter().rev() {
+        out.push('/');
+        out.push_str(p);
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// Resolves `path` from `cwd` (absolute paths from the root), following
+/// symbolic links (the last one only if `follow_last`). Returns the inode
+/// and its canonical absolute path.
+pub fn resolve(
+    cwd: &Arc<dyn Inode>,
+    path: &str,
+    follow_last: bool,
+) -> KResult<(Arc<dyn Inode>, String)> {
     if path.is_empty() {
         return Err(Errno::ENOENT);
     }
-    let mut cur = if path.starts_with('/') {
-        root()
-    } else {
-        cwd.clone()
-    };
-    for part in path.split('/').filter(|p| !p.is_empty()) {
-        cur = step(&cur, part)?;
+    if path.len() > PATH_MAX {
+        return Err(Errno::ENAMETOOLONG);
     }
-    // "file/" names a directory.
-    if path.ends_with('/') && cur.file_type() != FileType::Directory {
+    let trailing_slash = path.ends_with('/');
+    let mut todo: VecDeque<String> = path
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect();
+    let (mut cur, mut canon): (Arc<dyn Inode>, Vec<String>) = if path.starts_with('/') {
+        (root(), Vec::new())
+    } else {
+        let p = path_of(cwd);
+        (
+            cwd.clone(),
+            p.split('/')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect(),
+        )
+    };
+    let mut links = 0;
+    while let Some(part) = todo.pop_front() {
+        if cur.file_type() != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        match part.as_str() {
+            "." => continue,
+            ".." => {
+                cur = cur.parent().unwrap_or_else(|| cur.clone());
+                canon.pop();
+                continue;
+            }
+            p if p.len() > NAME_MAX => return Err(Errno::ENAMETOOLONG),
+            _ => {}
+        }
+        let next = cur.lookup(&part)?;
+        let last = todo.is_empty();
+        if next.file_type() == FileType::Symlink && (!last || follow_last || trailing_slash) {
+            links += 1;
+            if links > MAX_SYMLINKS {
+                return Err(Errno::ELOOP);
+            }
+            let target = next.readlink()?;
+            if target.starts_with('/') {
+                cur = root();
+                canon.clear();
+            }
+            for p in target.split('/').filter(|p| !p.is_empty()).rev() {
+                todo.push_front(p.to_string());
+            }
+            continue;
+        }
+        cur = next;
+        canon.push(part);
+    }
+    if trailing_slash && cur.file_type() != FileType::Directory {
         return Err(Errno::ENOTDIR);
     }
-    Ok(cur)
+    let mut path = String::from("/");
+    path.push_str(&canon.join("/"));
+    Ok((cur, path))
 }
 
-fn step(dir: &Arc<dyn Inode>, part: &str) -> KResult<Arc<dyn Inode>> {
-    if dir.file_type() != FileType::Directory {
-        return Err(Errno::ENOTDIR);
-    }
-    match part {
-        "." => Ok(dir.clone()),
-        ".." => Ok(dir.parent().unwrap_or_else(|| dir.clone())),
-        name if name.len() > NAME_MAX => Err(Errno::ENAMETOOLONG),
-        name => dir.lookup(name),
-    }
+/// Resolves `path` from `cwd`, following every symbolic link.
+pub fn lookup(cwd: &Arc<dyn Inode>, path: &str) -> KResult<Arc<dyn Inode>> {
+    resolve(cwd, path, true).map(|(i, _)| i)
+}
+
+/// Resolves `path` without following a symbolic link at the end.
+pub fn lookup_nofollow(cwd: &Arc<dyn Inode>, path: &str) -> KResult<Arc<dyn Inode>> {
+    resolve(cwd, path, false).map(|(i, _)| i)
 }
 
 /// Resolves everything but the last component: (directory, last name).
-/// The last name is never "." or ".." (callers creating or removing
-/// entries get EEXIST/EINVAL/ENOTEMPTY-like errors from those).
+/// "path/." and "path/.." have no usable last name: EEXIST-style errors
+/// come from the directory operations themselves.
 pub fn lookup_parent(cwd: &Arc<dyn Inode>, path: &str) -> KResult<(Arc<dyn Inode>, String)> {
     let trimmed = path.trim_end_matches('/');
     if path.is_empty() {
@@ -217,7 +403,7 @@ pub fn lookup_parent(cwd: &Arc<dyn Inode>, path: &str) -> KResult<(Arc<dyn Inode
 }
 
 /// Joins `path` onto the absolute directory `base` and removes ".", ".."
-/// and repeated slashes (for the working directory's name).
+/// and repeated slashes, lexically.
 pub fn normalize(base: &str, path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     let full = if path.starts_with('/') {
@@ -241,8 +427,24 @@ pub fn normalize(base: &str, path: &str) -> String {
     out
 }
 
-/// An open file: shared by descriptors `dup` makes, and (from Phase 3) by
-/// parent and child after `fork`.
+/// Whether `dir` is `ancestor` or below it (rename must not move a
+/// directory into itself).
+pub fn is_within(dir: &Arc<dyn Inode>, ancestor: &Arc<dyn Inode>) -> bool {
+    let mut cur = dir.clone();
+    for _ in 0..4096 {
+        if cur.ino() == ancestor.ino() {
+            return true;
+        }
+        match cur.parent() {
+            Some(p) if p.ino() != cur.ino() => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// An open file: shared by descriptors `dup` makes, and by parent and
+/// child after `fork`.
 pub struct File {
     pub inode: Arc<dyn Inode>,
     pub offset: Mutex<u64>,
@@ -269,13 +471,17 @@ impl File {
         matches!(*self.flags.lock() & O_ACCMODE, O_WRONLY | O_RDWR)
     }
 
+    fn nonblock(&self) -> bool {
+        *self.flags.lock() & crate::abi::open::O_NONBLOCK != 0
+    }
+
     /// Reads at the file offset and advances it.
     pub fn read(&self, buf: &mut [u8]) -> KResult<usize> {
         if !self.readable() {
             return Err(Errno::EBADF);
         }
         if !self.inode.seekable() {
-            return self.inode.read_at(0, buf);
+            return self.inode.read_stream(buf, self.nonblock());
         }
         let mut off = self.offset.lock();
         let n = self.inode.read_at(*off, buf)?;
@@ -289,7 +495,7 @@ impl File {
             return Err(Errno::EBADF);
         }
         if !self.inode.seekable() {
-            return self.inode.write_at(0, data);
+            return self.inode.write_stream(data, self.nonblock());
         }
         let mut off = self.offset.lock();
         if *self.flags.lock() & crate::abi::open::O_APPEND != 0 {
@@ -354,6 +560,15 @@ impl FdTable {
         }
     }
 
+    /// Closes every descriptor marked close-on-exec.
+    pub fn close_on_exec(&mut self) {
+        for e in self.fds.iter_mut() {
+            if e.as_ref().is_some_and(|e| e.cloexec) {
+                *e = None;
+            }
+        }
+    }
+
     pub fn set_cloexec(&mut self, fd: i32, on: bool) -> KResult<()> {
         let i = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
         match self.fds.get_mut(i) {
@@ -372,6 +587,15 @@ impl FdTable {
             .and_then(|e| e.as_ref())
             .map(|e| e.cloexec)
             .ok_or(Errno::EBADF)
+    }
+
+    /// The open descriptors, for /proc/<pid>/fd.
+    pub fn list(&self) -> Vec<(i32, Arc<File>)> {
+        self.fds
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.as_ref().map(|e| (i as i32, e.file.clone())))
+            .collect()
     }
 
     pub fn clear(&mut self) {

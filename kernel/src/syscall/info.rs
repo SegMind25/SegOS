@@ -113,13 +113,24 @@ pub fn time(ctx: &Ctx, tloc: u64) -> KResult<u64> {
     Ok(secs)
 }
 
-pub fn nanosleep(ctx: &Ctx, req: u64, _rem: u64) -> KResult<u64> {
+fn write_remaining(ctx: &Ctx, rem: u64, deadline: u64) {
+    if rem != 0 {
+        let left = deadline.saturating_sub(time::monotonic_ns());
+        let _ = ctx.mm().write(rem, &timespec(left));
+    }
+}
+
+pub fn nanosleep(ctx: &Ctx, req: u64, rem: u64) -> KResult<u64> {
     let ns = read_timespec(ctx, req)?;
-    time::sleep_ns(ns);
+    let deadline = time::monotonic_ns().saturating_add(ns);
+    if time::sleep_until(deadline, true).is_err() {
+        write_remaining(ctx, rem, deadline);
+        return Err(Errno::EINTR);
+    }
     Ok(0)
 }
 
-pub fn clock_nanosleep(ctx: &Ctx, clock: u32, flags: u32, req: u64, _rem: u64) -> KResult<u64> {
+pub fn clock_nanosleep(ctx: &Ctx, clock: u32, flags: u32, req: u64, rem: u64) -> KResult<u64> {
     const TIMER_ABSTIME: u32 = 1;
     if matches!(clock, CLOCK_THREAD_CPUTIME_ID) {
         return Err(Errno::EINVAL);
@@ -131,7 +142,13 @@ pub fn clock_nanosleep(ctx: &Ctx, clock: u32, flags: u32, req: u64, _rem: u64) -
     } else {
         ns
     };
-    time::sleep_ns(wait);
+    let deadline = time::monotonic_ns().saturating_add(wait);
+    if time::sleep_until(deadline, true).is_err() {
+        if flags & TIMER_ABSTIME == 0 {
+            write_remaining(ctx, rem, deadline);
+        }
+        return Err(Errno::EINTR);
+    }
     Ok(0)
 }
 
@@ -172,7 +189,7 @@ pub fn getrlimit(ctx: &Ctx, resource: u32, out: u64) -> KResult<u64> {
 }
 
 pub fn prlimit64(ctx: &Ctx, pid: u32, resource: u32, _new: u64, old: u64) -> KResult<u64> {
-    if pid != 0 && pid != ctx.process().pid {
+    if pid != 0 && crate::proc::lookup(pid).is_none() {
         return Err(Errno::ESRCH);
     }
     let l = rlimit(resource)?;
@@ -211,4 +228,105 @@ pub fn sched_getaffinity(ctx: &Ctx, len: u64, mask: u64) -> KResult<u64> {
     }
     ctx.mm().copy_to(mask, &out)?;
     Ok(bytes as u64)
+}
+
+/// `sysinfo`: uptime, memory and process count.
+pub fn sysinfo(ctx: &Ctx, buf: u64) -> KResult<u64> {
+    let mut b = [0u8; 112];
+    let put =
+        |b: &mut [u8; 112], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    put(&mut b, 0, time::monotonic_ns() / NS_PER_SEC);
+    put(&mut b, 32, crate::mm::frame::total_count() * 4096);
+    put(&mut b, 40, crate::mm::frame::free_count() * 4096);
+    let procs = crate::proc::all().len() as u16;
+    b[80..82].copy_from_slice(&procs.to_le_bytes());
+    b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
+    ctx.mm().copy_to(buf, &b)?;
+    Ok(0)
+}
+
+/// `times`: CPU times are not accounted yet (zeros); returns clock ticks
+/// since boot.
+pub fn times(ctx: &Ctx, buf: u64) -> KResult<u64> {
+    if buf != 0 {
+        ctx.mm().copy_to(buf, &[0u8; 32])?;
+    }
+    Ok(time::monotonic_ns() / (NS_PER_SEC / crate::hal::apic::HZ))
+}
+
+/// `getgroups`: no supplementary groups.
+pub fn getgroups(_ctx: &Ctx, _size: u64, _list: u64) -> KResult<u64> {
+    Ok(0)
+}
+
+pub fn prctl(ctx: &Ctx, a: [u64; 6]) -> KResult<u64> {
+    const PR_SET_PDEATHSIG: u64 = 1;
+    const PR_GET_DUMPABLE: u64 = 3;
+    const PR_SET_DUMPABLE: u64 = 4;
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    const PR_SET_CHILD_SUBREAPER: u64 = 36;
+    const PR_SET_NO_NEW_PRIVS: u64 = 38;
+    const PR_GET_NO_NEW_PRIVS: u64 = 39;
+    match a[0] {
+        PR_SET_NAME => {
+            let mut raw = [0u8; 16];
+            // The name may end anywhere in the 16 bytes; read what is there.
+            for (i, b) in raw.iter_mut().enumerate() {
+                *b = ctx.mm().read(a[1] + i as u64)?;
+                if *b == 0 {
+                    break;
+                }
+            }
+            raw[15] = 0;
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(15);
+            *ctx.process().name.lock() =
+                alloc::string::String::from_utf8_lossy(&raw[..end]).into_owned();
+            Ok(0)
+        }
+        PR_GET_NAME => {
+            let mut raw = [0u8; 16];
+            let name = ctx.process().name.lock().clone();
+            let n = name.len().min(15);
+            raw[..n].copy_from_slice(&name.as_bytes()[..n]);
+            ctx.mm().copy_to(a[1], &raw)?;
+            Ok(0)
+        }
+        PR_GET_DUMPABLE => Ok(1),
+        PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_CHILD_SUBREAPER | PR_SET_NO_NEW_PRIVS => Ok(0),
+        PR_GET_NO_NEW_PRIVS => Ok(0),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// `reboot`: restart, power off, or halt the machine.
+pub fn reboot(magic1: u32, magic2: u32, cmd: u32) -> KResult<u64> {
+    const MAGIC1: u32 = 0xfee1_dead;
+    const MAGIC2: [u32; 4] = [672_274_793, 85_072_278, 369_367_448, 537_993_216];
+    const RESTART: u32 = 0x0123_4567;
+    const HALT: u32 = 0xcdef_0123;
+    const POWER_OFF: u32 = 0x4321_fedc;
+    const CAD_ON: u32 = 0x89ab_cdef;
+    const CAD_OFF: u32 = 0;
+    if magic1 != MAGIC1 || !MAGIC2.contains(&magic2) {
+        return Err(Errno::EINVAL);
+    }
+    match cmd {
+        CAD_ON | CAD_OFF => Ok(0),
+        RESTART => {
+            crate::info!("reboot: restarting");
+            crate::hal::cpu::restart()
+        }
+        POWER_OFF => {
+            crate::info!("reboot: power off");
+            crate::hal::acpi::power_off();
+            crate::info!("reboot: power off failed; system halted");
+            crate::hal::cpu::halt_forever()
+        }
+        HALT => {
+            crate::info!("reboot: system halted");
+            crate::hal::cpu::halt_forever()
+        }
+        _ => Err(Errno::EINVAL),
+    }
 }

@@ -1,10 +1,13 @@
 # SegOS: a from-scratch operating system in Rust (plan)
 
-Status: **Phase 2 done**. SegOS boots on UEFI with its own bootloader,
-segboot, starts every CPU, and runs unmodified static Linux programs: a
-musl "hello world" built on Linux runs as `/init`, and a conformance test
-prints exactly what it prints on Linux. 24 kernel tests pass in QEMU on 4
-CPUs, debug and release builds; no third-party crates. Next: Phase 3.
+Status: **Phase 3 done**. SegOS boots on UEFI with its own bootloader,
+segboot, starts every CPU, and runs Ubuntu's statically linked BusyBox,
+unmodified, as an interactive shell on the console: `ls | grep | wc`
+works, and so do job control, `^C`, `ps`, `free` and `poweroff`. Three
+conformance tests print byte for byte what they print on Linux; 26 kernel
+tests pass in QEMU on 4 CPUs (debug and release, with and without
+SMEP/SMAP); CI also types commands into the shell over the serial port.
+No third-party crates. Next: Phase 4, real disks.
 
 ## 1. The goal, stated precisely
 
@@ -200,24 +203,70 @@ the console. What it took:
   output must match what it prints on Linux; xtask checks that on the build
   machine's Linux first.
 
-## 9. Next concrete steps (Phase 3: a shell)
+## 9. Phase 3, as built
 
-The demo: BusyBox `sh` runs, and `ls | grep | wc` works.
+The demo: BusyBox `sh` runs and `ls | grep | wc` works. The BusyBox is
+Ubuntu's `busybox-static` package (statically linked with glibc), copied
+unchanged into the initramfs with a symbolic link per applet. What it took:
 
-1. **Copy-on-write `fork`**: frame reference counts, read-only sharing,
-   copy on the write fault. Then `vfork`/`clone` for processes.
-2. **`execve`** replacing the address space of a running process, closing
-   `O_CLOEXEC` descriptors; `wait4`, process groups and sessions, `getpgid`,
-   `setsid`.
-3. **Signals delivered**: the signal frame on the user stack,
-   `rt_sigreturn`, default actions (stop, continue), `SIGCHLD`, signals
-   interrupting blocking calls (`EINTR`).
-4. **Pipes**, and blocking reads and writes that sleep instead of spinning;
-   `poll`/`select` on them.
-5. **A terminal**: PS/2 and USB keyboard input, a line discipline (echo,
-   editing, `^C` sending `SIGINT` to the foreground process group).
-6. **Files BusyBox needs**: symbolic links (BusyBox is one binary with a
-   link per command), `getdents64` users, `rename`, `/proc/self`,
-   `/proc/mounts`, timestamps that change.
-7. **Tests**: more programs in `userland/tests/` (fork, pipes, signals),
-   recorded on Linux; BusyBox's own test suite where it fits.
+- **Copy-on-write `fork`** (`mm/vm.rs`, `mm/frame.rs`): every frame has a
+  reference count; `fork` shares all pages read-only with a software COW
+  bit, and the first write copies (or, for the last holder, just takes
+  the page back). Kernel writes to user memory break COW first.
+- **Processes** (`proc/`): a process table, parent and children, zombies
+  and `wait4`/`waitid`, orphans handed to init, process groups and
+  sessions, `clone` for processes (`fork`, `vfork`, `posix_spawn`'s
+  `CLONE_VM | CLONE_VFORK`), `execve` with `#!` scripts. New threads
+  start from a saved register frame, so `fork` children, `exec` and
+  `/init` share one path into user mode.
+- **Signals** (`proc/signal.rs`): delivery on every return to user mode,
+  Linux's exact `rt_sigframe` (siginfo, ucontext, FPU state), `rt_sigreturn`,
+  SA_RESTART, SA_RESETHAND, SA_NODEFER, alternate stacks, `sigsuspend`,
+  default actions including stop and continue (and `WUNTRACED`), faults
+  in user mode as SIGSEGV/SIGILL/SIGFPE to the program's handler.
+  Blocking waits are interruptible: a signal kicks the sleeper, which
+  returns `ERESTARTSYS`, turned into a restart or EINTR on the way out.
+- **Files** (`fs/`): symbolic links (followed in lookups, 40 at most),
+  canonical paths, `rename`, hard links, `chmod`, timestamps, FIFOs,
+  pipes with PIPE_BUF atomicity and SIGPIPE, `poll`/`ppoll`/`select`/
+  `pselect6`, `/proc` (`self`, `<pid>/{stat,status,cmdline,comm,exe,cwd,fd}`,
+  `meminfo`, `uptime`, `mounts`, `cpuinfo`, `version`, `stat`), one
+  `st_dev` per file system.
+- **A terminal** (`tty.rs`, `drivers/`, `hal/ioapic.rs`): the I/O APIC
+  routes the PS/2 keyboard and serial interrupts; the line discipline
+  does canonical editing, echo, raw mode with VMIN/VTIME, `^C`/`^\`/`^Z`
+  to the foreground group, termios, window size and the controlling
+  terminal. The screen console understands the VT100/ANSI sequences line
+  editors and `vi` use.
+- **140 system call numbers**, `reboot` (ACPI power off from `\_S5_`, or
+  a reset), `sysinfo`, `prctl`, a minimal `futex`.
+- **Tests**: `userland/tests/process.c` and `shell.sh` join `basics.c`,
+  each checked on Linux by xtask before SegOS runs it; and `cargo xtask
+  test` ends by booting SegOS, typing commands into the shell over the
+  serial port, checking their output and powering the machine off.
+
+Two bugs found on the way, both now covered by tests: Phase 2's `TCGETS`
+wrote 60 bytes (the C library's termios) where the kernel's struct is 36,
+which would have corrupted a glibc program's stack; and naming a process
+after its resolved executable instead of the path it was started by,
+which stops BusyBox (it checks for "exe") from naming its applets.
+
+## 10. Next concrete steps (Phase 4: real storage)
+
+The demo: SegOS boots from a disk with a full root file system (not only
+the initramfs), on QEMU's virtio and NVMe disks and on a real PC's SATA or
+NVMe drive.
+
+1. **PCI(e)**: find the configuration space (ACPI MCFG, ECAM), enumerate
+   buses, read BARs, map them; MSI/MSI-X interrupts.
+2. **A block layer and page cache**: requests, a cache of file pages
+   shared by `read`/`write` and `mmap` (finally real `MAP_SHARED` file
+   mappings), write-back.
+3. **Drivers**: virtio-blk first (simplest, in QEMU), then NVMe, then
+   AHCI (SATA).
+4. **Partitions and file systems**: GPT; ext4 read-only, then read-write
+   (journal replay first); FAT32 for the EFI partition.
+5. **Mounts**: a mount table, `mount`/`umount`, `/proc/mounts` from it,
+   `pivot_root`/`switch_root` from the initramfs to the disk.
+6. **Tests**: file system tests recorded on Linux (on an ext4 image xtask
+   builds), and a CI boot from a disk image with a full BusyBox root.

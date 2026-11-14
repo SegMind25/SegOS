@@ -50,6 +50,11 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// The value, when no one else can be holding the lock.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
     /// For the panic path: never waits.
     pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
         let irq_enabled = x86::interrupts_enabled();
@@ -69,6 +74,12 @@ impl<T> SpinLock<T> {
             }
             None
         }
+    }
+}
+
+impl<T: Default> Default for SpinLock<T> {
+    fn default() -> Self {
+        Self::new(T::default())
     }
 }
 

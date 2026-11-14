@@ -8,10 +8,16 @@
 //! Memory below 1 MiB is kept back from [`alloc_zeroed`]: it is scarce and
 //! some things need it (the real-mode trampoline that starts the other
 //! CPUs, old DMA). Only [`alloc_below`] hands it out.
+//!
+//! Every frame also has a reference count (4 bytes per 4 KiB frame, 0.1%
+//! of memory, next to the bitmap): copy-on-write `fork` shares one frame
+//! between address spaces, and the frame is freed when the last one lets
+//! go ([`free`] drops one reference).
 
 use super::{PAGE_SIZE, phys_to_virt};
-use crate::sync::SpinLock;
+use crate::sync::{Once, SpinLock};
 use bootinfo::{MemoryKind, MemoryRegion};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// First frame [`FrameAllocator::alloc`] may return (1 MiB).
 const LOW_FRAMES: u64 = 0x10_0000 / PAGE_SIZE;
@@ -25,6 +31,19 @@ pub struct FrameAllocator {
 }
 
 static ALLOCATOR: SpinLock<Option<FrameAllocator>> = SpinLock::new(None);
+/// Frames of usable memory at boot.
+static TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn total_count() -> u64 {
+    TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reference count of every frame, indexed by frame number.
+static REFS: Once<&'static [AtomicU32]> = Once::new();
+
+fn refs(phys: u64) -> &'static AtomicU32 {
+    &REFS.get().expect("frame allocator not ready")[(phys / PAGE_SIZE) as usize]
+}
 
 impl FrameAllocator {
     fn is_used(&self, i: u64) -> bool {
@@ -81,7 +100,8 @@ pub fn init(entries: &[MemoryRegion]) {
         .expect("no usable memory");
     let frames = top / PAGE_SIZE;
     let words = frames.div_ceil(64);
-    let bytes = words * 8;
+    let bitmap_bytes = words * 8;
+    let bytes = bitmap_bytes + frames * 4;
 
     let home = entries
         .iter()
@@ -91,6 +111,12 @@ pub fn init(entries: &[MemoryRegion]) {
         core::slice::from_raw_parts_mut(phys_to_virt(home.base).cast::<u64>(), words as usize)
     };
     bitmap.fill(u64::MAX);
+    let counts = unsafe {
+        let p = phys_to_virt(home.base + bitmap_bytes).cast::<AtomicU32>();
+        core::ptr::write_bytes(p, 0, frames as usize);
+        core::slice::from_raw_parts(p, frames as usize)
+    };
+    REFS.call_once(|| counts);
 
     let mut fa = FrameAllocator {
         bitmap,
@@ -114,8 +140,9 @@ pub fn init(entries: &[MemoryRegion]) {
         fa.set(0, true);
         fa.free -= 1;
     }
+    TOTAL.store(fa.free, Ordering::Relaxed);
     crate::info!(
-        "frames: {} free of {} ({} KiB bitmap)",
+        "frames: {} free of {} ({} KiB bitmap and reference counts)",
         fa.free,
         frames,
         bytes / 1024
@@ -123,11 +150,24 @@ pub fn init(entries: &[MemoryRegion]) {
     *ALLOCATOR.lock() = Some(fa);
 }
 
-/// Allocates one zeroed 4 KiB frame; returns its physical address.
+/// Allocates one zeroed 4 KiB frame with one reference; returns its
+/// physical address.
 pub fn alloc_zeroed() -> Option<u64> {
     let phys = ALLOCATOR.lock().as_mut()?.alloc()?;
+    refs(phys).store(1, Ordering::Relaxed);
     unsafe { core::ptr::write_bytes(phys_to_virt(phys), 0, PAGE_SIZE as usize) };
     Some(phys)
+}
+
+/// Adds a reference to an allocated frame (it is now shared).
+pub fn get(phys: u64) {
+    let old = refs(phys).fetch_add(1, Ordering::Relaxed);
+    assert!(old > 0, "reference to free frame {phys:#x}");
+}
+
+/// How many address spaces (or other owners) hold the frame.
+pub fn ref_count(phys: u64) -> u32 {
+    refs(phys).load(Ordering::Acquire)
 }
 
 /// Allocates one zeroed frame below `limit` (for real-mode code, DMA).
@@ -139,16 +179,22 @@ pub fn alloc_below(limit: u64) -> Option<u64> {
     fa.free -= 1;
     drop(guard);
     let phys = i * PAGE_SIZE;
+    refs(phys).store(1, Ordering::Relaxed);
     unsafe { core::ptr::write_bytes(phys_to_virt(phys), 0, PAGE_SIZE as usize) };
     Some(phys)
 }
 
+/// Drops one reference; the frame is freed with the last one.
 pub fn free(phys: u64) {
-    ALLOCATOR
-        .lock()
-        .as_mut()
-        .expect("frame allocator not ready")
-        .dealloc(phys);
+    let old = refs(phys).fetch_sub(1, Ordering::AcqRel);
+    assert!(old > 0, "double free of frame {phys:#x}");
+    if old == 1 {
+        ALLOCATOR
+            .lock()
+            .as_mut()
+            .expect("frame allocator not ready")
+            .dealloc(phys);
+    }
 }
 
 pub fn free_count() -> u64 {

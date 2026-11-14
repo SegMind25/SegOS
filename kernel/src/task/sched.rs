@@ -41,6 +41,13 @@ core::arch::global_asm!(
     "    pop rbp",
     "    mov rax, rdx",
     "    ret",
+    // First run of a user thread: rax holds the previous task; rsp points
+    // at the thread's saved user registers (a TrapFrame).
+    ".global user_trampoline",
+    "user_trampoline:",
+    "    mov rdi, rax",
+    "    call user_task_start",
+    "    jmp trap_return",
     // First run of a new task: rax holds the previous task.
     ".global task_trampoline",
     "task_trampoline:",
@@ -53,6 +60,31 @@ core::arch::global_asm!(
 unsafe extern "C" {
     fn switch_context(save: *mut u64, load: u64, prev: *const ()) -> *const ();
     fn task_trampoline();
+    fn user_trampoline();
+}
+
+/// The stack of a user thread that has never run: its user registers at
+/// the top (where traps from user mode put them), and below them a switch
+/// frame returning into `user_trampoline`, which leaves through the trap
+/// exit path to user mode.
+pub(super) fn initial_user_stack(top: u64, frame: &crate::hal::idt::TrapFrame) -> u64 {
+    let frame_at = top - size_of::<crate::hal::idt::TrapFrame>() as u64;
+    debug_assert!(frame_at.is_multiple_of(16));
+    let rsp = frame_at - 7 * 8;
+    unsafe {
+        (frame_at as *mut crate::hal::idt::TrapFrame).write(*frame);
+        let slots = rsp as *mut u64;
+        for i in 0..6 {
+            slots.add(i).write(0);
+        }
+        slots.add(6).write(user_trampoline as *const () as u64);
+    }
+    rsp
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn user_task_start(prev: *const Task) {
+    finish_switch(prev);
 }
 
 /// The stack of a task that has never run: six zeroed callee-saved
@@ -197,16 +229,11 @@ extern "C" fn task_start(prev: *const Task) -> ! {
         let me = current();
         unsafe { (*me.entry.get()).take() }
     };
+    x86::enable_interrupts();
     if let Some(f) = entry {
-        x86::enable_interrupts();
         f();
-        exit()
     }
-    // A user thread: no closure, straight to user mode. The task stays
-    // alive (referenced by this CPU's `current`) while it runs, so the
-    // borrow below outlives this frame.
-    let me = unsafe { &*Arc::as_ptr(&current()) };
-    crate::proc::start_user(me.user().expect("task with nothing to run"))
+    exit()
 }
 
 /// Ends the current task.

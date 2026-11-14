@@ -2,11 +2,15 @@
 
 use super::{Ctx, path_arg};
 use crate::abi::open::*;
-use crate::abi::{AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, Errno, Iovec, KResult};
-use crate::fs::{self, File, FileType, Inode};
+use crate::abi::{
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, Errno, Iovec, KResult,
+};
+use crate::fs::{self, File, FileType, Inode, poll as pollbits};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 /// Largest single read or write; a bigger request returns a short count,
 /// which POSIX allows and every program handles.
@@ -55,8 +59,18 @@ pub fn readv(ctx: &Ctx, fd: i32, iov: u64, count: u64) -> KResult<u64> {
     let f = file(ctx, fd)?;
     let mut total = 0u64;
     for e in iovecs(ctx, iov, count)? {
+        if e.len == 0 {
+            continue;
+        }
         let mut kbuf = vec![0u8; e.len.min(IO_CHUNK) as usize];
-        let n = f.read(&mut kbuf)?;
+        let n = match f.read(&mut kbuf) {
+            Ok(n) => n,
+            Err(e) if total > 0 => {
+                let _ = e;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         ctx.mm().copy_to(e.base, &kbuf[..n])?;
         total += n as u64;
         if (n as u64) < e.len {
@@ -68,7 +82,8 @@ pub fn readv(ctx: &Ctx, fd: i32, iov: u64, count: u64) -> KResult<u64> {
 
 pub fn writev(ctx: &Ctx, fd: i32, iov: u64, count: u64) -> KResult<u64> {
     let f = file(ctx, fd)?;
-    // Gather first, then write once: a console line is not split.
+    // Gather first, then write once: a console line or a small pipe write
+    // is not split.
     let mut data = Vec::new();
     for e in iovecs(ctx, iov, count)? {
         let start = data.len();
@@ -114,9 +129,11 @@ pub fn pwrite(ctx: &Ctx, fd: i32, buf: u64, count: u64, off: i64) -> KResult<u64
 
 pub fn lseek(ctx: &Ctx, fd: i32, off: i64, whence: u32) -> KResult<u64> {
     let f = file(ctx, fd)?;
-    if !f.inode.seekable() && f.inode.file_type() != FileType::Directory {
+    match f.inode.file_type() {
+        FileType::Fifo => return Err(Errno::ESPIPE),
         // Character devices: seeking succeeds and means nothing.
-        return Ok(0);
+        FileType::CharDevice => return Ok(0),
+        _ => {}
     }
     let mut pos = f.offset.lock();
     let base = match whence {
@@ -133,10 +150,17 @@ pub fn lseek(ctx: &Ctx, fd: i32, off: i64, whence: u32) -> KResult<u64> {
     Ok(new as u64)
 }
 
+fn cwd(ctx: &Ctx) -> Arc<dyn Inode> {
+    ctx.process().cwd.lock().clone()
+}
+
 /// The directory a `*at` call's relative path starts from.
-fn dir_of(ctx: &Ctx, dirfd: i32) -> KResult<Arc<dyn Inode>> {
+fn dir_of(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<Arc<dyn Inode>> {
+    if path.starts_with('/') {
+        return Ok(fs::root());
+    }
     if dirfd == AT_FDCWD {
-        return Ok(ctx.process().cwd.lock().inode.clone());
+        return Ok(cwd(ctx));
     }
     let f = file(ctx, dirfd)?;
     if f.inode.file_type() != FileType::Directory {
@@ -145,33 +169,29 @@ fn dir_of(ctx: &Ctx, dirfd: i32) -> KResult<Arc<dyn Inode>> {
     Ok(f.inode.clone())
 }
 
-fn resolve(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<Arc<dyn Inode>> {
-    let base = if path.starts_with('/') {
-        fs::root()
-    } else {
-        dir_of(ctx, dirfd)?
-    };
-    fs::lookup(&base, path)
+fn resolve(ctx: &Ctx, dirfd: i32, path: &str, follow: bool) -> KResult<Arc<dyn Inode>> {
+    let base = dir_of(ctx, dirfd, path)?;
+    fs::resolve(&base, path, follow).map(|(i, _)| i)
 }
 
-fn resolve_parent(
-    ctx: &Ctx,
-    dirfd: i32,
-    path: &str,
-) -> KResult<(Arc<dyn Inode>, alloc::string::String)> {
-    let base = if path.starts_with('/') {
-        fs::root()
-    } else {
-        dir_of(ctx, dirfd)?
-    };
-    fs::lookup_parent(&base, path)
+fn resolve_parent(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<(Arc<dyn Inode>, String)> {
+    let base = dir_of(ctx, dirfd, path)?;
+    let (dir, name) = fs::lookup_parent(&base, path)?;
+    if !dir.writable_dir() {
+        return Err(Errno::EACCES);
+    }
+    Ok((dir, name))
+}
+
+fn umask(ctx: &Ctx) -> u32 {
+    ctx.process().umask.load(Ordering::Relaxed)
 }
 
 pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResult<u64> {
     let path = path_arg(ctx, path)?;
+    let follow = flags & O_NOFOLLOW == 0;
     let inode = if flags & O_CREAT != 0 {
-        let (dir, name) = resolve_parent(ctx, dirfd, &path)?;
-        match dir.lookup(&name) {
+        match resolve(ctx, dirfd, &path, follow) {
             Ok(existing) => {
                 if flags & O_EXCL != 0 {
                     return Err(Errno::EEXIST);
@@ -182,19 +202,25 @@ pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResul
                 if path.ends_with('/') {
                     return Err(Errno::EISDIR);
                 }
-                let umask = ctx
-                    .process()
-                    .umask
-                    .load(core::sync::atomic::Ordering::Relaxed);
-                dir.create(&name, FileType::Regular, mode & 0o7777 & !umask)?
+                let (dir, name) = resolve_parent(ctx, dirfd, &path)?;
+                match dir.create(&name, FileType::Regular, mode & 0o7777 & !umask(ctx)) {
+                    Ok(i) => i,
+                    // A dangling symbolic link in the way.
+                    Err(Errno::EEXIST) => return Err(Errno::ENOENT),
+                    Err(e) => return Err(e),
+                }
             }
             Err(e) => return Err(e),
         }
     } else {
-        resolve(ctx, dirfd, &path)?
+        resolve(ctx, dirfd, &path, follow)?
     };
     let ty = inode.file_type();
     let acc = flags & O_ACCMODE;
+    if ty == FileType::Symlink {
+        // O_NOFOLLOW on a symbolic link.
+        return Err(Errno::ELOOP);
+    }
     if flags & O_DIRECTORY != 0 && ty != FileType::Directory {
         return Err(Errno::ENOTDIR);
     }
@@ -204,6 +230,8 @@ pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResul
     if flags & O_TRUNC != 0 && ty == FileType::Regular && acc != O_RDONLY {
         inode.truncate(0)?;
     }
+    inode.opened(flags)?;
+    let inode = inode.open_fifo(flags).unwrap_or(inode);
     let status = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK | O_DIRECTORY | O_PATH);
     let f = File::new(inode, status);
     let fd = ctx
@@ -215,7 +243,14 @@ pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResul
 }
 
 pub fn close(ctx: &Ctx, fd: i32) -> KResult<u64> {
-    ctx.process().files.lock().close(fd)?;
+    let f = {
+        let mut files = ctx.process().files.lock();
+        let f = files.get(fd)?;
+        files.close(fd)?;
+        f
+    };
+    // The last reference may close a pipe end: drop it outside the lock.
+    drop(f);
     Ok(0)
 }
 
@@ -232,13 +267,12 @@ pub fn stat_path(ctx: &Ctx, dirfd: i32, path: u64, buf: u64, flags: u32) -> KRes
             return Err(Errno::ENOENT);
         }
         if dirfd == AT_FDCWD {
-            ctx.process().cwd.lock().inode.clone()
+            cwd(ctx)
         } else {
             file(ctx, dirfd)?.inode.clone()
         }
     } else {
-        // No symbolic links yet, so AT_SYMLINK_NOFOLLOW changes nothing.
-        resolve(ctx, dirfd, &p)?
+        resolve(ctx, dirfd, &p, flags & AT_SYMLINK_NOFOLLOW == 0)?
     };
     ctx.mm().write(buf, &inode.stat())?;
     Ok(0)
@@ -246,7 +280,7 @@ pub fn stat_path(ctx: &Ctx, dirfd: i32, path: u64, buf: u64, flags: u32) -> KRes
 
 pub fn faccessat(ctx: &Ctx, dirfd: i32, path: u64, mode: u32) -> KResult<u64> {
     let path = path_arg(ctx, path)?;
-    let inode = resolve(ctx, dirfd, &path)?;
+    let inode = resolve(ctx, dirfd, &path, true)?;
     // Everything runs as root: only "execute" needs an x bit somewhere.
     if mode & 1 != 0 && inode.file_type() != FileType::Directory && inode.perm() & 0o111 == 0 {
         return Err(Errno::EACCES);
@@ -255,12 +289,23 @@ pub fn faccessat(ctx: &Ctx, dirfd: i32, path: u64, mode: u32) -> KResult<u64> {
 }
 
 pub fn ioctl(ctx: &Ctx, fd: i32, req: u32, arg: u64) -> KResult<u64> {
-    const FIOCLEX: u32 = 0x5451;
     const FIONCLEX: u32 = 0x5450;
+    const FIOCLEX: u32 = 0x5451;
+    const FIONBIO: u32 = 0x5421;
     let f = file(ctx, fd)?;
     match req {
         FIOCLEX | FIONCLEX => {
             ctx.process().files.lock().set_cloexec(fd, req == FIOCLEX)?;
+            Ok(0)
+        }
+        FIONBIO => {
+            let on: i32 = ctx.mm().read(arg)?;
+            let mut fl = f.flags.lock();
+            if on != 0 {
+                *fl |= O_NONBLOCK;
+            } else {
+                *fl &= !O_NONBLOCK;
+            }
             Ok(0)
         }
         _ => f.inode.ioctl(req, arg, ctx.mm()),
@@ -275,22 +320,27 @@ pub fn dup(ctx: &Ctx, fd: i32) -> KResult<u64> {
 
 /// `dup2` (`is_dup2`: same descriptor is fine) and `dup3`.
 pub fn dup3(ctx: &Ctx, old: i32, new: i32, flags: u32, is_dup2: bool) -> KResult<u64> {
-    let mut files = ctx.process().files.lock();
-    let f = files.get(old)?;
-    if new < 0 || new as usize >= fs::MAX_FDS {
-        return Err(Errno::EBADF);
+    let replaced;
+    {
+        let mut files = ctx.process().files.lock();
+        let f = files.get(old)?;
+        if new < 0 || new as usize >= fs::MAX_FDS {
+            return Err(Errno::EBADF);
+        }
+        if old == new {
+            return if is_dup2 {
+                Ok(new as u64)
+            } else {
+                Err(Errno::EINVAL)
+            };
+        }
+        if flags & !O_CLOEXEC != 0 {
+            return Err(Errno::EINVAL);
+        }
+        replaced = files.get(new).ok();
+        files.set(new as usize, f, flags & O_CLOEXEC != 0);
     }
-    if old == new {
-        return if is_dup2 {
-            Ok(new as u64)
-        } else {
-            Err(Errno::EINVAL)
-        };
-    }
-    if flags & !O_CLOEXEC != 0 {
-        return Err(Errno::EINVAL);
-    }
-    files.set(new as usize, f, flags & O_CLOEXEC != 0);
+    drop(replaced);
     Ok(new as u64)
 }
 
@@ -300,7 +350,11 @@ pub fn fcntl(ctx: &Ctx, fd: i32, cmd: u32, arg: u64) -> KResult<u64> {
     const F_SETFD: u32 = 2;
     const F_GETFL: u32 = 3;
     const F_SETFL: u32 = 4;
+    const F_GETLK: u32 = 5;
+    const F_SETLK: u32 = 6;
+    const F_SETLKW: u32 = 7;
     const F_DUPFD_CLOEXEC: u32 = 1030;
+    const F_GETPIPE_SZ: u32 = 1032;
     const FD_CLOEXEC: u64 = 1;
     let mut files = ctx.process().files.lock();
     let f = files.get(fd)?;
@@ -324,8 +378,22 @@ pub fn fcntl(ctx: &Ctx, fd: i32, cmd: u32, arg: u64) -> KResult<u64> {
             *fl = (*fl & !changeable) | (arg as u32 & changeable);
             Ok(0)
         }
+        // Record locks: one process at a time uses a file so far; grant.
+        F_SETLK | F_SETLKW => Ok(0),
+        F_GETLK => {
+            // struct flock: l_type F_UNLCK (2) means "would succeed".
+            drop(files);
+            ctx.mm().write(arg, &2u16)?;
+            Ok(0)
+        }
+        F_GETPIPE_SZ if f.inode.file_type() == FileType::Fifo => Ok(64 * 1024),
         _ => Err(Errno::EINVAL),
     }
+}
+
+pub fn fsync(ctx: &Ctx, fd: i32) -> KResult<u64> {
+    file(ctx, fd)?;
+    Ok(0)
 }
 
 pub fn ftruncate(ctx: &Ctx, fd: i32, len: i64) -> KResult<u64> {
@@ -342,7 +410,7 @@ pub fn ftruncate(ctx: &Ctx, fd: i32, len: i64) -> KResult<u64> {
 
 pub fn truncate(ctx: &Ctx, path: u64, len: i64) -> KResult<u64> {
     let path = path_arg(ctx, path)?;
-    let inode = resolve(ctx, AT_FDCWD, &path)?;
+    let inode = resolve(ctx, AT_FDCWD, &path, true)?;
     if len < 0 {
         return Err(Errno::EINVAL);
     }
@@ -354,7 +422,7 @@ pub fn truncate(ctx: &Ctx, path: u64, len: i64) -> KResult<u64> {
 }
 
 pub fn getcwd(ctx: &Ctx, buf: u64, size: u64) -> KResult<u64> {
-    let path = ctx.process().cwd.lock().path.clone();
+    let path = fs::path_of(&cwd(ctx));
     let len = path.len() as u64 + 1;
     if size < len {
         return Err(Errno::ERANGE);
@@ -365,37 +433,45 @@ pub fn getcwd(ctx: &Ctx, buf: u64, size: u64) -> KResult<u64> {
     Ok(len)
 }
 
-fn set_cwd(ctx: &Ctx, inode: Arc<dyn Inode>, path: alloc::string::String) -> KResult<u64> {
+fn set_cwd(ctx: &Ctx, inode: Arc<dyn Inode>) -> KResult<u64> {
     if inode.file_type() != FileType::Directory {
         return Err(Errno::ENOTDIR);
     }
-    let mut cwd = ctx.process().cwd.lock();
-    cwd.inode = inode;
-    cwd.path = path;
+    *ctx.process().cwd.lock() = inode;
     Ok(0)
 }
 
 pub fn chdir(ctx: &Ctx, path: u64) -> KResult<u64> {
     let path = path_arg(ctx, path)?;
-    let inode = resolve(ctx, AT_FDCWD, &path)?;
-    let base = ctx.process().cwd.lock().path.clone();
-    set_cwd(ctx, inode, fs::normalize(&base, &path))
+    let inode = resolve(ctx, AT_FDCWD, &path, true)?;
+    set_cwd(ctx, inode)
 }
 
 pub fn fchdir(ctx: &Ctx, fd: i32) -> KResult<u64> {
-    let _ = (ctx, fd);
-    // Needs a path per open directory: Phase 3, with getdents users.
-    Err(Errno::ENOSYS)
+    let inode = file(ctx, fd)?.inode.clone();
+    set_cwd(ctx, inode)
 }
 
 pub fn mkdirat(ctx: &Ctx, dirfd: i32, path: u64, mode: u32) -> KResult<u64> {
     let path = path_arg(ctx, path)?;
     let (dir, name) = resolve_parent(ctx, dirfd, &path)?;
-    let umask = ctx
-        .process()
-        .umask
-        .load(core::sync::atomic::Ordering::Relaxed);
-    dir.create(&name, FileType::Directory, mode & 0o7777 & !umask)?;
+    dir.create(&name, FileType::Directory, mode & 0o7777 & !umask(ctx))?;
+    Ok(0)
+}
+
+/// `mknod`/`mknodat`: FIFOs and regular files (no device nodes: /dev is
+/// the kernel's).
+pub fn mknodat(ctx: &Ctx, dirfd: i32, path: u64, mode: u32) -> KResult<u64> {
+    use crate::abi::mode::*;
+    let path = path_arg(ctx, path)?;
+    let (dir, name) = resolve_parent(ctx, dirfd, &path)?;
+    let perm = mode & 0o7777 & !umask(ctx);
+    let ty = match mode & S_IFMT {
+        S_IFIFO => FileType::Fifo,
+        0 | S_IFREG => FileType::Regular,
+        _ => return Err(Errno::EPERM),
+    };
+    dir.create(&name, ty, perm)?;
     Ok(0)
 }
 
@@ -407,7 +483,7 @@ pub fn unlinkat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32) -> KResult<u64> {
     let dir_wanted = flags & AT_REMOVEDIR != 0;
     if !dir_wanted && path.ends_with('/') {
         // unlink("dir/") names a directory.
-        let target = resolve(ctx, dirfd, &path)?;
+        let target = resolve(ctx, dirfd, &path, true)?;
         return Err(if target.file_type() == FileType::Directory {
             Errno::EISDIR
         } else {
@@ -415,40 +491,418 @@ pub fn unlinkat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32) -> KResult<u64> {
         });
     }
     let (dir, name) = resolve_parent(ctx, dirfd, &path)?;
+    if dir_wanted && name == "." {
+        return Err(Errno::EINVAL);
+    }
     dir.remove(&name, dir_wanted)?;
     Ok(0)
 }
 
-pub fn readlinkat(ctx: &Ctx, dirfd: i32, path: u64) -> KResult<u64> {
+pub fn renameat(
+    ctx: &Ctx,
+    olddir: i32,
+    old: u64,
+    newdir: i32,
+    new: u64,
+    flags: u32,
+) -> KResult<u64> {
+    const RENAME_NOREPLACE: u32 = 1;
+    if flags & !RENAME_NOREPLACE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let old = path_arg(ctx, old)?;
+    let new = path_arg(ctx, new)?;
+    let (from_dir, from) = resolve_parent(ctx, olddir, &old)?;
+    let (to_dir, to) = resolve_parent(ctx, newdir, &new)?;
+    if matches!(from.as_str(), "." | "..") || matches!(to.as_str(), "." | "..") {
+        return Err(Errno::EBUSY);
+    }
+    let inode = from_dir.lookup(&from)?;
+    let is_dir = inode.file_type() == FileType::Directory;
+    if is_dir && fs::is_within(&to_dir, &inode) {
+        return Err(Errno::EINVAL); // into itself
+    }
+    match to_dir.lookup(&to) {
+        Ok(existing) => {
+            if existing.ino() == inode.ino() {
+                return Ok(0); // the same file: nothing to do
+            }
+            if flags & RENAME_NOREPLACE != 0 {
+                return Err(Errno::EEXIST);
+            }
+            let target_dir = existing.file_type() == FileType::Directory;
+            match (is_dir, target_dir) {
+                (true, false) => return Err(Errno::ENOTDIR),
+                (false, true) => return Err(Errno::EISDIR),
+                _ => {}
+            }
+            to_dir.remove(&to, target_dir)?;
+        }
+        Err(Errno::ENOENT) => {}
+        Err(e) => return Err(e),
+    }
+    let inode = from_dir.take(&from)?;
+    if let Err(e) = to_dir.insert(&to, inode.clone()) {
+        let _ = from_dir.insert(&from, inode);
+        return Err(e);
+    }
+    if is_dir {
+        inode.set_parent(&to_dir);
+    }
+    Ok(0)
+}
+
+pub fn linkat(ctx: &Ctx, olddir: i32, old: u64, newdir: i32, new: u64) -> KResult<u64> {
+    let old = path_arg(ctx, old)?;
+    let new = path_arg(ctx, new)?;
+    let inode = resolve(ctx, olddir, &old, false)?;
+    if inode.file_type() == FileType::Directory {
+        return Err(Errno::EPERM);
+    }
+    let (dir, name) = resolve_parent(ctx, newdir, &new)?;
+    dir.insert(&name, inode.clone())?;
+    inode.link_added();
+    Ok(0)
+}
+
+pub fn symlinkat(ctx: &Ctx, target: u64, newdir: i32, path: u64) -> KResult<u64> {
+    let target = path_arg(ctx, target)?;
     let path = path_arg(ctx, path)?;
-    // There are no symbolic links yet: anything that exists is "not one".
-    resolve(ctx, dirfd, &path)?;
-    Err(Errno::EINVAL)
+    let (dir, name) = resolve_parent(ctx, newdir, &path)?;
+    dir.symlink(&name, &target)?;
+    Ok(0)
+}
+
+pub fn readlinkat(ctx: &Ctx, dirfd: i32, path: u64, buf: u64, size: u64) -> KResult<u64> {
+    let path = path_arg(ctx, path)?;
+    if size as i64 <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    let inode = resolve(ctx, dirfd, &path, false)?;
+    let target = inode.readlink()?;
+    let n = target.len().min(size as usize);
+    ctx.mm().copy_to(buf, &target.as_bytes()[..n])?;
+    Ok(n as u64)
+}
+
+pub fn fchmodat(ctx: &Ctx, dirfd: i32, path: u64, mode: u32) -> KResult<u64> {
+    let path = path_arg(ctx, path)?;
+    resolve(ctx, dirfd, &path, true)?.set_perm(mode & 0o7777)?;
+    Ok(0)
+}
+
+pub fn fchmod(ctx: &Ctx, fd: i32, mode: u32) -> KResult<u64> {
+    file(ctx, fd)?.inode.set_perm(mode & 0o7777)?;
+    Ok(0)
+}
+
+/// `utime` (132), `utimes` (235), `utimensat` (280): only the modification
+/// time is kept.
+pub fn utimes(ctx: &Ctx, nr: u64, a: [u64; 6]) -> KResult<u64> {
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const UTIME_OMIT: i64 = (1 << 30) - 2;
+    let now = crate::time::realtime_ns() / crate::time::NS_PER_SEC;
+    let (inode, mtime) = match nr {
+        280 => {
+            let (dirfd, path, times, flags) = (a[0] as i32, a[1], a[2], a[3] as u32);
+            let inode = if path == 0 {
+                file(ctx, dirfd)?.inode.clone()
+            } else {
+                let p = path_arg(ctx, path)?;
+                resolve(ctx, dirfd, &p, flags & AT_SYMLINK_NOFOLLOW == 0)?
+            };
+            let mtime = if times == 0 {
+                Some(now)
+            } else {
+                let t: crate::abi::Timespec = ctx.mm().read(times + 16)?;
+                match t.tv_nsec {
+                    UTIME_OMIT => None,
+                    UTIME_NOW => Some(now),
+                    _ => Some(t.tv_sec.max(0) as u64),
+                }
+            };
+            (inode, mtime)
+        }
+        _ => {
+            let p = path_arg(ctx, a[0])?;
+            let inode = resolve(ctx, AT_FDCWD, &p, true)?;
+            let mtime = if a[1] == 0 {
+                Some(now)
+            } else {
+                // utime: {actime, modtime}; utimes: two timevals.
+                let off = if nr == 132 { 8 } else { 16 };
+                Some(ctx.mm().read::<i64>(a[1] + off)?.max(0) as u64)
+            };
+            (inode, mtime)
+        }
+    };
+    if let Some(t) = mtime {
+        inode.set_mtime(t);
+    }
+    Ok(0)
+}
+
+/// `statfs` (path) and `fstatfs` (descriptor): tmpfs numbers come from
+/// free memory; /proc has none.
+pub fn statfs(ctx: &Ctx, target: u64, buf: u64, by_fd: bool) -> KResult<u64> {
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+    const PIPEFS_MAGIC: u64 = 0x5049_5045;
+    let inode = if by_fd {
+        file(ctx, target as i32)?.inode.clone()
+    } else {
+        let p = path_arg(ctx, target)?;
+        resolve(ctx, AT_FDCWD, &p, true)?
+    };
+    let (magic, total, free) = match inode.dev() {
+        fs::DEV_PROC => (PROC_SUPER_MAGIC, 0, 0),
+        fs::DEV_PIPEFS => (PIPEFS_MAGIC, 0, 0),
+        _ => (
+            TMPFS_MAGIC,
+            crate::mm::frame::total_count(),
+            crate::mm::frame::free_count(),
+        ),
+    };
+    let words: [u64; 12] = [
+        magic,   // f_type
+        4096,    // f_bsize
+        total,   // f_blocks
+        free,    // f_bfree
+        free,    // f_bavail
+        1 << 20, // f_files
+        1 << 20, // f_ffree
+        0,       // f_fsid
+        255,     // f_namelen
+        4096,    // f_frsize
+        0,       // f_flags
+        0,
+    ];
+    let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    bytes.resize(120, 0);
+    ctx.mm().copy_to(buf, &bytes)?;
+    Ok(0)
+}
+
+pub fn pipe2(ctx: &Ctx, fds: u64, flags: u32) -> KResult<u64> {
+    if flags & !(O_CLOEXEC | O_NONBLOCK | O_DIRECT) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (r, w) = fs::pipe::pipe();
+    let status = flags & O_NONBLOCK;
+    let cloexec = flags & O_CLOEXEC != 0;
+    let (rfd, wfd) = {
+        let mut files = ctx.process().files.lock();
+        let rfd = files.alloc(0, File::new(r, O_RDONLY | status), cloexec)?;
+        match files.alloc(0, File::new(w, O_WRONLY | status), cloexec) {
+            Ok(wfd) => (rfd, wfd),
+            Err(e) => {
+                let _ = files.close(rfd);
+                return Err(e);
+            }
+        }
+    };
+    let pair = [rfd, wfd];
+    if let Err(e) = ctx.mm().write(fds, &pair) {
+        let mut files = ctx.process().files.lock();
+        let _ = files.close(rfd);
+        let _ = files.close(wfd);
+        return Err(e);
+    }
+    Ok(0)
+}
+
+/// Waits until one of `fds` (descriptor, wanted events) is ready, a signal
+/// arrives, or `timeout` (ns, None for ever) passes. Returns the events.
+fn wait_ready(ctx: &Ctx, fds: &[(i32, u16)], timeout: Option<u64>) -> KResult<Vec<u16>> {
+    let deadline = timeout.map(|t| crate::time::monotonic_ns().saturating_add(t));
+    let _timer = deadline
+        .filter(|_| timeout != Some(0))
+        .map(crate::time::wake_at);
+    loop {
+        let seen = fs::POLL_EVENTS.load(Ordering::Acquire);
+        let mut ready = 0;
+        let files = ctx.process().files.lock();
+        let events: Vec<u16> = fds
+            .iter()
+            .map(|&(fd, want)| {
+                if fd < 0 {
+                    return 0;
+                }
+                let r = match files.get(fd) {
+                    Ok(f) => f.inode.poll() & (want | pollbits::POLLERR | pollbits::POLLHUP),
+                    Err(_) => pollbits::POLLNVAL,
+                };
+                if r != 0 {
+                    ready += 1;
+                }
+                r
+            })
+            .collect();
+        drop(files);
+        if ready > 0 || deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {
+            return Ok(events);
+        }
+        let timed_out = || deadline.is_some_and(|d| crate::time::monotonic_ns() >= d);
+        match fs::POLL_WAIT
+            .wait_interruptible(|| fs::POLL_EVENTS.load(Ordering::Acquire) != seen || timed_out())
+        {
+            Ok(()) => {}
+            // poll and select are not restarted after a handler (Linux).
+            Err(_) => return Err(Errno::EINTR),
+        }
+    }
+}
+
+fn do_poll(ctx: &Ctx, ufds: u64, nfds: u64, timeout: Option<u64>) -> KResult<u64> {
+    if nfds > fs::MAX_FDS as u64 {
+        return Err(Errno::EINVAL);
+    }
+    let mut fds = Vec::with_capacity(nfds as usize);
+    for i in 0..nfds {
+        let fd: i32 = ctx.mm().read(ufds + i * 8)?;
+        let events: u16 = ctx.mm().read(ufds + i * 8 + 4)?;
+        fds.push((fd, events));
+    }
+    let revents = wait_ready(ctx, &fds, timeout)?;
+    for (i, r) in revents.iter().enumerate() {
+        ctx.mm().write(ufds + i as u64 * 8 + 6, r)?;
+    }
+    Ok(revents.iter().filter(|&&r| r != 0).count() as u64)
+}
+
+pub fn poll(ctx: &Ctx, ufds: u64, nfds: u64, timeout_ms: i64) -> KResult<u64> {
+    let timeout = (timeout_ms >= 0).then(|| timeout_ms as u64 * 1_000_000);
+    do_poll(ctx, ufds, nfds, timeout)
+}
+
+fn timespec_ns(ctx: &Ctx, addr: u64) -> KResult<Option<u64>> {
+    if addr == 0 {
+        return Ok(None);
+    }
+    let t: crate::abi::Timespec = ctx.mm().read(addr)?;
+    if t.tv_sec < 0 || !(0..1_000_000_000).contains(&t.tv_nsec) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Some(
+        (t.tv_sec as u64)
+            .saturating_mul(crate::time::NS_PER_SEC)
+            .saturating_add(t.tv_nsec as u64),
+    ))
+}
+
+/// ppoll and pselect6 run with a temporary signal mask, restored on the
+/// way back to user mode (or from the signal frame if a handler runs), as
+/// with sigsuspend.
+fn apply_sigmask(ctx: &Ctx, mask: u64) -> KResult<()> {
+    if mask != 0 {
+        let m: u64 = ctx.mm().read(mask)?;
+        ctx.thread().sig.suspend_mask(m);
+    }
+    Ok(())
+}
+
+pub fn ppoll(ctx: &Ctx, ufds: u64, nfds: u64, tsp: u64, sigmask: u64) -> KResult<u64> {
+    let timeout = timespec_ns(ctx, tsp)?;
+    apply_sigmask(ctx, sigmask)?;
+    do_poll(ctx, ufds, nfds, timeout)
+}
+
+/// `select`, and `pselect6` (with `sigmask`: a pointer to {mask pointer,
+/// size}).
+pub fn select(ctx: &Ctx, nfds: i32, sets: [u64; 3], tv: u64, sigmask: Option<u64>) -> KResult<u64> {
+    let pselect = sigmask.is_some();
+    if !(0..=fs::MAX_FDS as i32).contains(&nfds) {
+        return Err(Errno::EINVAL);
+    }
+    let words = (nfds as usize).div_ceil(64);
+    let mut bits = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
+    for (set, &addr) in bits.iter_mut().zip(&sets) {
+        if addr != 0 {
+            for (w, word) in set.iter_mut().enumerate() {
+                *word = ctx.mm().read(addr + w as u64 * 8)?;
+            }
+        }
+    }
+    let timeout = if tv == 0 {
+        None
+    } else if pselect {
+        timespec_ns(ctx, tv)?
+    } else {
+        let s: i64 = ctx.mm().read(tv)?;
+        let us: i64 = ctx.mm().read(tv + 8)?;
+        if s < 0 || !(0..1_000_000).contains(&us) {
+            return Err(Errno::EINVAL);
+        }
+        Some(s as u64 * crate::time::NS_PER_SEC + us as u64 * 1000)
+    };
+    let mut fds = Vec::new();
+    for fd in 0..nfds as usize {
+        let (w, b) = (fd / 64, 1u64 << (fd % 64));
+        let mut want = 0;
+        if bits[0][w] & b != 0 {
+            want |= pollbits::POLLIN;
+        }
+        if bits[1][w] & b != 0 {
+            want |= pollbits::POLLOUT;
+        }
+        if bits[2][w] & b != 0 {
+            want |= pollbits::POLLPRI;
+        }
+        if want != 0 {
+            if file(ctx, fd as i32).is_err() {
+                return Err(Errno::EBADF);
+            }
+            fds.push((fd as i32, want));
+        }
+    }
+    if let Some(m) = sigmask.filter(|&m| m != 0) {
+        let mask_ptr: u64 = ctx.mm().read(m)?;
+        apply_sigmask(ctx, mask_ptr)?;
+    }
+    let revents = wait_ready(ctx, &fds, timeout)?;
+    let mut out = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
+    let mut count = 0;
+    for (&(fd, want), &r) in fds.iter().zip(&revents) {
+        let (w, b) = (fd as usize / 64, 1u64 << (fd % 64));
+        if want & pollbits::POLLIN != 0
+            && r & (pollbits::POLLIN | pollbits::POLLHUP | pollbits::POLLERR) != 0
+        {
+            out[0][w] |= b;
+            count += 1;
+        }
+        if want & pollbits::POLLOUT != 0 && r & (pollbits::POLLOUT | pollbits::POLLERR) != 0 {
+            out[1][w] |= b;
+            count += 1;
+        }
+        if want & pollbits::POLLPRI != 0 && r & pollbits::POLLPRI != 0 {
+            out[2][w] |= b;
+            count += 1;
+        }
+    }
+    for (set, &addr) in out.iter().zip(&sets) {
+        if addr != 0 {
+            for (w, word) in set.iter().enumerate() {
+                ctx.mm().write(addr + w as u64 * 8, word)?;
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// `getdents64`: the file offset counts entries already returned
 /// ("." and ".." first).
 pub fn getdents64(ctx: &Ctx, fd: i32, buf: u64, count: u64) -> KResult<u64> {
-    const DT_CHR: u8 = 2;
-    const DT_DIR: u8 = 4;
-    const DT_REG: u8 = 8;
     let f = file(ctx, fd)?;
     let dir = &f.inode;
-    let mut list: Vec<(alloc::string::String, u64, u8)> = vec![
-        (".".into(), dir.ino(), DT_DIR),
-        (
-            "..".into(),
-            dir.parent().map_or(dir.ino(), |p| p.ino()),
-            DT_DIR,
-        ),
+    if dir.file_type() != FileType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+    let mut list: Vec<(String, u64, u8)> = vec![
+        (".".into(), dir.ino(), 4),
+        ("..".into(), dir.parent().map_or(dir.ino(), |p| p.ino()), 4),
     ];
     for (name, inode) in dir.entries()? {
-        let t = match inode.file_type() {
-            FileType::Directory => DT_DIR,
-            FileType::Regular => DT_REG,
-            FileType::CharDevice => DT_CHR,
-        };
-        list.push((name, inode.ino(), t));
+        list.push((name, inode.ino(), inode.file_type().dirent_type()));
     }
     let mut pos = f.offset.lock();
     let mut out = Vec::new();
@@ -472,4 +926,39 @@ pub fn getdents64(ctx: &Ctx, fd: i32, buf: u64, count: u64) -> KResult<u64> {
     ctx.mm().copy_to(buf, &out)?;
     *pos = i as u64;
     Ok(out.len() as u64)
+}
+
+/// `sendfile(out, in, offset, count)`: copies between files in the kernel.
+pub fn sendfile(ctx: &Ctx, out_fd: i32, in_fd: i32, offset: u64, count: u64) -> KResult<u64> {
+    let input = file(ctx, in_fd)?;
+    let output = file(ctx, out_fd)?;
+    if !input.readable() || !output.writable() {
+        return Err(Errno::EBADF);
+    }
+    let mut buf = vec![0u8; count.min(64 * 1024) as usize];
+    let n = if offset != 0 {
+        if !input.inode.seekable() {
+            return Err(Errno::ESPIPE);
+        }
+        let mut pos: i64 = ctx.mm().read(offset)?;
+        if pos < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let n = input.inode.read_at(pos as u64, &mut buf)?;
+        let w = output.write(&buf[..n])?;
+        pos += w as i64;
+        ctx.mm().write(offset, &pos)?;
+        return Ok(w as u64);
+    } else {
+        input.read(&mut buf)?
+    };
+    let mut done = 0;
+    while done < n {
+        match output.write(&buf[done..n]) {
+            Ok(w) => done += w,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done as u64)
 }

@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SegOS: a from-scratch OS in Rust that speaks Linux</title>
-  <meta name="description" content="SegOS is an operating system written from scratch in Rust. Its kernel implements the Linux system call interface so it can, in time, run unmodified Linux applications, and Windows ones through Wine and Proton. Early development: it boots on every CPU and runs its first unmodified Linux programs.">
+  <meta name="description" content="SegOS is an operating system written from scratch in Rust. Its kernel implements the Linux system call interface so it can, in time, run unmodified Linux applications, and Windows ones through Wine and Proton. Early development: it boots on every CPU and runs BusyBox, unmodified, as an interactive shell.">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f7f5f1" media="(prefers-color-scheme: light)">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="SegOS">
   <meta property="og:title" content="SegOS: a from-scratch OS in Rust that speaks Linux">
-  <meta property="og:description" content="A new kernel in Rust that implements the Linux syscall ABI, so unmodified Linux apps (and Windows apps via Wine/Proton) can run on it. Phases 0 to 2 done: a musl hello world built on Linux runs unmodified.">
+  <meta property="og:description" content="A new kernel in Rust that implements the Linux syscall ABI, so unmodified Linux apps (and Windows apps via Wine/Proton) can run on it. Phases 0 to 3 done: Ubuntu&#39;s BusyBox runs unmodified as a shell.">
   <meta property="og:image" content="/assets/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -41,16 +41,16 @@
   <main id="main">
     <div class="wrap">
       <section class="hero" aria-labelledby="hero-title">
-        <p class="eyebrow"><span class="dot" aria-hidden="true"></span><span>Early development &middot; 3 of 11 phases done</span></p>
+        <p class="eyebrow"><span class="dot" aria-hidden="true"></span><span>Early development &middot; 4 of 11 phases done</span></p>
         <h1 id="hero-title">A new operating system in Rust that <em>speaks Linux</em>.</h1>
         <p class="lede">
           SegOS is a kernel written from scratch whose native interface is the
           <strong>Linux system call ABI</strong>. The goal: run the applications
           people already use, unmodified, and Windows programs through Wine and
-          Proton. Today it boots with its own bootloader, runs threads on every
-          CPU, and <strong>runs its first unmodified Linux program</strong>: a
-          static &ldquo;hello world&rdquo; compiled with musl on Linux. A shell
-          is next.
+          Proton. Today it boots with its own bootloader, runs on every CPU,
+          and <strong>gives you a shell</strong>: BusyBox, exactly as Ubuntu
+          ships it, with pipes, job control and <code>^C</code>. Real disks
+          are next.
         </p>
         <div class="actions">
           <a class="btn btn-primary" href="/roadmap">See the roadmap</a>
@@ -65,14 +65,15 @@
         <div class="console-bar" aria-hidden="true"><i></i><i></i><i></i><span>qemu-system-x86_64 &middot; segos.img</span></div>
         <div class="shot" tabindex="0" role="region" aria-label="Kernel console screenshot">
         <picture>
-          <img src="/assets/console.png" width="1280" height="176"
-               alt="SegOS kernel console in QEMU. Lines: SegOS 0.1.0; console: 1280x800 framebuffer; apic: id 0, timer 999 MHz bus, 100 Hz tick; smp: 4 CPUs online; ready: 4 CPUs, 499 MiB free; initramfs: 3 files (91 KiB), 3 directories; started /init (pid 1); Hello, world!; /init exited with status 0; nothing left to run (a shell arrives in Phase 3).">
+          <img src="/assets/console.png" width="1280" height="416"
+               alt="A BusyBox shell session on the SegOS screen console. uname -a prints: Linux segos 6.6.0-segos-0.1.0 #1 SegOS 0.1.0 x86_64 GNU/Linux. ls /bin | grep sh | wc -l prints 3. hello prints Hello, world! echo $((6 * 7)) | tee /tmp/answer; cat /tmp/answer prints 42 twice. sleep 1 &amp; ps lists init, two shells and ps. free -m shows 502 MB total, 485 free. cat /proc/version prints: Linux version 6.6.0-segos-0.1.0 (SegOS 0.1.0, a kernel written in Rust that speaks Linux).">
         </picture>
         </div>
         <figcaption id="console-cap">
-          SegOS today, booted in QEMU on 4 CPUs: it unpacks the initramfs and
-          runs <code>/init</code>, a hello world compiled for Linux with musl,
-          unmodified. &ldquo;Hello, world!&rdquo; is the program&rsquo;s own output.
+          SegOS today, in QEMU: Ubuntu&rsquo;s BusyBox shell on the kernel&rsquo;s
+          own screen console. <code>ls /bin | grep sh | wc -l</code> is the
+          Phase 3 demo; <code>ps</code> and <code>free</code> read
+          <code>/proc</code>; <code>hello</code> is a musl program built on Linux.
           <a href="/assets/console-full.png">Full 1280&times;800 screenshot</a>.
         </figcaption>
       </figure>
@@ -152,54 +153,49 @@
         <div class="section-head">
           <p class="kicker">Status</p>
           <h2 id="status-title">Where it is right now</h2>
-          <p>Each phase ends with a demo that has to work in QEMU. Phases 0, 1 and 2 have passed; Phase 3, a shell, is next.</p>
+          <p>Each phase ends with a demo that has to work in QEMU and in CI. Phases 0 to 3 have passed; Phase 4, real disks, is next.</p>
         </div>
         <div class="grid">
           <div class="panel">
-            <h3>Phase 0 &middot; Bring-up <span class="badge done">Done</span></h3>
+            <h3>Phases 0&ndash;1 &middot; Bring-up, multitasking <span class="badge done">Done</span></h3>
             <ul class="checklist done">
               <li>Boots on UEFI with segboot, its own bootloader</li>
-              <li>No third-party crates: all the code it runs is in the repository</li>
-              <li>Serial port and framebuffer text console</li>
-              <li>GDT, TSS and IDT; handlers for every CPU exception</li>
-              <li>Physical frame allocator from the boot memory map</li>
-              <li>4-level paging with a higher-half direct map</li>
-              <li>Kernel heap</li>
-              <li>7 in-kernel tests passing in QEMU</li>
-            </ul>
-          </div>
-          <div class="panel">
-            <h3>Phase 1 &middot; Multitasking <span class="badge done">Done</span></h3>
-            <ul class="checklist done">
-              <li>Local APIC timer, calibrated against the PIT</li>
-              <li>Kernel threads and a preemptive scheduler</li>
-              <li>SMP: every CPU started, per-CPU data</li>
-              <li>Interrupt-safe spinlocks, sleeping mutexes, wait queues</li>
-              <li>Kernel stacks with guard pages</li>
-              <li>13 in-kernel tests passing in QEMU on 4 CPUs</li>
+              <li>No third-party crates: all of the OS is in the repository</li>
+              <li>Exceptions, frame allocator, paging, kernel heap</li>
+              <li>APIC timer, preemptive scheduler on every CPU</li>
+              <li>Spinlocks, sleeping mutexes, wait queues</li>
             </ul>
           </div>
           <div class="panel">
             <h3>Phase 2 &middot; First user program <span class="badge done">Done</span></h3>
             <ul class="checklist done">
               <li>Ring 3, <code>syscall</code> entry, FPU/SSE state per thread</li>
-              <li>Address spaces with demand paging, <code>mmap</code>, <code>brk</code>, <code>mprotect</code></li>
+              <li>Address spaces with demand paging, <code>mmap</code>, <code>brk</code></li>
               <li>ELF loader and the Linux initial stack (argv, envp, auxv)</li>
-              <li>initramfs (newc cpio) unpacked into tmpfs; <code>/dev</code> devices</li>
-              <li>79 Linux system call numbers answered</li>
+              <li>initramfs unpacked into tmpfs; <code>/dev</code> devices</li>
               <li>A musl hello world built on Linux runs unmodified</li>
-              <li>A conformance test prints exactly what it prints on Linux</li>
             </ul>
           </div>
           <div class="panel">
-            <h3>Phase 3 &middot; A shell <span class="badge wip">Next</span></h3>
-            <ul class="checklist">
-              <li><code>fork</code> with copy-on-write, <code>execve</code>, <code>wait4</code></li>
-              <li>Pipes, signal delivery</li>
-              <li>A terminal: keyboard input and line editing</li>
-              <li>Symbolic links, <code>/proc</code> basics</li>
+            <h3>Phase 3 &middot; A shell <span class="badge done">Done</span></h3>
+            <ul class="checklist done">
+              <li>Ubuntu&rsquo;s BusyBox runs unmodified; <code>ls | grep | wc</code> works</li>
+              <li><code>fork</code> with copy-on-write, <code>execve</code>, <code>wait4</code>, process groups</li>
+              <li>Signals delivered to handlers, SA_RESTART, stop and continue</li>
+              <li>Pipes, <code>poll</code>/<code>select</code>, symbolic links, <code>/proc</code></li>
+              <li>A terminal: keyboard and serial input, line editing, <code>^C</code></li>
+              <li>140 Linux system call numbers; 3 tests match Linux byte for byte</li>
             </ul>
-            <p class="notice"><span>Done when BusyBox <code>sh</code> runs and <code>ls | grep | wc</code> works.</span></p>
+          </div>
+          <div class="panel">
+            <h3>Phase 4 &middot; Real storage <span class="badge wip">Next</span></h3>
+            <ul class="checklist">
+              <li>PCI(e), MSI interrupts</li>
+              <li>virtio-blk, NVMe and AHCI (SATA) drivers</li>
+              <li>A block layer and page cache</li>
+              <li>GPT partitions, ext4, FAT32, mounts</li>
+            </ul>
+            <p class="notice"><span>Done when SegOS boots from a disk with a full root file system.</span></p>
           </div>
         </div>
         <p style="margin-top:1.5rem"><a href="/roadmap">All 11 phases, from bring-up to Steam &rarr;</a></p>
@@ -213,15 +209,16 @@
           <h2 id="build-title">Build it yourself</h2>
           <p>
             You need Rust (the version is pinned in <code>rust-toolchain.toml</code>),
-            QEMU, OVMF and musl-gcc. Nothing is downloaded: the bootloader, the
-            kernel and the tool that writes the disk image are all in the
-            repository, in Rust. musl-gcc builds the test programs in
-            <code>userland/</code>: ordinary C programs for Linux, built the way
-            any Linux user would build them.
+            QEMU, OVMF and musl-gcc. The bootloader, the kernel and the tool that
+            writes the disk image are all in the repository, in Rust. What runs
+            on it is ordinary Linux software: the first build fetches Ubuntu&rsquo;s
+            <code>busybox-static</code> with <code>apt-get download</code>, and
+            musl-gcc builds the test programs in <code>userland/</code>.
           </p>
           <p>
-            What you will see is the console above: SegOS boots, runs the
-            hello world, and stops there. That is the honest state of things.
+            What you will see is the console above: a shell, on the QEMU window
+            and on your terminal. Everything lives in memory (no disk yet), and
+            <code>poweroff -f</code> turns it off.
           </p>
         </div>
         <div class="cmds">
@@ -236,8 +233,8 @@
           </figure>
           <figure class="cmd">
             <figcaption>Build, boot and test</figcaption>
-            <pre><code><span class="p" aria-hidden="true">$ </span>cargo xtask run          <span class="c"># build the disk image, boot it in QEMU</span>
-<span class="p" aria-hidden="true">$ </span>cargo xtask test         <span class="c"># in-kernel tests, in QEMU</span>
+            <pre><code><span class="p" aria-hidden="true">$ </span>cargo xtask run          <span class="c"># build the disk image, boot it: a shell</span>
+<span class="p" aria-hidden="true">$ </span>cargo xtask test         <span class="c"># tests on Linux, in the kernel, in the shell</span>
 <span class="p" aria-hidden="true">$ </span>cargo xtask image        <span class="c"># target/segos.img, for a USB stick</span></code></pre>
           </figure>
         </div>

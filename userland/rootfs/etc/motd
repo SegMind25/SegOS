@@ -1,0 +1,6 @@
+
+  Welcome to SegOS: a kernel written from scratch in Rust that speaks Linux.
+  Everything below is BusyBox, unmodified, as Ubuntu builds it.
+  Try: ls /bin | grep sh | wc -l    ps    cat /proc/meminfo    hello
+  'poweroff -f' turns the machine off.
+

@@ -21,7 +21,11 @@ errnos! {
     ENODEV = 19, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, ENFILE = 23,
     EMFILE = 24, ENOTTY = 25, EFBIG = 27, ENOSPC = 28, ESPIPE = 29,
     EROFS = 30, EMLINK = 31, EPIPE = 32, ERANGE = 34, ENAMETOOLONG = 36,
-    ENOSYS = 38, ENOTEMPTY = 39, ELOOP = 40, EOPNOTSUPP = 95,
+    ENOSYS = 38, ENOTEMPTY = 39, ELOOP = 40, ENOTSOCK = 88, EOPNOTSUPP = 95,
+    ETIMEDOUT = 110,
+    // Kernel-internal: never seen by programs. A blocking call interrupted
+    // by a signal; turned into a restart or EINTR on the way out.
+    ERESTARTSYS = 512,
 }
 
 /// Open flags (`fcntl.h`).
@@ -36,6 +40,7 @@ pub mod open {
     pub const O_TRUNC: u32 = 0o1000;
     pub const O_APPEND: u32 = 0o2000;
     pub const O_NONBLOCK: u32 = 0o4000;
+    pub const O_DIRECT: u32 = 0o40000;
     pub const O_DIRECTORY: u32 = 0o200000;
     pub const O_NOFOLLOW: u32 = 0o400000;
     pub const O_CLOEXEC: u32 = 0o2000000;
@@ -52,6 +57,7 @@ pub const AT_EMPTY_PATH: u32 = 0x1000;
 pub mod mode {
     pub const S_IFMT: u32 = 0o170000;
     pub const S_IFDIR: u32 = 0o040000;
+    pub const S_IFIFO: u32 = 0o010000;
     pub const S_IFCHR: u32 = 0o020000;
     pub const S_IFREG: u32 = 0o100000;
     pub const S_IFLNK: u32 = 0o120000;
@@ -143,6 +149,7 @@ unsafe impl Pod for Stat {}
 unsafe impl Pod for Timespec {}
 unsafe impl Pod for Iovec {}
 unsafe impl Pod for Winsize {}
+unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 
 pub fn as_bytes<T: Pod>(v: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(v as *const T as *const u8, size_of::<T>()) }

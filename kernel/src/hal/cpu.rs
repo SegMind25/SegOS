@@ -92,3 +92,22 @@ pub fn backtrace(mut f: impl FnMut(usize, u64)) {
         rbp = unsafe { *(rbp as *const u64) };
     }
 }
+
+/// Resets the machine: the keyboard controller's reset line, then a triple
+/// fault if that did nothing.
+pub fn restart() -> ! {
+    x86::disable_interrupts();
+    unsafe {
+        for _ in 0..1000 {
+            if x86::inb(0x64) & 2 == 0 {
+                break;
+            }
+        }
+        x86::outb(0x64, 0xfe);
+        // An empty IDT and an exception: the CPU resets.
+        let empty = x86::DescriptorPointer { limit: 0, base: 0 };
+        x86::lidt(&empty);
+        core::arch::asm!("int3", options(nomem, nostack));
+    }
+    halt_forever()
+}

@@ -1,0 +1,53 @@
+# fork and wait
+ok   p > 0
+ok   waitpid(p, &st, 0) == p
+ok   WIFEXITED(st) && WEXITSTATUS(st) == 7
+ok   waitpid(-1, &st, WNOHANG) == -1 && errno == ECHILD
+ok   waitpid(p, &st, WNOHANG) == 0
+ok   waitpid(p, &st, 0) == p && WIFEXITED(st)
+# copy-on-write
+ok   pipe(fds) == 0
+ok   read(fds[0], &ok, 1) == 1 && ok == 1
+ok   global == 1
+ok   heap[0] == 'p' && heap[99999] == 'p'
+# pipes
+ok   pipe(fds) == 0
+ok   n == 0 && total == 20000
+ok   pipe(fds) == 0
+ok   write(fds[1], "x", 1) == -1 && errno == EPIPE
+ok   pipe2(fds, O_NONBLOCK | O_CLOEXEC) == 0
+ok   read(fds[0], buf, 1) == -1 && errno == EAGAIN
+ok   fcntl(fds[0], F_GETFD) == FD_CLOEXEC
+ok   poll(&pf, 1, 0) == 0
+ok   write(fds[1], "y", 1) == 1
+ok   poll(&pf, 1, 1000) == 1 && (pf.revents & POLLIN)
+ok   read(fds[0], buf, 2) == 1 && read(fds[0], buf, 1) == 0
+ok   poll(&pf, 1, 0) == 1 && (pf.revents & POLLHUP)
+# signals
+ok   kill(getpid(), SIGUSR1) == 0 && got == SIGUSR1
+ok   got == 0
+ok   sigismember(&pend, SIGUSR1)
+ok   got == SIGUSR1
+ok   raise(SIGUSR2) == 0
+ok   r == 1 && got == SIGUSR1
+ok   r == -1 && e == EINTR && got == SIGUSR1
+ok   where == SIGSEGV
+ok   WIFSIGNALED(st) && WTERMSIG(st) == SIGTERM
+ok   waitpid(p, &st, WUNTRACED) == p && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP
+ok   waitpid(p, &st, 0) == p && WIFEXITED(st) && WEXITSTATUS(st) == 3
+ok   got == SIGCHLD
+# exec
+ok   WIFEXITED(st) && WEXITSTATUS(st) == 42
+ok   execl("/no/such/program", "x", (char *)NULL) == -1 && errno == ENOENT
+ok   WIFEXITED(st) && WEXITSTATUS(st) == 5
+ok   posix_spawn(&p, self, NULL, NULL, argv, environ) == 0
+ok   WIFEXITED(st) && WEXITSTATUS(st) == 42
+ok   WIFEXITED(st) && WEXITSTATUS(st) == 43
+# process groups and sessions
+ok   getpgid(0) == getpgrp()
+ok   getsid(0) > 0
+ok   WEXITSTATUS(status_of(p)) == 0
+ok   WEXITSTATUS(status_of(p)) == 0
+ok   kill(-getpgrp(), 0) == 0
+ok   kill(999999, 0) == -1 && errno == ESRCH
+0 failures

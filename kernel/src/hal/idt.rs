@@ -70,7 +70,7 @@ unsafe extern "C" {
 
 /// Registers as saved by `isr_common`, lowest address first.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TrapFrame {
     pub r15: u64,
     pub r14: u64,
@@ -164,13 +164,14 @@ impl Gate {
         _reserved: 0,
     };
 
-    /// Present, ring-0 interrupt gate (interrupts stay off in the handler).
-    fn interrupt(handler: u64, ist: u8) -> Self {
+    /// Present interrupt gate (interrupts stay off in the handler) that
+    /// user code may invoke with `int3`/`into` if `user` (DPL 3).
+    fn interrupt(handler: u64, ist: u8, user: bool) -> Self {
         Self {
             offset_low: handler as u16,
             selector: super::gdt::KERNEL_CODE,
             ist,
-            attributes: 0x8e,
+            attributes: if user { 0xee } else { 0x8e },
             offset_mid: (handler >> 16) as u16,
             offset_high: (handler >> 32) as u32,
             _reserved: 0,
@@ -195,7 +196,9 @@ pub fn init() {
             } else {
                 0
             };
-            idt.0[vector] = Gate::interrupt(handler, ist);
+            // int3 and into may be used by programs (debuggers, asserts).
+            let user = vector == 3 || vector == 4;
+            idt.0[vector] = Gate::interrupt(handler, ist, user);
         }
         idt
     });
@@ -221,7 +224,8 @@ pub fn exception_name(vector: u64) -> &'static str {
 extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     if frame.came_from_user() && frame.vector < 32 {
         // A user program's fault: its business, not a kernel bug.
-        crate::proc::user_exception(frame);
+        crate::proc::faults::user_exception(frame);
+        return_to_user(frame);
         return;
     }
     match frame.vector {
@@ -261,11 +265,32 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
             }
             crate::task::sched::preempt();
         }
+        v if v == crate::drivers::KEYBOARD_VECTOR as u64 => {
+            crate::drivers::ps2kbd::irq();
+            super::apic::eoi();
+        }
+        v if v == crate::drivers::SERIAL_VECTOR as u64 => {
+            super::serial::irq();
+            super::apic::eoi();
+        }
         v if v == super::apic::SPURIOUS_VECTOR as u64 => {}
         v @ 0..32 => panic!(
             "CPU exception {v}: {} (error code {:#x}) rip={:#x}\n{frame:#x?}",
             EXCEPTION_NAMES[v as usize], frame.error_code, frame.rip
         ),
         v => crate::warn!("unexpected interrupt vector {v}"),
+    }
+    if frame.came_from_user() {
+        return_to_user(frame);
+    }
+}
+
+/// Before an interrupt or exception returns to user mode: act on pending
+/// signals (with interrupts on: it may touch user memory or sleep).
+fn return_to_user(frame: &mut TrapFrame) {
+    if crate::proc::signal::pending() {
+        x86::enable_interrupts();
+        crate::proc::signal::on_return_to_user(frame, None);
+        x86::disable_interrupts();
     }
 }
