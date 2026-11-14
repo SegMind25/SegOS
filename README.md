@@ -4,22 +4,27 @@ An operating system written from scratch in Rust, aiming to run **unmodified
 Linux applications** (and, through Wine/Proton, Windows ones) by implementing
 the Linux system call interface in a new kernel.
 
-Status: **Phase 1 (multitasking) done**. SegOS boots on UEFI with its own
-bootloader, segboot. The kernel prints to the serial port and the screen,
-handles CPU exceptions, manages physical memory, page tables and a kernel
-heap, starts every CPU, and runs kernel threads on all of them with a
-preemptive scheduler. It does not run programs yet; that is Phase 2.
+Status: **Phase 2 (first user program) done**. SegOS boots on UEFI with its
+own bootloader, segboot, starts every CPU, and runs **unmodified Linux
+programs**: a static "hello world" compiled with musl on Linux runs as
+`/init`, and a conformance test prints exactly what it prints on Linux.
+The kernel has user address spaces with demand paging, an ELF loader, an
+initramfs unpacked into tmpfs, `/dev`, and answers 79 Linux system call
+numbers. Next is Phase 3: `fork`, `execve`, pipes and a shell.
 
 Everything it runs is in this repository: the bootloader, the kernel and
 the build tool use no third-party crates, only Rust's `core`, `alloc` and
-(for the build tool) `std`.
+(for the build tool) `std`. The only C is in `userland/`: test programs for
+Linux, built with the ordinary Linux toolchain (`musl-gcc`), because the
+point is that SegOS runs what Linux compilers produce.
 
 The whole roadmap, from here to Steam: [docs/plan.md](docs/plan.md).
 
-![The SegOS kernel booted in QEMU on 4 CPUs](docs/images/boot-4-cpus.png)
+![SegOS in QEMU running a musl hello world as /init](docs/images/console.png)
 
-*The kernel today, booted in QEMU: all 4 CPUs started, each timer ticking
-100 times a second, threads scheduled across them.*
+*SegOS today, booted in QEMU on 4 CPUs: it unpacks the initramfs and runs
+`/init`, a hello world compiled for Linux with musl, unmodified. "Hello,
+world!" is the program's own output.*
 
 ## How SegOS works
 
@@ -58,7 +63,9 @@ flowchart LR
     B --> C["CPU setup<br/>serial log<br/>GDT · TSS · IDT"]
     C --> D["Memory<br/>frames · paging<br/>heap"]
     D --> E["Screen console<br/>APIC timer"]
-    E --> F["All CPUs start<br/>scheduler runs<br/>threads everywhere"]
+    E --> F["All CPUs start<br/>scheduler runs"]
+    F --> G["initramfs<br/>unpacked to tmpfs"]
+    G --> H["/init runs<br/>in user mode"]
 ```
 
 segboot is a UEFI application (`EFI/BOOT/BOOTX64.EFI` on the disk). It
@@ -95,6 +102,35 @@ sequenceDiagram
     Note over S,Q: Threads that wait (for a lock, or another<br/>thread to finish) sleep in a wait queue<br/>and use no CPU until they are woken.
 ```
 
+### How a Linux program runs
+
+`/init` is an ordinary static Linux executable. The kernel reads its ELF
+headers, creates an address space, maps its segments, and builds the stack
+exactly as Linux does (`argc`, `argv`, `envp`, the auxiliary vector), then
+drops to ring 3 at its entry point. From there the C library talks to the
+kernel only through the `syscall` instruction:
+
+```mermaid
+sequenceDiagram
+    participant P as hello (musl, unmodified)
+    participant E as syscall entry
+    participant D as dispatcher
+    participant F as files / memory
+    P->>E: syscall: rax = 20 (writev), rdi = 1, ...
+    E->>E: swapgs, switch to the thread's kernel stack, save registers
+    E->>D: Linux number 20
+    D->>F: fd 1 → /dev/console, copy the buffers in
+    F-->>D: 14 bytes written
+    D-->>E: rax = 14 (or -errno)
+    E-->>P: iretq back to ring 3
+```
+
+Memory is mapped lazily: the program's regions (code, data, heap, stack,
+`mmap`) are recorded, and the first touch of a page faults and gets a
+zeroed frame. A touch outside every region kills the program with
+SIGSEGV, as on Linux; the kernel carries on. Unknown system calls return
+`ENOSYS` and are logged once, which is the to-do list for what comes next.
+
 ### Where things live in memory
 
 | Virtual address | What |
@@ -105,8 +141,15 @@ sequenceDiagram
 | `0xffff_e000_0000_0000` | device registers (local APIC) |
 | `0xffff_ffff_8000_0000` | the kernel itself |
 
-The lower half (below `0x0000_8000_0000_0000`) is reserved for programs,
-from Phase 2.
+The lower half (below `0x0000_8000_0000_0000`) belongs to each program,
+laid out as on Linux:
+
+| Virtual address | What |
+|---|---|
+| `0x0000_0000_0040_0000` | a static executable's code and data (`0x5555_5555_4000` for a static PIE) |
+| just above it | `brk` heap |
+| below `0x0000_7f00_0000_0000` | `mmap` regions, allocated downwards |
+| `0x0000_7fff_ff7f_f000`–`0x0000_7fff_ffff_f000` | the main thread's 8 MiB stack |
 
 ## The plan
 
@@ -118,7 +161,7 @@ install Steam and play.
 flowchart TB
     subgraph F["Foundation"]
         direction LR
-        P0["0 · Bring-up<br/>boot, console, memory"]:::done --> P1["1 · Multitasking<br/>timer, threads, all CPUs"]:::done --> P2["2 · First program<br/>user mode, ELF, syscalls"]:::next --> P3["3 · A shell<br/>fork, exec, pipes"]
+        P0["0 · Bring-up<br/>boot, console, memory"]:::done --> P1["1 · Multitasking<br/>timer, threads, all CPUs"]:::done --> P2["2 · First program<br/>user mode, ELF, syscalls"]:::done --> P3["3 · A shell<br/>fork, exec, pipes"]:::next
     end
     subgraph L["Linux userland"]
         direction LR
@@ -136,9 +179,9 @@ flowchart TB
 Green is done, amber is next.
 
 How progress is measured: small test programs whose output is recorded on
-real Linux and compared on SegOS; a published table of which Linux system
-calls work; and a ladder of real applications run in CI, from BusyBox up to
-Steam.
+real Linux and compared on SegOS (`userland/tests/`, see below); a
+published table of which Linux system calls work; and a ladder of real
+applications run in CI, from BusyBox up to Steam.
 
 Honest expectation: a working shell within months, a desktop with a browser
 in 2 to 3 years, games after that. Drivers for real graphics cards are the
@@ -154,11 +197,12 @@ tracks the roadmap.
 
 ## Build and run
 
-Needs Rust (the version is pinned in `rust-toolchain.toml`), QEMU and
-OVMF (UEFI firmware for QEMU). On Debian/Ubuntu:
+Needs Rust (the version is pinned in `rust-toolchain.toml`), QEMU, OVMF
+(UEFI firmware for QEMU) and musl-gcc (for the Linux test programs). On
+Debian/Ubuntu:
 
 ```bash
-sudo apt install qemu-system-x86 ovmf git
+sudo apt install qemu-system-x86 ovmf musl-tools git
 ```
 
 ```bash
@@ -166,7 +210,7 @@ cargo xtask run          # build the disk image and boot it in QEMU
 ```
 
 ```bash
-cargo xtask test         # in-kernel tests, in QEMU
+cargo xtask test         # userland tests on this Linux, then kernel tests in QEMU
 ```
 
 ```bash
@@ -174,7 +218,8 @@ cargo xtask image        # target/segos.img
 ```
 
 Nothing is downloaded. `target/segos.img` is a GPT disk with one FAT32 EFI
-system partition, written by `xtask` itself. To boot a real PC from a USB
+system partition, written by `xtask` itself: segboot, the kernel and the
+initramfs (a `newc` cpio archive of `userland/`, built with musl-gcc). To boot a real PC from a USB
 stick (UEFI only, Secure Boot off; this erases the stick):
 
 ```bash
@@ -182,7 +227,21 @@ sudo dd if=target/segos.img of=/dev/sdX bs=4M conv=fsync
 ```
 
 Set `OVMF=/path/to/OVMF.fd` if your distribution keeps it elsewhere than
-`/usr/share/ovmf/OVMF.fd`.
+`/usr/share/ovmf/OVMF.fd`, and `MUSL_GCC` if musl's compiler has another
+name.
+
+### Testing against Linux
+
+Every program in `userland/tests/` has a `.expected` file: its exact
+output. `cargo xtask test` first runs each one **on the Linux machine
+doing the build** and fails if Linux does not print exactly that (so the
+expectations are Linux's behaviour, not SegOS's), then boots SegOS, where
+the kernel test suite runs each one again and compares. To add a test,
+write the C program, run it on Linux, and save its output:
+
+```bash
+musl-gcc -static -O2 -o /tmp/t userland/tests/NAME.c && /tmp/t > userland/tests/NAME.expected
+```
 
 ## Layout
 
@@ -190,16 +249,21 @@ Set `OVMF=/path/to/OVMF.fd` if your distribution keeps it elsewhere than
 |---|---|
 | `boot/` | segboot, the UEFI bootloader: loads the kernel ELF, page tables, memory map, framebuffer |
 | `bootinfo/` | the boot protocol: what segboot hands the kernel |
-| `kernel/src/hal/` | x86-64: instructions, serial, GDT/TSS, IDT and the trap path, ACPI tables, local APIC and timer, per-CPU data, starting CPUs |
-| `kernel/src/mm/` | frame allocator, page tables, kernel heap allocator |
+| `kernel/src/hal/` | x86-64: instructions, serial, GDT/TSS, IDT and the trap path, `syscall` entry, entering user mode, ACPI tables, local APIC and timer, RTC, per-CPU data, starting CPUs |
+| `kernel/src/mm/` | frame allocator, page tables, kernel heap allocator, process address spaces (`vm.rs`) |
+| `kernel/src/proc/` | processes and user threads, the ELF loader and initial stack, user faults |
+| `kernel/src/syscall/` | the Linux system calls, by Linux number |
+| `kernel/src/fs/` | the VFS, tmpfs, `/dev` devices, the initramfs (cpio) unpacker |
+| `kernel/src/abi.rs` | Linux's error numbers, flags and structure layouts |
 | `kernel/src/task/` | kernel threads, scheduler and context switch, wait queues |
 | `kernel/src/sync.rs` | interrupt-safe spinlock, sleeping mutex |
-| `kernel/src/time.rs` | uptime and sleeping |
+| `kernel/src/time.rs` | TSC clock, wall-clock time from the RTC, sleeping |
 | `kernel/src/console.rs` | framebuffer text console |
 | `kernel/src/font.rs` | the console's 8×16 bitmap font |
 | `kernel/src/klog.rs` | kernel log levels and macros |
 | `kernel/src/ktest.rs` | in-kernel tests |
-| `xtask/` | build tool: builds segboot and the kernel, writes the GPT/FAT32 disk image, runs QEMU |
+| `xtask/` | build tool: builds segboot, the kernel and `userland/`, writes the initramfs and the GPT/FAT32 disk image, runs QEMU |
+| `userland/` | Linux programs SegOS runs: `hello/` (the `/init` demo) and `tests/` (conformance tests with their Linux output) |
 | `site/` | the website, deployed by Vercel (`vercel.json`) |
 
 Subsystems become their own crates once they grow (see the plan).
@@ -209,4 +273,5 @@ Subsystems become their own crates once they grow (see the plan).
 MIT or Apache-2.0, at your option.
 
 The previous project in this repository, SegLinux (a Linux distribution),
-remains on the `main` branch.
+is in the git history up to its 1.0.0 release: commit
+[`fededbe`](https://github.com/SegMind25/SegOS/commit/fededbe1b8a5d5d58cc89a27f7e7852b27409f80).

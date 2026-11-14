@@ -41,7 +41,22 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
 pub mod msr {
     pub const APIC_BASE: u32 = 0x1b;
     pub const EFER: u32 = 0xc000_0080;
+    /// `syscall`/`sysret` segment selectors.
+    pub const STAR: u32 = 0xc000_0081;
+    /// `syscall` entry point.
+    pub const LSTAR: u32 = 0xc000_0082;
+    /// RFLAGS bits cleared on `syscall`.
+    pub const FMASK: u32 = 0xc000_0084;
+    pub const FS_BASE: u32 = 0xc000_0100;
     pub const GS_BASE: u32 = 0xc000_0101;
+    /// Swapped with GS_BASE by `swapgs`: holds the user's GS base while the
+    /// kernel runs, and the per-CPU block while user code runs.
+    pub const KERNEL_GS_BASE: u32 = 0xc000_0102;
+}
+
+pub mod efer {
+    /// `syscall`/`sysret` enabled.
+    pub const SCE: u64 = 1 << 0;
 }
 
 pub fn read_cr2() -> u64 {
@@ -54,6 +69,109 @@ pub fn read_cr3() -> u64 {
     let v: u64;
     unsafe { asm!("mov {}, cr3", out(reg) v, options(nomem, nostack, preserves_flags)) };
     v
+}
+
+/// Switches address space (and flushes non-global TLB entries).
+///
+/// # Safety
+/// `pml4` must be a top-level table that maps the kernel as the current one
+/// does.
+pub unsafe fn write_cr3(pml4: u64) {
+    unsafe { asm!("mov cr3, {}", in(reg) pml4, options(nostack, preserves_flags)) }
+}
+
+pub fn read_cr0() -> u64 {
+    let v: u64;
+    unsafe { asm!("mov {}, cr0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+pub unsafe fn write_cr0(v: u64) {
+    unsafe { asm!("mov cr0, {}", in(reg) v, options(nostack, preserves_flags)) }
+}
+
+pub fn read_cr4() -> u64 {
+    let v: u64;
+    unsafe { asm!("mov {}, cr4", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+pub unsafe fn write_cr4(v: u64) {
+    unsafe { asm!("mov cr4, {}", in(reg) v, options(nostack, preserves_flags)) }
+}
+
+pub mod cr0 {
+    pub const MP: u64 = 1 << 1;
+    pub const EM: u64 = 1 << 2;
+    pub const TS: u64 = 1 << 3;
+}
+
+pub mod cr4 {
+    pub const OSFXSR: u64 = 1 << 9;
+    pub const OSXMMEXCPT: u64 = 1 << 10;
+    /// Supervisor-mode execution prevention: the kernel cannot run user pages.
+    pub const SMEP: u64 = 1 << 20;
+    /// Supervisor-mode access prevention: the kernel cannot read or write
+    /// user pages (it uses the direct map instead).
+    pub const SMAP: u64 = 1 << 21;
+}
+
+/// The time-stamp counter.
+pub fn rdtsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    unsafe {
+        asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags))
+    };
+    (hi as u64) << 32 | lo as u64
+}
+
+/// CPUID leaf `leaf`, subleaf `sub`: (eax, ebx, ecx, edx).
+pub fn cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
+    let r = core::arch::x86_64::__cpuid_count(leaf, sub);
+    (r.eax, r.ebx, r.ecx, r.edx)
+}
+
+/// A hardware random number, if the CPU has RDRAND and it delivers.
+pub fn rdrand() -> Option<u64> {
+    if cpuid(1, 0).2 & (1 << 30) == 0 {
+        return None;
+    }
+    for _ in 0..10 {
+        let (v, ok): (u64, u8);
+        unsafe {
+            asm!("rdrand {}", "setc {}", out(reg) v, out(reg_byte) ok, options(nomem, nostack))
+        };
+        if ok != 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 512-byte `fxsave` area: x87, MMX and SSE state of a user thread.
+#[repr(C, align(16))]
+pub struct FxArea(pub [u8; 512]);
+
+impl FxArea {
+    /// The state after `fninit` with SSE exceptions masked, as Linux gives a
+    /// new program: FCW 0x37f, MXCSR 0x1f80, everything else zero.
+    pub fn initial() -> Self {
+        let mut a = [0u8; 512];
+        a[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
+        a[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        // MXCSR_MASK 0: the CPU's default mask applies on fxrstor.
+        FxArea(a)
+    }
+}
+
+pub fn fxsave(area: &mut FxArea) {
+    unsafe { asm!("fxsave64 [{}]", in(reg) area.0.as_mut_ptr(), options(nostack, preserves_flags)) }
+}
+
+pub fn fxrstor(area: &FxArea) {
+    unsafe {
+        asm!("fxrstor64 [{}]", in(reg) area.0.as_ptr(), options(nostack, preserves_flags, readonly))
+    }
 }
 
 pub unsafe fn invlpg(addr: u64) {

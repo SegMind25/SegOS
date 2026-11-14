@@ -164,9 +164,10 @@ pub fn cpu_count_from_acpi() -> usize {
 
 extern "sysv64" fn ap_entry(arg: u64) -> ! {
     let (index, apic_id) = ((arg >> 32) as u32, arg as u32);
-    gdt::init_ap();
+    let tss = gdt::init_ap();
     idt::init();
-    percpu::init(index, apic_id);
+    super::cpu::init_this_cpu();
+    percpu::init(index, apic_id, tss);
     apic::init_ap();
     crate::task::sched::init_cpu();
     ONLINE.fetch_add(1, Ordering::Release);

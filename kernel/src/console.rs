@@ -138,6 +138,38 @@ pub fn print(args: fmt::Arguments) {
     });
 }
 
+/// Writes raw bytes (a program's output) to serial and the screen.
+/// Invalid UTF-8 shows as U+FFFD on the screen; serial gets the bytes.
+pub fn write_bytes(data: &[u8]) {
+    crate::hal::x86::without_interrupts(|| {
+        {
+            let mut serial = serial::SERIAL.lock();
+            for &b in data {
+                if b == b'\n' {
+                    serial.write_byte(b'\r');
+                }
+                serial.write_byte(b);
+            }
+        }
+        if let Some(console) = CONSOLE.lock().as_mut() {
+            for chunk in data.utf8_chunks() {
+                let _ = console.write_str(chunk.valid());
+                if !chunk.invalid().is_empty() {
+                    let _ = console.write_str("\u{fffd}");
+                }
+            }
+        }
+    });
+}
+
+/// Text columns and rows of the console (80x25 on serial only).
+pub fn size() -> (usize, usize) {
+    CONSOLE
+        .lock()
+        .as_ref()
+        .map_or((80, 25), |c| (c.cols, c.rows))
+}
+
 /// Prints to the screen only (for what serial already has).
 pub fn print_screen(args: fmt::Arguments) {
     crate::hal::x86::without_interrupts(|| {

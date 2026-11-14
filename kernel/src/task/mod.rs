@@ -1,12 +1,14 @@
 //! Kernel threads.
 //!
-//! A [`Task`] is a kernel thread with its own stack. In Phase 2 a user
-//! process becomes a task plus an address space; the scheduler stays the same.
+//! A [`Task`] is a kernel thread with its own stack. A user thread is a
+//! task with a [`UserThread`] attached (see `proc`); the scheduler treats
+//! both the same.
 
 pub mod sched;
 pub mod wait;
 
 use crate::mm::{PAGE_SIZE, paging};
+use crate::proc::UserThread;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
@@ -37,7 +39,8 @@ pub struct Task {
     pub last_cpu: AtomicU32,
     pub(crate) entry: UnsafeCell<Option<Box<dyn FnOnce() + Send>>>,
     pub(crate) exited: WaitQueue,
-    _stack: Option<KernelStack>,
+    stack: Option<KernelStack>,
+    user: Option<Box<UserThread>>,
 }
 
 unsafe impl Send for Task {}
@@ -67,13 +70,20 @@ impl Task {
 
     /// The context a CPU booted on, which becomes its idle task.
     pub(crate) fn boot(name: &'static str) -> Self {
-        Self::build(name, None, 0, None)
+        Self::build(name, None, 0, None, None)
     }
 
     pub(crate) fn new(name: &'static str, f: Box<dyn FnOnce() + Send>) -> Self {
         let stack = KernelStack::new().expect("out of memory for a kernel stack");
         let rsp = sched::initial_stack(stack.top);
-        Self::build(name, Some(stack), rsp, Some(f))
+        Self::build(name, Some(stack), rsp, Some(f), None)
+    }
+
+    /// A user thread: on first run it drops to user mode (`proc::start_user`).
+    pub(crate) fn new_user(user: UserThread) -> Self {
+        let stack = KernelStack::new().expect("out of memory for a kernel stack");
+        let rsp = sched::initial_stack(stack.top);
+        Self::build("user", Some(stack), rsp, None, Some(Box::new(user)))
     }
 
     fn build(
@@ -81,6 +91,7 @@ impl Task {
         stack: Option<KernelStack>,
         rsp: u64,
         entry: Option<Box<dyn FnOnce() + Send>>,
+        user: Option<Box<UserThread>>,
     ) -> Self {
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -95,8 +106,19 @@ impl Task {
             last_cpu: AtomicU32::new(0),
             entry: UnsafeCell::new(entry),
             exited: WaitQueue::new(),
-            _stack: stack,
+            stack,
+            user,
         }
+    }
+
+    /// The user-mode side of the thread, if it has one.
+    pub fn user(&self) -> Option<&UserThread> {
+        self.user.as_deref()
+    }
+
+    /// Top of the kernel stack (0 for a CPU's boot/idle context).
+    pub fn kernel_stack_top(&self) -> u64 {
+        self.stack.as_ref().map_or(0, |s| s.top)
     }
 
     /// Waits until the task has exited.
@@ -144,4 +166,9 @@ impl Drop for KernelStack {
 
 pub fn spawn_named(name: &'static str, f: impl FnOnce() + Send + 'static) -> Arc<Task> {
     sched::spawn_task(Task::new(name, Box::new(f)))
+}
+
+/// Makes a user thread runnable.
+pub fn spawn_user(user: UserThread) -> Arc<Task> {
+    sched::spawn_task(Task::new_user(user))
 }

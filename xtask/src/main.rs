@@ -1,9 +1,12 @@
-//! `cargo xtask`: builds segboot and the kernel, writes a bootable GPT disk
-//! image, runs it in QEMU.
+//! `cargo xtask`: builds segboot, the kernel and the userland programs,
+//! writes a bootable GPT disk image, runs it in QEMU.
 //!
-//! Only the Rust standard library is used: the GPT and FAT32 writers are in
-//! `gpt.rs` and `fat.rs`. Running needs qemu-system-x86_64 and OVMF.
+//! Only the Rust standard library is used: the GPT, FAT32 and cpio writers
+//! are in `gpt.rs`, `fat.rs` and `cpio.rs`. The userland programs are
+//! ordinary Linux programs, built with musl-gcc exactly as a Linux user
+//! would build them. Running needs qemu-system-x86_64 and OVMF.
 
+mod cpio;
 mod fat;
 mod gpt;
 
@@ -20,7 +23,8 @@ commands:
   build     build segboot and the kernel
   image     build and write a bootable disk image (target/segos.img)
   run       build the image and boot it in QEMU (serial on this terminal)
-  test      boot the kernel test suite in QEMU, fail if a test fails
+  test      check the userland tests on this Linux machine, then boot the
+            kernel test suite in QEMU; fail if any test fails
 
 options:
   --release        optimised build
@@ -29,9 +33,11 @@ options:
 
 environment:
   OVMF      path to OVMF.fd (default /usr/share/ovmf/OVMF.fd)
+  MUSL_GCC  the musl C compiler (default musl-gcc)
 
-The image is a GPT disk with one FAT32 EFI system partition; write it to a
-USB stick with e.g. `dd if=target/segos.img of=/dev/sdX bs=4M`.
+The image is a GPT disk with one FAT32 EFI system partition holding
+segboot, the kernel and the initramfs (userland/ built with musl); write it
+to a USB stick with e.g. `dd if=target/segos.img of=/dev/sdX bs=4M`.
 ";
 
 /// isa-debug-exit maps the kernel's success code 0x10 to (0x10 << 1) | 1.
@@ -60,7 +66,9 @@ fn main() -> ExitCode {
         "build" => build_all(&opts, false).map(|_| ()),
         "image" => image(&opts, false).map(|img| println!("{}", img.display())),
         "run" => image(&opts, false).and_then(|img| run(&img, &opts)),
-        "test" => image(&opts, true).and_then(|img| test(&img)),
+        "test" => check_userland_on_host()
+            .and_then(|()| image(&opts, true))
+            .and_then(|img| test(&img)),
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
             Ok(())
@@ -188,18 +196,144 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     out
 }
 
+fn read(p: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display()))
+}
+
 fn image(opts: &Opts, ktest: bool) -> Result<PathBuf, String> {
     let (bootloader, kernel) = build_all(opts, ktest)?;
-    let read = |p: &Path| std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display()));
+    let initramfs = initramfs(&build_userland()?)?;
     let files = [
         ("EFI/BOOT/BOOTX64.EFI", read(&bootloader)?),
         ("boot/segkernel", read(&kernel)?),
+        ("boot/initramfs", initramfs),
     ];
     let name = if ktest { "segos-test.img" } else { "segos.img" };
     let path = root().join("target").join(name);
     let disk = disk_image(&files)?;
     std::fs::write(&path, disk).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// A program from `userland/`, compiled.
+struct Program {
+    /// Where it goes in the initramfs ("init", "tests/basics").
+    path: String,
+    binary: PathBuf,
+    /// For tests: the output it must print, recorded on Linux.
+    expected: Option<PathBuf>,
+}
+
+fn musl_gcc() -> String {
+    std::env::var("MUSL_GCC").unwrap_or_else(|_| "musl-gcc".into())
+}
+
+/// Compiles `userland/hello` (becomes `/init`) and every
+/// `userland/tests/*.c` as static musl executables.
+fn build_userland() -> Result<Vec<Program>, String> {
+    let src = root().join("userland");
+    let out = root().join("target/userland");
+    std::fs::create_dir_all(&out).map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+    let mut sources = vec![("init".to_string(), src.join("hello/hello.c"), None)];
+    let tests = src.join("tests");
+    let mut names: Vec<_> = std::fs::read_dir(&tests)
+        .map_err(|e| format!("cannot read {}: {e}", tests.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "c"))
+        .collect();
+    names.sort();
+    for c in names {
+        let name = c.file_stem().unwrap().to_string_lossy().into_owned();
+        let expected = c.with_extension("expected");
+        if !expected.exists() {
+            return Err(format!("{} has no {}", c.display(), expected.display()));
+        }
+        sources.push((format!("tests/{name}"), c, Some(expected)));
+    }
+    let cc = musl_gcc();
+    let mut programs = Vec::new();
+    for (path, c, expected) in sources {
+        let binary = out.join(path.replace('/', "-"));
+        let mut cmd = Command::new(&cc);
+        cmd.args(["-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+            .arg(&binary)
+            .arg(&c);
+        match cmd.status() {
+            Ok(s) if s.success() => {}
+            Ok(s) => return Err(format!("{cc} failed on {}: {s}", c.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!(
+                    "`{cc}` not found. The userland programs are built for Linux \
+                     with musl: install musl-tools (Debian/Ubuntu) or musl \
+                     (Arch, Fedora), or set MUSL_GCC"
+                ));
+            }
+            Err(e) => return Err(format!("cannot run {cc}: {e}")),
+        }
+        programs.push(Program {
+            path,
+            binary,
+            expected,
+        });
+    }
+    Ok(programs)
+}
+
+/// The initramfs: the programs, each test's expected output, and the
+/// empty directories the kernel mounts things on.
+fn initramfs(programs: &[Program]) -> Result<Vec<u8>, String> {
+    let mut entries = Vec::new();
+    for p in programs {
+        entries.push(cpio::Entry {
+            path: p.path.clone(),
+            mode: cpio::MODE_FILE | 0o755,
+            data: read(&p.binary)?,
+        });
+        if let Some(e) = &p.expected {
+            entries.push(cpio::Entry {
+                path: format!("{}.expected", p.path),
+                mode: cpio::MODE_FILE | 0o644,
+                data: read(e)?,
+            });
+        }
+    }
+    Ok(cpio::write(&entries, &["dev", "tmp"]))
+}
+
+/// Runs every userland test on this machine, if it is x86-64 Linux, and
+/// checks it prints exactly its `.expected` file: the expectations must be
+/// real Linux behaviour, not what SegOS happens to do.
+fn check_userland_on_host() -> Result<(), String> {
+    let programs = build_userland()?;
+    if !(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")) {
+        println!("xtask: not on x86-64 Linux, skipping the host run of the userland tests");
+        return Ok(());
+    }
+    let dir = root().join("target/userland/host-run");
+    for p in programs.iter().filter(|p| p.expected.is_some()) {
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let out = Command::new(&p.binary)
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", p.binary.display()))?;
+        let expected = read(p.expected.as_ref().unwrap())?;
+        if !out.status.success() || out.stdout != expected {
+            return Err(format!(
+                "{} does not behave as its .expected file says on this Linux \
+                 machine ({}). It printed:\n{}",
+                p.path,
+                out.status,
+                String::from_utf8_lossy(&out.stdout)
+            ));
+        }
+        println!("xtask: {} passes on Linux", p.path);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
 }
 
 /// A GPT disk with one EFI system partition holding `files`.

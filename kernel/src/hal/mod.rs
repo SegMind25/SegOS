@@ -6,14 +6,18 @@ pub mod cpu;
 pub mod gdt;
 pub mod idt;
 pub mod percpu;
+pub mod rtc;
 pub mod serial;
 pub mod smp;
+pub mod syscall;
+pub mod user;
 pub mod x86;
 
 /// Brings the CPU into a known state: segments, TSS, exception handlers,
-/// legacy PIC masked (the APIC takes over in Phase 1).
+/// SSE for user code, `syscall`; legacy PIC masked (the APIC takes over).
 pub fn init() {
     gdt::init_bsp();
     idt::init();
+    cpu::init_this_cpu();
     cpu::mask_legacy_pic();
 }

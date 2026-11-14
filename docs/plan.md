@@ -1,9 +1,10 @@
 # SegOS: a from-scratch operating system in Rust (plan)
 
-Status: **Phase 1 done** (boots on UEFI with its own bootloader, segboot;
-exceptions, frames, paging, heap; APIC timer, all CPUs started from the
-ACPI tables, preemptive scheduler, locks; 13 kernel tests pass in QEMU on
-4 CPUs, debug and release builds; no third-party crates). Next: Phase 2.
+Status: **Phase 2 done**. SegOS boots on UEFI with its own bootloader,
+segboot, starts every CPU, and runs unmodified static Linux programs: a
+musl "hello world" built on Linux runs as `/init`, and a conformance test
+prints exactly what it prints on Linux. 24 kernel tests pass in QEMU on 4
+CPUs, debug and release builds; no third-party crates. Next: Phase 3.
 
 ## 1. The goal, stated precisely
 
@@ -82,13 +83,14 @@ Design decisions:
 
 ## 3. Repository layout (target)
 
-Today the kernel is one `kernel` crate with `hal/`, `mm/` and `task/`
-modules; they move into the crates below as they grow.
+Today the kernel is one `kernel` crate with `hal/`, `mm/`, `task/`,
+`proc/`, `fs/` and `syscall/` modules; they move into the crates below as
+they grow.
 
 ```
 Cargo.toml              workspace
 rust-toolchain.toml
-xtask/                  cargo xtask build|run|test|image, GPT + FAT32 writer
+xtask/                  cargo xtask build|run|test|image; GPT, FAT32, cpio writers
 boot/                   segboot, the UEFI bootloader
 bootinfo/               the boot protocol shared by segboot and the kernel
 kernel/
@@ -101,7 +103,8 @@ kernel/
   drivers/              virtio-*, nvme, ahci, xhci, hid, e1000, gpu
   kernel/               the binary that ties it together
 userland/
-  init/                 segos-init, PID 1, Rust
+  hello/                the Phase 2 demo, /init today (C, built with musl-gcc)
+  init/                 segos-init, PID 1, later
   tests/                syscall conformance tests (run on Linux AND SegOS)
 docs/
 ```
@@ -155,7 +158,8 @@ top of SegOS once Phase 7 is reached, because they are Linux programs:
 - `seglinux-pe`, `segrun` — Windows program support via Wine.
 - `docs/gaming.md`, tuning knowledge — scheduler and latency targets.
 
-They stay available in git history (`git show main:crates/...`) and can be
+They stay available in git history (`git show fededbe:crates/...`, the
+SegLinux 1.0.0 tree) and can be
 restored into `userland/` when needed.
 
 ## 7. Risks
@@ -168,38 +172,52 @@ restored into `userland/` when needed.
 | Licensing | Kernel code original under MIT/Apache-2.0; no code copied from Linux (GPL-2.0); rootfs binaries keep their own licences |
 | `unsafe` bugs | Confine to `hal` and audited modules, `#![forbid(unsafe_code)]` elsewhere, Miri for pure logic, KASAN-like checks in debug builds |
 
-## 8. Next concrete steps (Phase 2)
+## 8. Phase 2, as built
 
 The demo: a static "hello world" built with musl on Linux, copied
 unchanged into SegOS's initramfs, runs as `/init` and its output appears on
-the console. What it takes:
+the console. What it took:
 
-1. **Address spaces.** A page table per process: the lower half its own,
-   the kernel half shared (the kernel's top-level entries are all created
-   at boot so every process sees the same kernel mappings). Regions (VMAs)
-   record what each part of the lower half is; a page fault in a region
-   maps a zeroed page on demand, anything else kills the process with
-   `SIGSEGV`.
-2. **Ring 3.** User code and data segments, a TSS kernel stack per thread,
-   `syscall`/`sysret` (STAR, LSTAR, FMASK), `swapgs` with the kernel's
-   per-CPU block in `KERNEL_GS_BASE`, user `FS` base saved per thread, and
-   FPU/SSE state saved per thread (`fxsave`/`xsave`).
-3. **ELF loader** for static executables (`ET_EXEC` and static-PIE
-   `ET_DYN`), and the initial stack Linux builds: `argc`, `argv`, `envp`,
-   the auxiliary vector (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`,
-   `AT_ENTRY`, `AT_RANDOM`, `AT_HWCAP`, `AT_CLKTCK`, ...).
-4. **initramfs**: segboot also loads `\boot\initramfs` (a `newc` cpio
-   archive, as Linux uses) and passes it in `BootInfo`; the kernel unpacks
-   it into a tmpfs root.
-5. **Files**: a small VFS with tmpfs and a console device, file
-   descriptors, `open`/`openat`, `read`, `write`, `readv`/`writev`, `close`,
-   `lseek`, `fstat`/`newfstatat`, `ioctl` (`TIOCGWINSZ`, `TCGETS`).
-6. **The rest of the ~40 syscalls** a static program touches: `brk`,
-   `mmap`/`munmap`/`mprotect` (anonymous), `arch_prctl`,
-   `set_tid_address`, `exit`, `exit_group`, `getpid` and friends, `uname`,
-   `clock_gettime`, `nanosleep`, `getrandom`, signal calls answered
-   harmlessly until Phase 3. Unknown syscalls return `ENOSYS` and are
-   logged, which tells us what to write next.
-7. **Tests**: in-kernel tests for each piece, and the demo itself in CI:
-   xtask builds `userland/hello` with `musl-gcc` (as a real Linux user
-   would) and checks its output on the serial port.
+- **Address spaces** (`mm/vm.rs`): a page table per process, sharing the
+  kernel half (all its top-level entries are created at boot). Regions
+  record what each part of the lower half is; pages are mapped on first
+  touch. The kernel copies to and from user memory through the direct map
+  after checking the regions, so a bad pointer is `EFAULT`, never a kernel
+  fault. PROT_NONE pages are kept present but kernel-only.
+- **Ring 3** (`hal/syscall.rs`, `hal/user.rs`): `syscall` entry with
+  `swapgs` and a per-thread kernel stack, one `iretq` exit shared with
+  interrupts; FS/GS base and `fxsave` state switched with the thread.
+- **ELF loader** (`proc/elf.rs`): `ET_EXEC` and static-PIE, the Linux
+  initial stack with the auxiliary vector.
+- **initramfs**: segboot loads `\boot\initramfs` (newc cpio, written by
+  xtask); the kernel unpacks it into tmpfs. `/dev` has null, zero, full,
+  random, urandom, tty and console.
+- **79 system call numbers** (`syscall/`): files and directories, memory,
+  identity, time, limits, signal bookkeeping (delivery is Phase 3).
+- **Tests**: 24 in-kernel tests, including hand-made ELF programs that
+  fault (SIGSEGV, SIGILL) without hurting the kernel, `/init` with its
+  output captured, and `userland/tests/basics.c` (about 90 checks) whose
+  output must match what it prints on Linux; xtask checks that on the build
+  machine's Linux first.
+
+## 9. Next concrete steps (Phase 3: a shell)
+
+The demo: BusyBox `sh` runs, and `ls | grep | wc` works.
+
+1. **Copy-on-write `fork`**: frame reference counts, read-only sharing,
+   copy on the write fault. Then `vfork`/`clone` for processes.
+2. **`execve`** replacing the address space of a running process, closing
+   `O_CLOEXEC` descriptors; `wait4`, process groups and sessions, `getpgid`,
+   `setsid`.
+3. **Signals delivered**: the signal frame on the user stack,
+   `rt_sigreturn`, default actions (stop, continue), `SIGCHLD`, signals
+   interrupting blocking calls (`EINTR`).
+4. **Pipes**, and blocking reads and writes that sleep instead of spinning;
+   `poll`/`select` on them.
+5. **A terminal**: PS/2 and USB keyboard input, a line discipline (echo,
+   editing, `^C` sending `SIGINT` to the foreground process group).
+6. **Files BusyBox needs**: symbolic links (BusyBox is one binary with a
+   link per command), `getdents64` users, `rename`, `/proc/self`,
+   `/proc/mounts`, timestamps that change.
+7. **Tests**: more programs in `userland/tests/` (fork, pipes, signals),
+   recorded on Linux; BusyBox's own test suite where it fits.

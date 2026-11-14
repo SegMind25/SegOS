@@ -122,15 +122,19 @@ pub fn delay_us(us: u64) {
     pit_wait();
 }
 
-/// Counts the APIC timer makes in 10 ms, timed with PIT channel 2.
+/// Counts the APIC timer makes in 10 ms, timed with PIT channel 2. The
+/// TSC is measured over the same window (for `time`).
 fn calibrate_10ms() -> u32 {
     pit_start((PIT_HZ / 100) as u16);
     write(REG_TIMER_DIVIDE, DIVIDE_BY_16);
     write(REG_LVT_TIMER, LVT_MASKED);
     write(REG_TIMER_INIT, u32::MAX);
+    let tsc0 = x86::rdtsc();
     pit_wait();
+    let tsc1 = x86::rdtsc();
     let elapsed = u32::MAX - read(REG_TIMER_CURRENT);
     write(REG_TIMER_INIT, 0);
+    crate::time::set_tsc_hz((tsc1 - tsc0) * 100, tsc1);
     elapsed
 }
 

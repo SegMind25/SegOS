@@ -3,13 +3,14 @@
 pub mod frame;
 pub mod heap;
 pub mod paging;
+pub mod vm;
 
 use bootinfo::{MemoryKind, MemoryRegion};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const PAGE_SIZE: u64 = 4096;
 
-/// Virtual address where all physical memory is mapped (Limine's HHDM).
+/// Virtual address where all physical memory is mapped (the direct map).
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 pub fn hhdm_offset() -> u64 {

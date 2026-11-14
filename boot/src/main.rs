@@ -1,8 +1,9 @@
 //! segboot: the SegOS UEFI bootloader.
 //!
-//! Loads `\boot\segkernel` (an ELF64 executable) from the partition segboot
-//! itself was loaded from, builds the page tables described in the
-//! `bootinfo` crate, exits boot services and jumps to the kernel.
+//! Loads `\boot\segkernel` (an ELF64 executable) and, if present,
+//! `\boot\initramfs` from the partition segboot itself was loaded from,
+//! builds the page tables described in the `bootinfo` crate, exits boot
+//! services and jumps to the kernel.
 
 #![no_std]
 #![no_main]
@@ -22,10 +23,12 @@ use paging::{PAGE, PageTables};
 
 const KERNEL_PATH_STR: &str = "\\boot\\segkernel";
 static KERNEL_PATH: [u16; KERNEL_PATH_STR.len() + 1] = ucs2(KERNEL_PATH_STR);
+const INITRAMFS_PATH_STR: &str = "\\boot\\initramfs";
+static INITRAMFS_PATH: [u16; INITRAMFS_PATH_STR.len() + 1] = ucs2(INITRAMFS_PATH_STR);
 
 const STACK_SIZE: u64 = 64 * 1024;
 const GIB: u64 = 1 << 30;
-/// Read the kernel file in pieces this large (some firmware dislikes huge reads).
+/// Read files in pieces this large (some firmware dislikes huge reads).
 const READ_CHUNK: usize = 1 << 20;
 
 /// ASCII string to a NUL-terminated UCS-2 array.
@@ -40,15 +43,28 @@ const fn ucs2<const N: usize>(s: &str) -> [u16; N] {
     out
 }
 
-/// A boot failure: what went wrong, plus the firmware's status if any.
+/// A boot failure: what went wrong (and with which file), plus the
+/// firmware's status if any.
 struct Error {
+    file: Option<&'static str>,
     msg: &'static str,
     status: Option<efi::Status>,
 }
 
 impl Error {
     fn new(msg: &'static str) -> Self {
-        Error { msg, status: None }
+        Error {
+            file: None,
+            msg,
+            status: None,
+        }
+    }
+
+    fn file(self, name: &'static str) -> Self {
+        Error {
+            file: Some(name),
+            ..self
+        }
     }
 }
 
@@ -60,6 +76,9 @@ impl From<&'static str> for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if let Some(file) = self.file {
+            write!(f, "{file}: ")?;
+        }
         f.write_str(self.msg)?;
         if let Some(s) = self.status {
             write!(f, ": {} ({s:#x})", efi::status_name(s))?;
@@ -74,6 +93,7 @@ fn check(s: efi::Status, msg: &'static str) -> Result<(), Error> {
         Ok(())
     } else {
         Err(Error {
+            file: None,
             msg,
             status: Some(s),
         })
@@ -100,11 +120,27 @@ pub unsafe extern "efiapi" fn efi_main(
     e.status.unwrap_or(efi::LOAD_ERROR)
 }
 
-/// The kernel file, read into pool memory.
-struct KernelFile {
+/// A file read from the boot partition into pool memory (`LoaderData`,
+/// which the kernel sees as `BootloaderReclaimable`).
+struct FileData {
     data: *mut u8,
     len: usize,
 }
+
+/// A file segboot reads: its UCS-2 path and its name for messages.
+struct BootFile {
+    path: &'static [u16],
+    name: &'static str,
+}
+
+const KERNEL_FILE: BootFile = BootFile {
+    path: &KERNEL_PATH,
+    name: "\\boot\\segkernel",
+};
+const INITRAMFS_FILE: BootFile = BootFile {
+    path: &INITRAMFS_PATH,
+    name: "\\boot\\initramfs",
+};
 
 fn protocol<T>(
     bs: &efi::BootServices,
@@ -118,7 +154,8 @@ fn protocol<T>(
     Ok(p.cast())
 }
 
-fn read_kernel(bs: &efi::BootServices, image: efi::Handle) -> Result<KernelFile, Error> {
+/// The root directory of the partition segboot was loaded from.
+fn open_boot_volume(bs: &efi::BootServices, image: efi::Handle) -> Result<*mut efi::File, Error> {
     let loaded: *mut efi::LoadedImage = protocol(
         bs,
         image,
@@ -134,35 +171,44 @@ fn read_kernel(bs: &efi::BootServices, image: efi::Handle) -> Result<KernelFile,
         "the boot partition has no file system the firmware can read",
     )?;
     let mut root: *mut efi::File = null_mut();
-    // SAFETY: valid protocol interfaces and out pointers throughout.
-    unsafe {
-        check(
-            ((*fs).open_volume)(fs, &mut root),
-            "cannot open the boot partition",
-        )?;
-        let mut file: *mut efi::File = null_mut();
-        let s = ((*root).open)(
+    // SAFETY: valid protocol interface and out pointer.
+    check(
+        unsafe { ((*fs).open_volume)(fs, &mut root) },
+        "cannot open the boot partition",
+    )?;
+    Ok(root)
+}
+
+/// Reads `file` from the boot volume; `Ok(None)` if it does not exist.
+fn read_file(
+    bs: &efi::BootServices,
+    root: *mut efi::File,
+    file: &BootFile,
+) -> Result<Option<FileData>, Error> {
+    let mut handle: *mut efi::File = null_mut();
+    // SAFETY: valid directory handle, NUL-terminated path, out pointer.
+    let s = unsafe {
+        ((*root).open)(
             root,
-            &mut file,
-            KERNEL_PATH.as_ptr(),
+            &mut handle,
+            file.path.as_ptr(),
             efi::FILE_MODE_READ,
             0,
-        );
-        ((*root).close)(root);
-        if s == efi::NOT_FOUND {
-            return Err(Error::new(
-                "kernel not found: \\boot\\segkernel is missing from the boot partition",
-            ));
-        }
-        check(s, "cannot open \\boot\\segkernel")?;
-        let result = read_whole(bs, file);
-        ((*file).close)(file);
-        result
+        )
+    };
+    if s == efi::NOT_FOUND {
+        return Ok(None);
     }
+    check(s, "cannot open the file").map_err(|e| e.file(file.name))?;
+    // SAFETY: `handle` is an open file.
+    let result = unsafe { read_whole(bs, handle) }.map_err(|e| e.file(file.name));
+    // SAFETY: as above; closed exactly once.
+    unsafe { ((*handle).close)(handle) };
+    result.map(Some)
 }
 
 /// Reads an open file completely into pool memory.
-unsafe fn read_whole(bs: &efi::BootServices, file: *mut efi::File) -> Result<KernelFile, Error> {
+unsafe fn read_whole(bs: &efi::BootServices, file: *mut efi::File) -> Result<FileData, Error> {
     let mut info = [0u64; 128];
     let mut size = core::mem::size_of_val(&info);
     // SAFETY: valid file and a buffer of `size` bytes.
@@ -174,20 +220,20 @@ unsafe fn read_whole(bs: &efi::BootServices, file: *mut efi::File) -> Result<Ker
                 &mut size,
                 info.as_mut_ptr().cast(),
             ),
-            "cannot get the size of \\boot\\segkernel",
+            "cannot get the file size",
         )?;
         let info = &*(info.as_ptr() as *const efi::FileInfo);
         if info.attribute & efi::FILE_DIRECTORY != 0 {
-            return Err(Error::new("\\boot\\segkernel is a directory"));
+            return Err(Error::new("is a directory"));
         }
         let len = info.file_size as usize;
         if len == 0 {
-            return Err(Error::new("\\boot\\segkernel is empty"));
+            return Err(Error::new("is empty"));
         }
         let mut data: *mut u8 = null_mut();
         check(
             (bs.allocate_pool)(efi::LOADER_DATA, len, &mut data),
-            "out of memory reading the kernel",
+            "out of memory reading the file",
         )?;
         let mut done = 0;
         while done < len {
@@ -196,16 +242,17 @@ unsafe fn read_whole(bs: &efi::BootServices, file: *mut efi::File) -> Result<Ker
             if s != efi::SUCCESS || n == 0 {
                 (bs.free_pool)(data);
                 if s == efi::SUCCESS {
-                    return Err(Error::new("\\boot\\segkernel: unexpected end of file"));
+                    return Err(Error::new("unexpected end of file"));
                 }
                 return Err(Error {
-                    msg: "error reading \\boot\\segkernel",
+                    file: None,
+                    msg: "read error",
                     status: Some(s),
                 });
             }
             done += n;
         }
-        Ok(KernelFile { data, len })
+        Ok(FileData { data, len })
     }
 }
 
@@ -227,6 +274,7 @@ fn load_kernel(
     let pages = (hi - lo).div_ceil(PAGE);
     let phys = mem::allocate_pages(bs, efi::ALLOCATE_ANY_PAGES, mem::KERNEL_TYPE, pages, 0)
         .map_err(|s| Error {
+            file: None,
             msg: "out of memory for the kernel image",
             status: Some(s),
         })?;
@@ -366,6 +414,7 @@ fn alloc_reclaimable(
     let pages = bytes.div_ceil(PAGE);
     let p = mem::allocate_pages(bs, efi::ALLOCATE_ANY_PAGES, mem::RECLAIMABLE_TYPE, pages, 0)
         .map_err(|s| Error {
+            file: None,
             msg: what,
             status: Some(s),
         })?;
@@ -395,8 +444,26 @@ fn boot(image: efi::Handle, st: &efi::SystemTable) -> Result<core::convert::Infa
         ));
     }
 
-    info!("loading \\boot\\segkernel");
-    let file = read_kernel(bs, image)?;
+    let root = open_boot_volume(bs, image)?;
+    info!("loading {}", KERNEL_FILE.name);
+    let file = read_file(bs, root, &KERNEL_FILE);
+    let initramfs = match file {
+        Ok(Some(_)) => {
+            info!("loading {}", INITRAMFS_FILE.name);
+            read_file(bs, root, &INITRAMFS_FILE)
+        }
+        _ => Ok(None),
+    };
+    // SAFETY: the root directory was opened above and is closed once.
+    unsafe { ((*root).close)(root) };
+    let file = file?.ok_or(Error::new(
+        "kernel not found: \\boot\\segkernel is missing from the boot partition",
+    ))?;
+    let initramfs = initramfs?;
+    match &initramfs {
+        Some(f) => info!("initramfs: {} KiB", f.len.div_ceil(1024)),
+        None => info!("no \\boot\\initramfs: the kernel starts without one"),
+    }
     // SAFETY: read_whole filled `len` bytes.
     let bytes = unsafe { core::slice::from_raw_parts(file.data, file.len) };
     let elf = match elf::Elf::parse(bytes) {
@@ -450,6 +517,7 @@ fn boot(image: efi::Handle, st: &efi::SystemTable) -> Result<core::convert::Infa
     };
     if s != efi::BUFFER_TOO_SMALL || desc_size < core::mem::size_of::<efi::MemoryDescriptor>() {
         return Err(Error {
+            file: None,
             msg: "cannot query the memory map size",
             status: Some(s),
         });
@@ -513,6 +581,8 @@ fn boot(image: efi::Handle, st: &efi::SystemTable) -> Result<core::convert::Infa
             memory_map_len: 0,
             framebuffer: fb,
             rsdp,
+            initramfs: initramfs.as_ref().map_or(0, |f| f.data as u64),
+            initramfs_len: initramfs.as_ref().map_or(0, |f| f.len as u64),
         })
     };
 

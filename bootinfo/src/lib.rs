@@ -26,7 +26,7 @@
 
 /// "SEGBOOT\0" little-endian.
 pub const MAGIC: u64 = u64::from_le_bytes(*b"SEGBOOT\0");
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Virtual address of the direct map of physical memory.
 pub const HHDM_OFFSET: u64 = 0xffff_8000_0000_0000;
@@ -49,9 +49,32 @@ pub struct BootInfo {
     pub framebuffer: Framebuffer,
     /// Physical address of the ACPI RSDP (version 2 preferred), 0 if none.
     pub rsdp: u64,
+    /// `\boot\initramfs` from the boot partition (a `newc` cpio archive)
+    /// in `BootloaderReclaimable` memory; physical address 0 if there was
+    /// none.
+    pub initramfs: u64,
+    pub initramfs_len: u64,
 }
 
+// SAFETY: the kernel only reads the structure and the memory it points to.
+unsafe impl Sync for BootInfo {}
+
 impl BootInfo {
+    /// The initramfs bytes, through the direct map.
+    pub fn initramfs(&self) -> &[u8] {
+        if self.initramfs == 0 {
+            return &[];
+        }
+        // SAFETY: the bootloader guarantees address and length, and the
+        // memory stays reserved.
+        unsafe {
+            core::slice::from_raw_parts(
+                (self.hhdm_offset + self.initramfs) as *const u8,
+                self.initramfs_len as usize,
+            )
+        }
+    }
+
     pub fn memory_map(&self) -> &[MemoryRegion] {
         // SAFETY: the bootloader guarantees pointer and length.
         unsafe { core::slice::from_raw_parts(self.memory_map, self.memory_map_len as usize) }

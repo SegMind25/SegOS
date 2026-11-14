@@ -89,13 +89,23 @@ pub fn init_bsp() {
     }
 }
 
-/// Application processors: tables on the heap, never freed.
-pub fn init_ap() {
+/// The bootstrap CPU's TSS.
+pub fn bsp_tss() -> *mut TaskStateSegment {
+    &raw mut BSP_TSS
+}
+
+/// Application processors: tables on the heap, never freed. Returns the
+/// CPU's TSS.
+pub fn init_ap() -> *mut TaskStateSegment {
     let stack = Box::leak(alloc::vec![0u8; IST_STACK_SIZE].into_boxed_slice());
     let mut tss = TaskStateSegment::new();
     tss.ist[DOUBLE_FAULT_IST] = stack.as_ptr() as u64 + IST_STACK_SIZE as u64;
-    let tss: &'static TaskStateSegment = Box::leak(Box::new(tss));
-    load(Box::leak(Box::new(Gdt::new(tss))));
+    let tss: &'static mut TaskStateSegment = Box::leak(Box::new(tss));
+    let ptr: *mut TaskStateSegment = tss;
+    // SAFETY: the GDT only records the TSS address; the CPU and
+    // PerCpu::set_kernel_stack access it through raw pointers.
+    load(Box::leak(Box::new(Gdt::new(unsafe { &*ptr }))));
+    ptr
 }
 
 fn load(gdt: &'static Gdt) {

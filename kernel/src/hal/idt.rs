@@ -3,7 +3,8 @@
 //! build.rs generates one tiny stub per vector (`isr_N`) that pushes a dummy
 //! error code where the CPU does not, then the vector number, and jumps to
 //! `isr_common`. That saves all registers into a [`TrapFrame`] and calls
-//! [`trap_dispatch`]. Ring-3 processes (Phase 2) reuse the same frame.
+//! [`trap_dispatch`]. Interrupts and exceptions from ring 3 use the same
+//! path (with `swapgs`); the `syscall` entry builds the same frame.
 
 use super::x86::{self, DescriptorPointer};
 
@@ -13,6 +14,12 @@ core::arch::global_asm!(
     ".section .text",
     ".global isr_common",
     "isr_common:",
+    // From ring 3 (CS in the CPU's frame has RPL 3): switch GS to the
+    // per-CPU block. [rsp] is the vector, then the error code, RIP, CS.
+    "    test qword ptr [rsp + 24], 3",
+    "    jz 1f",
+    "    swapgs",
+    "1:",
     "    push rax",
     "    push rbx",
     "    push rcx",
@@ -31,6 +38,9 @@ core::arch::global_asm!(
     "    mov rdi, rsp",
     "    cld",
     "    call trap_dispatch",
+    // Shared exit, also used by the system call entry.
+    ".global trap_return",
+    "trap_return:",
     "    pop r15",
     "    pop r14",
     "    pop r13",
@@ -46,7 +56,11 @@ core::arch::global_asm!(
     "    pop rcx",
     "    pop rbx",
     "    pop rax",
-    "    add rsp, 16", // vector and error code
+    "    add rsp, 16",                 // vector and error code
+    "    test qword ptr [rsp + 8], 3", // back to ring 3?
+    "    jz 2f",
+    "    swapgs",
+    "2:",
     "    iretq",
 );
 
@@ -192,8 +206,24 @@ pub fn init() {
     unsafe { x86::lidt(&ptr) };
 }
 
+impl TrapFrame {
+    /// Whether the trap came from user mode.
+    pub fn came_from_user(&self) -> bool {
+        self.cs & 3 == 3
+    }
+}
+
+pub fn exception_name(vector: u64) -> &'static str {
+    EXCEPTION_NAMES.get(vector as usize).copied().unwrap_or("?")
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
+    if frame.came_from_user() && frame.vector < 32 {
+        // A user program's fault: its business, not a kernel bug.
+        crate::proc::user_exception(frame);
+        return;
+    }
     match frame.vector {
         vector::BREAKPOINT => {
             crate::debug!("breakpoint at {:#x}", frame.rip);

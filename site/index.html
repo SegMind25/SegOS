@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SegOS: a from-scratch OS in Rust that speaks Linux</title>
-  <meta name="description" content="SegOS is an operating system written from scratch in Rust. Its kernel implements the Linux system call interface so it can, in time, run unmodified Linux applications, and Windows ones through Wine and Proton. Early development: it boots, it does not run programs yet.">
+  <meta name="description" content="SegOS is an operating system written from scratch in Rust. Its kernel implements the Linux system call interface so it can, in time, run unmodified Linux applications, and Windows ones through Wine and Proton. Early development: it boots on every CPU and runs its first unmodified Linux programs.">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f7f5f1" media="(prefers-color-scheme: light)">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="SegOS">
   <meta property="og:title" content="SegOS: a from-scratch OS in Rust that speaks Linux">
-  <meta property="og:description" content="A new kernel in Rust that implements the Linux syscall ABI, so unmodified Linux apps (and Windows apps via Wine/Proton) can run on it. Phases 0 and 1 done; Phase 2 next.">
+  <meta property="og:description" content="A new kernel in Rust that implements the Linux syscall ABI, so unmodified Linux apps (and Windows apps via Wine/Proton) can run on it. Phases 0 to 2 done: a musl hello world built on Linux runs unmodified.">
   <meta property="og:image" content="/assets/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -41,15 +41,16 @@
   <main id="main">
     <div class="wrap">
       <section class="hero" aria-labelledby="hero-title">
-        <p class="eyebrow"><span class="dot" aria-hidden="true"></span><span>Early development &middot; Phase 1 of 11 done</span></p>
+        <p class="eyebrow"><span class="dot" aria-hidden="true"></span><span>Early development &middot; 3 of 11 phases done</span></p>
         <h1 id="hero-title">A new operating system in Rust that <em>speaks Linux</em>.</h1>
         <p class="lede">
           SegOS is a kernel written from scratch whose native interface is the
           <strong>Linux system call ABI</strong>. The goal: run the applications
           people already use, unmodified, and Windows programs through Wine and
-          Proton. Today it boots, manages memory and runs threads on every CPU.
-          <strong>It does not run
-          programs yet.</strong>
+          Proton. Today it boots with its own bootloader, runs threads on every
+          CPU, and <strong>runs its first unmodified Linux program</strong>: a
+          static &ldquo;hello world&rdquo; compiled with musl on Linux. A shell
+          is next.
         </p>
         <div class="actions">
           <a class="btn btn-primary" href="/roadmap">See the roadmap</a>
@@ -64,14 +65,14 @@
         <div class="console-bar" aria-hidden="true"><i></i><i></i><i></i><span>qemu-system-x86_64 &middot; segos.img</span></div>
         <div class="shot" tabindex="0" role="region" aria-label="Kernel console screenshot">
         <picture>
-          <source srcset="/assets/console.webp" type="image/webp">
-          <img src="/assets/console.png" width="1279" height="151"
-               alt="SegOS kernel console in QEMU. Lines: SegOS 0.1.0; console: 1280x800 framebuffer; apic: id 0, timer 1006 MHz bus, 100 Hz tick; smp: 4 CPUs online; ready: 4 CPUs, 456 MiB free; uptime 1010 ms, timer ticks per CPU: 101, 100, 100, 100; Phase 1: scheduler running; nothing more to run yet.">
+          <img src="/assets/console.png" width="1280" height="176"
+               alt="SegOS kernel console in QEMU. Lines: SegOS 0.1.0; console: 1280x800 framebuffer; apic: id 0, timer 999 MHz bus, 100 Hz tick; smp: 4 CPUs online; ready: 4 CPUs, 499 MiB free; initramfs: 3 files (91 KiB), 3 directories; started /init (pid 1); Hello, world!; /init exited with status 0; nothing left to run (a shell arrives in Phase 3).">
         </picture>
         </div>
         <figcaption id="console-cap">
-          The SegOS kernel today, booted in QEMU on 4 CPUs: every CPU started,
-          its timer ticking 100 times a second, and an honest last line.
+          SegOS today, booted in QEMU on 4 CPUs: it unpacks the initramfs and
+          runs <code>/init</code>, a hello world compiled for Linux with musl,
+          unmodified. &ldquo;Hello, world!&rdquo; is the program&rsquo;s own output.
           <a href="/assets/console-full.png">Full 1280&times;800 screenshot</a>.
         </figcaption>
       </figure>
@@ -151,7 +152,7 @@
         <div class="section-head">
           <p class="kicker">Status</p>
           <h2 id="status-title">Where it is right now</h2>
-          <p>Each phase ends with a demo that has to work in QEMU. Phases 0 and 1 have passed; Phase 2, the first user program, is next.</p>
+          <p>Each phase ends with a demo that has to work in QEMU. Phases 0, 1 and 2 have passed; Phase 3, a shell, is next.</p>
         </div>
         <div class="grid">
           <div class="panel">
@@ -177,7 +178,28 @@
               <li>Kernel stacks with guard pages</li>
               <li>13 in-kernel tests passing in QEMU on 4 CPUs</li>
             </ul>
-            <p class="notice"><span>Next, Phase 2: the first user program, a static musl &ldquo;hello world&rdquo; built on Linux, running unmodified.</span></p>
+          </div>
+          <div class="panel">
+            <h3>Phase 2 &middot; First user program <span class="badge done">Done</span></h3>
+            <ul class="checklist done">
+              <li>Ring 3, <code>syscall</code> entry, FPU/SSE state per thread</li>
+              <li>Address spaces with demand paging, <code>mmap</code>, <code>brk</code>, <code>mprotect</code></li>
+              <li>ELF loader and the Linux initial stack (argv, envp, auxv)</li>
+              <li>initramfs (newc cpio) unpacked into tmpfs; <code>/dev</code> devices</li>
+              <li>79 Linux system call numbers answered</li>
+              <li>A musl hello world built on Linux runs unmodified</li>
+              <li>A conformance test prints exactly what it prints on Linux</li>
+            </ul>
+          </div>
+          <div class="panel">
+            <h3>Phase 3 &middot; A shell <span class="badge wip">Next</span></h3>
+            <ul class="checklist">
+              <li><code>fork</code> with copy-on-write, <code>execve</code>, <code>wait4</code></li>
+              <li>Pipes, signal delivery</li>
+              <li>A terminal: keyboard input and line editing</li>
+              <li>Symbolic links, <code>/proc</code> basics</li>
+            </ul>
+            <p class="notice"><span>Done when BusyBox <code>sh</code> runs and <code>ls | grep | wc</code> works.</span></p>
           </div>
         </div>
         <p style="margin-top:1.5rem"><a href="/roadmap">All 11 phases, from bring-up to Steam &rarr;</a></p>
@@ -191,18 +213,21 @@
           <h2 id="build-title">Build it yourself</h2>
           <p>
             You need Rust (the version is pinned in <code>rust-toolchain.toml</code>),
-            QEMU and OVMF. Nothing is downloaded: the bootloader, the kernel
-            and the tool that writes the disk image are all in the repository.
+            QEMU, OVMF and musl-gcc. Nothing is downloaded: the bootloader, the
+            kernel and the tool that writes the disk image are all in the
+            repository, in Rust. musl-gcc builds the test programs in
+            <code>userland/</code>: ordinary C programs for Linux, built the way
+            any Linux user would build them.
           </p>
           <p>
-            What you will see is the console above: the kernel boots, reports
-            its memory and stops. That is the honest state of things.
+            What you will see is the console above: SegOS boots, runs the
+            hello world, and stops there. That is the honest state of things.
           </p>
         </div>
         <div class="cmds">
           <figure class="cmd">
             <figcaption>Dependencies on Debian or Ubuntu</figcaption>
-            <pre><code><span class="p" aria-hidden="true">$ </span>sudo apt install qemu-system-x86 ovmf git</code></pre>
+            <pre><code><span class="p" aria-hidden="true">$ </span>sudo apt install qemu-system-x86 ovmf musl-tools git</code></pre>
           </figure>
           <figure class="cmd">
             <figcaption>Get the source</figcaption>

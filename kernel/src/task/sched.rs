@@ -168,6 +168,8 @@ pub fn schedule() {
     next.last_cpu.store(cpu.index, Ordering::Relaxed);
     let next_rsp = unsafe { *next.rsp.get() };
 
+    // Address space, user kernel stack, FS/GS bases, FPU registers.
+    crate::proc::switch_hook(cur, &next);
     let prev = slot.replace(next).unwrap();
     let save = prev.rsp.get();
     // No owned Arc may live across the switch: a dead task never comes back
@@ -195,11 +197,16 @@ extern "C" fn task_start(prev: *const Task) -> ! {
         let me = current();
         unsafe { (*me.entry.get()).take() }
     };
-    x86::enable_interrupts();
     if let Some(f) = entry {
+        x86::enable_interrupts();
         f();
+        exit()
     }
-    exit()
+    // A user thread: no closure, straight to user mode. The task stays
+    // alive (referenced by this CPU's `current`) while it runs, so the
+    // borrow below outlives this frame.
+    let me = unsafe { &*Arc::as_ptr(&current()) };
+    crate::proc::start_user(me.user().expect("task with nothing to run"))
 }
 
 /// Ends the current task.

@@ -9,6 +9,48 @@ pub fn halt_forever() -> ! {
     }
 }
 
+/// Per-CPU feature setup, on every CPU before it runs user code:
+/// x87/SSE usable from ring 3 (the kernel itself is built without SSE, so
+/// only user threads' FPU state needs saving), SMEP and SMAP where the CPU
+/// has them (the kernel reaches user memory only through the direct map,
+/// so any direct access is a bug and faults), and `syscall`.
+pub fn init_this_cpu() {
+    let ebx7 = if x86::cpuid(0, 0).0 >= 7 {
+        x86::cpuid(7, 0).1
+    } else {
+        0
+    };
+    let mut cr4 = x86::read_cr4() | x86::cr4::OSFXSR | x86::cr4::OSXMMEXCPT;
+    if ebx7 & (1 << 7) != 0 {
+        cr4 |= x86::cr4::SMEP;
+    }
+    if ebx7 & (1 << 20) != 0 {
+        cr4 |= x86::cr4::SMAP;
+    }
+    unsafe {
+        let cr0 = x86::read_cr0();
+        x86::write_cr0((cr0 | x86::cr0::MP) & !(x86::cr0::EM | x86::cr0::TS));
+        x86::write_cr4(cr4);
+        core::arch::asm!("fninit", options(nomem, nostack));
+    }
+    static LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        let on = |bit| {
+            if cr4 & bit != 0 {
+                "on"
+            } else {
+                "not available"
+            }
+        };
+        crate::info!(
+            "cpu: SMEP {}, SMAP {}",
+            on(x86::cr4::SMEP),
+            on(x86::cr4::SMAP)
+        );
+    }
+    super::syscall::init_this_cpu();
+}
+
 /// Masks every line of the two 8259 PICs so they never fire.
 pub fn mask_legacy_pic() {
     unsafe {

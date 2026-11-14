@@ -1,6 +1,7 @@
 //! segkernel: the SegOS kernel.
 //!
-//! Boot order: serial → logger → CPU tables → memory → screen console.
+//! Boot order: serial → logger → CPU tables → memory → screen console →
+//! timer and the other CPUs → the initramfs → `/init`, the first program.
 //! See docs/plan.md for where this is going.
 
 #![no_std]
@@ -10,9 +11,11 @@
 
 extern crate alloc;
 
+mod abi;
 #[macro_use]
 mod console;
 mod font;
+mod fs;
 mod hal;
 #[macro_use]
 mod klog;
@@ -20,7 +23,10 @@ mod klog;
 mod ktest;
 mod ktest_hooks;
 mod mm;
+mod proc;
+mod random;
 mod sync;
+mod syscall;
 mod task;
 mod time;
 
@@ -65,35 +71,74 @@ extern "sysv64" fn kmain(boot: &'static BootInfo) -> ! {
 
     // This CPU's timer and data, the other CPUs, the scheduler.
     hal::apic::init_bsp();
-    hal::percpu::init(0, hal::apic::id());
+    hal::percpu::init(0, hal::apic::id(), hal::gdt::bsp_tss());
     task::sched::init_cpu();
     hal::smp::start_aps(boot.rsdp);
+    // The AP trampoline was the last user of segboot's identity map.
+    mm::paging::remove_identity_map();
 
     #[cfg(feature = "ktest")]
-    task::spawn_named("ktest", || ktest::run());
+    task::spawn_named("ktest", move || ktest::run(boot));
     #[cfg(not(feature = "ktest"))]
-    task::spawn_named("init", kernel_init);
+    task::spawn_named("init", move || kernel_init(boot));
 
     // The boot context becomes this CPU's idle task.
     task::sched::idle_loop()
 }
 
-/// First kernel thread. Starts PID 1 from Phase 2 on; for now it reports.
+/// Unpacks the initramfs into the root file system.
+fn load_initramfs(boot: &BootInfo) {
+    let archive = boot.initramfs();
+    if archive.is_empty() {
+        warn!("no initramfs: there is no program to run");
+        return;
+    }
+    match fs::cpio::unpack(archive) {
+        Ok(s) => info!(
+            "initramfs: {} files ({} KiB), {} directories",
+            s.files,
+            s.bytes / 1024,
+            s.dirs
+        ),
+        Err(e) => error!("initramfs: not a valid newc cpio archive ({e:?})"),
+    }
+}
+
+/// First kernel thread: fills the root file system and starts `/init`,
+/// the first program, as process 1.
 #[cfg(not(feature = "ktest"))]
-fn kernel_init() {
+fn kernel_init(boot: &'static BootInfo) {
     let (used, size) = mm::heap::stats();
     info!(
         "ready: {} CPUs, {} MiB free, heap {used}/{size} bytes",
         hal::percpu::count(),
         mm::frame::free_count() * mm::PAGE_SIZE / (1024 * 1024)
     );
-    time::sleep_ms(1000);
-    info!(
-        "uptime {} ms, timer ticks per CPU: {:?}",
-        time::uptime_ms(),
-        hal::percpu::ticks()
-    );
-    info!("Phase 1: scheduler running; nothing more to run yet.");
+    load_initramfs(boot);
+    let started = proc::console_stdio().and_then(|stdio| {
+        proc::spawn(
+            "/init",
+            &["/init"],
+            &["HOME=/", "TERM=linux", "PATH=/bin:/sbin:/usr/bin:/usr/sbin"],
+            stdio,
+        )
+    });
+    let init = match started {
+        Ok(t) => t,
+        Err(e) => {
+            error!("cannot start /init: {e:?}");
+            return;
+        }
+    };
+    info!("started /init (pid 1)");
+    init.join();
+    let status = init.user().unwrap().process.exit_status().unwrap_or(0);
+    if status & 0x7f == 0 {
+        info!("/init exited with status {}", (status >> 8) & 0xff);
+    } else {
+        warn!("/init was killed by signal {}", status & 0x7f);
+    }
+    info!("nothing left to run (a shell arrives in Phase 3)");
 }
 
 #[panic_handler]

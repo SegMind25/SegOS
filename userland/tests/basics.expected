@@ -1,0 +1,97 @@
+# arguments and the auxiliary vector
+ok   argc >= 1
+ok   argv[argc] == NULL
+ok   envp != NULL
+ok   getauxval(AT_PAGESZ) == 4096
+ok   getauxval(AT_RANDOM) != 0
+ok   getauxval(AT_PHDR) != 0
+ok   getauxval(AT_ENTRY) != 0
+# identity
+ok   getpid() > 0
+ok   syscall(SYS_gettid) == getpid()
+ok   getppid() >= 0
+ok   getuid() == geteuid()
+ok   getgid() == getegid()
+ok   uname(&u) == 0
+ok   strcmp(u.sysname, "Linux") == 0
+ok   strcmp(u.machine, "x86_64") == 0
+# writev
+ok   writev of three pieces
+ok   writev(1, iov, 3) == 28
+ok   write(1, (void *)1, 1) == -1 && errno == EFAULT
+ok   write(1234, "x", 1) == -1 && errno == EBADF
+# brk, mmap, munmap, mprotect, malloc
+ok   top != NULL
+ok   (char *)syscall(SYS_brk, top + 4 * 4096) == top + 4 * 4096
+ok   top[4 * 4096 - 1] == 0x5e
+ok   (char *)syscall(SYS_brk, top) == top
+ok   (char *)syscall(SYS_brk, 0) == top
+ok   (char *)syscall(SYS_brk, 1) == top
+ok   p != MAP_FAILED
+ok   p[0] == 0 && p[len - 1] == 0
+ok   good
+ok   munmap(p, len) == 0
+ok   munmap(p, len) == 0
+ok   r != MAP_FAILED
+ok   mprotect(r, 4096, PROT_READ | PROT_WRITE) == 0
+ok   r[100] == 'x'
+ok   munmap(r, 4096) == 0
+ok   f == want
+ok   munmap(f, 8192) == 0
+ok   mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == EINVAL
+ok   big != NULL
+ok   good
+# files
+ok   fd >= 3
+ok   write(fd, "hello, file\n", 12) == 12
+ok   lseek(fd, 0, SEEK_CUR) == 12
+ok   lseek(fd, 0, SEEK_SET) == 0
+ok   read(fd, buf, sizeof buf) == 12
+ok   memcmp(buf, "hello, file\n", 12) == 0
+ok   read(fd, buf, sizeof buf) == 0
+ok   pread(fd, buf, 4, 7) == 4 && memcmp(buf, "file", 4) == 0
+ok   lseek(fd, 0, SEEK_END) == 12
+ok   lseek(fd, -1, SEEK_SET) == -1 && errno == EINVAL
+ok   fstat(fd, &st) == 0
+ok   S_ISREG(st.st_mode) && st.st_size == 12
+ok   (st.st_mode & 0777) == 0644 || (st.st_mode & 0777) == 0600 || (st.st_mode & 0777) == 0640
+ok   pwrite(fd, "F", 1, 7) == 1
+ok   pread(fd, buf, 12, 0) == 12 && memcmp(buf, "hello, File\n", 12) == 0
+ok   ftruncate(fd, 5) == 0
+ok   fstat(fd, &st) == 0 && st.st_size == 5
+ok   fd2 > fd
+ok   dup2(fd, 20) == 20
+ok   lseek(20, 0, SEEK_SET) == 0 && lseek(fd2, 0, SEEK_CUR) == 0
+ok   close(20) == 0 && close(fd2) == 0
+ok   close(fd) == 0
+ok   close(fd) == -1 && errno == EBADF
+ok   stat(name, &st) == 0 && st.st_size == 5
+ok   access(name, F_OK) == 0
+ok   open(name, O_CREAT | O_EXCL | O_WRONLY, 0644) == -1 && errno == EEXIST
+ok   unlink(name) == 0
+ok   open(name, O_RDONLY) == -1 && errno == ENOENT
+ok   stat("no/such/dir/file", &st) == -1 && errno == ENOENT
+ok   mkdir("segos-basics.dir", 0755) == 0
+ok   mkdir("segos-basics.dir", 0755) == -1 && errno == EEXIST
+ok   stat("segos-basics.dir", &st) == 0 && S_ISDIR(st.st_mode)
+ok   fd >= 0 && close(fd) == 0
+ok   rmdir("segos-basics.dir") == -1 && errno == ENOTEMPTY
+ok   unlink("segos-basics.dir/./inner") == 0
+ok   rmdir("segos-basics.dir") == 0
+ok   open("segos-basics.dir/inner", O_RDONLY) == -1 && errno == ENOENT
+ok   getcwd(cwd, sizeof cwd) != NULL && cwd[0] == '/'
+ok   fd >= 0
+ok   write(fd, "gone", 4) == 4 && read(fd, buf, 4) == 0
+ok   close(fd) == 0
+# time and randomness
+ok   nanosleep(&d, NULL) == 0
+ok   b - a >= 20 * 1000 * 1000
+ok   b - a < 2000LL * 1000 * 1000
+ok   ns(CLOCK_REALTIME) / 1000000000 > 1700000000
+ok   time(NULL) > 1700000000
+ok   getrandom(r1, 16, 0) == 16 && getrandom(r2, 16, 0) == 16
+ok   memcmp(r1, r2, 16) != 0
+ok   6.283
+# unknown system calls fail cleanly
+ok   syscall(999) == -1 && errno == ENOSYS
+0 failures

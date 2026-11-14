@@ -35,7 +35,7 @@ impl Serial {
         }
     }
 
-    fn write_byte(&mut self, byte: u8) {
+    pub fn write_byte(&mut self, byte: u8) {
         {
             while self.input(5) & 0x20 == 0 {
                 core::hint::spin_loop();
