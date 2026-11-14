@@ -214,9 +214,8 @@ impl Port {
         // One PRDT entry per page.
         let prdt = unsafe { fis.add(0x80) }.cast::<u32>();
         let mut left = bytes;
-        for p in 0..pages {
+        for (p, &addr) in self.data.iter().enumerate().take(pages) {
             let chunk = left.min(PAGE);
-            let addr = self.data[p];
             unsafe {
                 write_volatile(prdt.add(4 * p), addr as u32);
                 write_volatile(prdt.add(4 * p + 1), (addr >> 32) as u32);

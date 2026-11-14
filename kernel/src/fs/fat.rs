@@ -380,7 +380,7 @@ impl FatFs {
         let mut lfn: Vec<u16> = Vec::new();
         let mut lfn_start = None;
         let mut lfn_sum = 0u8;
-        for (i, e) in bytes.chunks_exact(32).enumerate() {
+        for (i, e) in bytes.as_chunks::<32>().0.iter().enumerate() {
             let pos = i as u64 * 32;
             match e[0] {
                 0 => break,
@@ -459,7 +459,7 @@ impl FatFs {
     fn free_slots(&self, inner: &mut Inner, loc: DirLoc, n: u64) -> KResult<u64> {
         let bytes = self.dir_read(inner, loc)?;
         let (mut run, mut run_start) = (0u64, 0u64);
-        for (i, e) in bytes.chunks_exact(32).enumerate() {
+        for (i, e) in bytes.as_chunks::<32>().0.iter().enumerate() {
             let pos = i as u64 * 32;
             if e[0] == 0 {
                 // Everything from here on is free.
@@ -507,7 +507,9 @@ impl FatFs {
 
     fn first_free_tail(&self, bytes: &[u8]) -> Option<u64> {
         bytes
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .position(|e| e[0] == 0)
             .map(|i| i as u64 * 32)
     }
