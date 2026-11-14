@@ -36,7 +36,17 @@ const PACKAGES: &[&str] = &[
     "libc6-dev",
     "libgcc-13-dev",
     "linux-libc-dev",
+    // Phase 6: networking.
+    "curl",
+    "libcurl4t64",
+    "wget",
+    "netcat-openbsd",
+    "ca-certificates",
+    "netbase",
 ];
+
+/// Files no package lists (generated at install time) but programs need.
+const EXTRA: &[&str] = &["/etc/ssl/certs/ca-certificates.crt"];
 
 /// Paths not worth the space.
 fn skipped(p: &str) -> bool {
@@ -113,7 +123,8 @@ fn copy(host: &str, tree: &Path) -> Result<(), String> {
     let Ok(meta) = std::fs::symlink_metadata(src) else {
         return Ok(());
     };
-    if meta.is_dir() {
+    // Directories, and links to directories (merged-/usr's /bin, /lib).
+    if meta.is_dir() || src.is_dir() {
         return Ok(());
     }
     let to = tree.join(dest(host).trim_start_matches('/'));
@@ -159,6 +170,7 @@ pub fn add(tree: &Path) -> Result<usize, String> {
             }
         }
     }
+    files.extend(EXTRA.iter().map(|s| s.to_string()));
     if files.is_empty() {
         eprintln!("xtask: no glibc packages found (not Debian/Ubuntu?): root disk without them");
         return Ok(0);
