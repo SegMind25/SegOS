@@ -265,6 +265,41 @@ fn add_tree(
 
 /// The initramfs (a newc cpio archive).
 pub fn initramfs(u: &Userland) -> Result<Vec<u8>, String> {
+    let (entries, dirs) = contents(u)?;
+    let dirs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
+    Ok(cpio::write(&entries, &dirs))
+}
+
+/// Writes the same root file system as a directory tree at `dest` (for
+/// mke2fs to turn into an ext4 disk).
+pub fn tree(u: &Userland, dest: &Path) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(dest);
+    let (entries, dirs) = contents(u)?;
+    let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    for d in &dirs {
+        let p = dest.join(d);
+        std::fs::create_dir_all(&p).map_err(|e| err(&p, e))?;
+    }
+    for e in &entries {
+        let p = dest.join(&e.path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| err(parent, e))?;
+        }
+        if e.mode & 0o170000 == cpio::MODE_SYMLINK & 0o170000 {
+            let target = String::from_utf8_lossy(&e.data).into_owned();
+            std::os::unix::fs::symlink(&target, &p).map_err(|e| err(&p, e))?;
+        } else {
+            std::fs::write(&p, &e.data).map_err(|e| err(&p, e))?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(e.mode & 0o7777))
+                .map_err(|e| err(&p, e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Files of the root file system and its extra empty directories.
+fn contents(u: &Userland) -> Result<(Vec<cpio::Entry>, Vec<String>), String> {
     let mut entries = Vec::new();
     let mut dirs: Vec<String> = [
         "dev", "proc", "tmp", "root", "home", "mnt", "var", "sbin", "usr/sbin",
@@ -303,8 +338,7 @@ pub fn initramfs(u: &Userland) -> Result<Vec<u8>, String> {
             });
         }
     }
-    let dirs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
-    Ok(cpio::write(&entries, &dirs))
+    Ok((entries, dirs))
 }
 
 /// Runs every test on this machine, if it is x86-64 Linux, and checks it

@@ -20,7 +20,7 @@ errnos! {
     EACCES = 13, EFAULT = 14, EBUSY = 16, EEXIST = 17, EXDEV = 18,
     ENODEV = 19, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, ENFILE = 23,
     EMFILE = 24, ENOTTY = 25, EFBIG = 27, ENOSPC = 28, ESPIPE = 29,
-    EROFS = 30, EMLINK = 31, EPIPE = 32, ERANGE = 34, ENAMETOOLONG = 36,
+    ENOTBLK = 15, EROFS = 30, EMLINK = 31, EPIPE = 32, ERANGE = 34, ENAMETOOLONG = 36,
     ENOSYS = 38, ENOTEMPTY = 39, ELOOP = 40, ENOTSOCK = 88, EOPNOTSUPP = 95,
     ETIMEDOUT = 110,
     // Kernel-internal: never seen by programs. A blocking call interrupted
@@ -59,6 +59,7 @@ pub mod mode {
     pub const S_IFDIR: u32 = 0o040000;
     pub const S_IFIFO: u32 = 0o010000;
     pub const S_IFCHR: u32 = 0o020000;
+    pub const S_IFBLK: u32 = 0o060000;
     pub const S_IFREG: u32 = 0o100000;
     pub const S_IFLNK: u32 = 0o120000;
 }

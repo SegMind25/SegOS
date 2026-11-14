@@ -209,7 +209,9 @@ fn read(p: &Path) -> Result<Vec<u8>, String> {
 
 fn image(opts: &Opts, ktest: bool) -> Result<PathBuf, String> {
     let (bootloader, kernel) = build_all(opts, ktest)?;
-    let initramfs = userland::initramfs(&userland::build()?)?;
+    let u = userland::build()?;
+    root_disk(&u)?;
+    let initramfs = userland::initramfs(&u)?;
     let files = [
         ("EFI/BOOT/BOOTX64.EFI", read(&bootloader)?),
         ("boot/segkernel", read(&kernel)?),
@@ -243,6 +245,51 @@ fn disk_image(files: &[(&str, Vec<u8>)]) -> Result<Vec<u8>, String> {
     Ok(disk)
 }
 
+/// Linux file system data partition type 0FC63DAF-8483-4772-8E79-3D69D8477DE4.
+const LINUX_FS_TYPE: [u8; 16] = [
+    0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4,
+];
+const ROOT_FIRST_LBA: u64 = 2048;
+const ROOT_SECTORS: u64 = 128 * 1024 * 1024 / gpt::SECTOR;
+
+/// `target/rootfs.img`: a GPT disk with one ext4 partition holding the full
+/// root file system (the same tree as the initramfs). The ext4 is made by
+/// e2fsprogs' mke2fs, so SegOS's reader is checked against the real format.
+fn root_disk(u: &userland::Userland) -> Result<PathBuf, String> {
+    let target = root().join("target");
+    let tree = target.join("rootfs");
+    userland::tree(u, &tree)?;
+    let part = target.join("rootfs.ext4");
+    let _ = std::fs::remove_file(&part);
+    status(
+        Command::new("mke2fs")
+            .args(["-q", "-F", "-t", "ext4", "-L", "segos-root", "-d"])
+            .arg(&tree)
+            .arg(&part)
+            .arg(format!("{}k", ROOT_SECTORS * gpt::SECTOR / 1024)),
+    )?;
+    let fs = read(&part)?;
+    let sector = gpt::SECTOR as usize;
+    let mut disk = vec![0u8; (ROOT_FIRST_LBA + ROOT_SECTORS + 2048) as usize * sector];
+    let start = ROOT_FIRST_LBA as usize * sector;
+    disk[start..start + fs.len()].copy_from_slice(&fs);
+    gpt::write(
+        &mut disk,
+        gpt::random_guid(random_bytes()),
+        &[gpt::Partition {
+            type_guid: LINUX_FS_TYPE,
+            guid: gpt::random_guid(random_bytes()),
+            first_lba: ROOT_FIRST_LBA,
+            last_lba: ROOT_FIRST_LBA + ROOT_SECTORS - 1,
+            name: "SegOS root",
+        }],
+    )?;
+    let path = target.join("rootfs.img");
+    std::fs::write(&path, disk).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    let _ = std::fs::remove_file(&part);
+    Ok(path)
+}
+
 fn qemu(img: &Path) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     let ovmf = std::env::var("OVMF").unwrap_or_else(|_| "/usr/share/ovmf/OVMF.fd".into());
@@ -251,6 +298,15 @@ fn qemu(img: &Path) -> Command {
         .args(["-bios", &ovmf])
         .arg("-drive")
         .arg(format!("format=raw,file={}", img.display()));
+    let rootfs = root().join("target/rootfs.img");
+    if rootfs.exists() {
+        cmd.arg("-drive")
+            .arg(format!(
+                "format=raw,if=none,id=root,file={}",
+                rootfs.display()
+            ))
+            .args(["-device", "virtio-blk-pci,drive=root"]);
+    }
     // Usable KVM only: CI runners often have /dev/kvm without permission.
     if std::fs::OpenOptions::new()
         .read(true)

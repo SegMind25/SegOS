@@ -654,27 +654,44 @@ pub fn statfs(ctx: &Ctx, target: u64, buf: u64, by_fd: bool) -> KResult<u64> {
         let p = path_arg(ctx, target)?;
         resolve(ctx, AT_FDCWD, &p, true)?
     };
-    let (magic, total, free) = match inode.dev() {
-        fs::DEV_PROC => (PROC_SUPER_MAGIC, 0, 0),
-        fs::DEV_PIPEFS => (PIPEFS_MAGIC, 0, 0),
+    let disk = fs::mount::mount_of_dev(inode.dev()).and_then(|m| m.info.clone().map(|i| (m, i)));
+    let (magic, bsize, total, free, files, ffree, flags) = match (inode.dev(), disk) {
+        (_, Some((m, info))) => {
+            let (bsize, blocks, bfree, files, ffree) = info.stats();
+            (
+                info.magic(),
+                bsize,
+                blocks,
+                bfree,
+                files,
+                ffree,
+                if m.read_only { 1 } else { 0 },
+            )
+        }
+        (fs::DEV_PROC, None) => (PROC_SUPER_MAGIC, 4096, 0, 0, 0, 0, 0),
+        (fs::DEV_PIPEFS, None) => (PIPEFS_MAGIC, 4096, 0, 0, 0, 0, 0),
         _ => (
             TMPFS_MAGIC,
+            4096,
             crate::mm::frame::total_count(),
             crate::mm::frame::free_count(),
+            1 << 20,
+            1 << 20,
+            0,
         ),
     };
     let words: [u64; 12] = [
-        magic,   // f_type
-        4096,    // f_bsize
-        total,   // f_blocks
-        free,    // f_bfree
-        free,    // f_bavail
-        1 << 20, // f_files
-        1 << 20, // f_ffree
-        0,       // f_fsid
-        255,     // f_namelen
-        4096,    // f_frsize
-        0,       // f_flags
+        magic,       // f_type
+        bsize,       // f_bsize
+        total,       // f_blocks
+        free,        // f_bfree
+        free,        // f_bavail
+        files,       // f_files
+        ffree,       // f_ffree
+        inode.dev(), // f_fsid
+        255,         // f_namelen
+        bsize,       // f_frsize
+        flags,       // f_flags (ST_RDONLY)
         0,
     ];
     let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -961,4 +978,84 @@ pub fn sendfile(ctx: &Ctx, out_fd: i32, in_fd: i32, offset: u64, count: u64) -> 
         }
     }
     Ok(done as u64)
+}
+
+/// Mounts a file system of type `fstype` on `point`: (root, info).
+fn make_fs(
+    ctx: &Ctx,
+    fstype: &str,
+    source: &str,
+    point: &Arc<dyn Inode>,
+) -> KResult<fs::mount::Mounted> {
+    match fstype {
+        "tmpfs" | "ramfs" => Ok((fs::tmpfs::Dir::new_root(0o1777), None)),
+        "proc" => Ok((fs::procfs::root(point), None)),
+        // The kernel's own /dev, wherever it is asked for.
+        "devtmpfs" => Ok((fs::dev_dir(), None)),
+        "ext4" | "ext3" | "ext2" => {
+            let node = resolve(ctx, AT_FDCWD, source, true)?;
+            let dev = crate::block::device_of(&node).ok_or(Errno::ENOTBLK)?;
+            fs::disk::mount_ext4(dev)
+        }
+        _ => Err(Errno::ENODEV),
+    }
+}
+
+/// `mount(source, target, fstype, flags, data)`: new mounts of tmpfs,
+/// proc, devtmpfs and ext2/3/4 (read-only for now), bind mounts,
+/// read-only remounts. Propagation changes are accepted and mean nothing
+/// (there is one mount namespace).
+pub fn mount(ctx: &Ctx, source: u64, target: u64, fstype: u64, flags: u64) -> KResult<u64> {
+    const MS_RDONLY: u64 = 1;
+    const MS_REMOUNT: u64 = 32;
+    const MS_BIND: u64 = 4096;
+    const MS_MOVE: u64 = 8192;
+    const PROPAGATION: u64 = 1 << 17 | 1 << 18 | 1 << 19 | 1 << 20;
+    let target = path_arg(ctx, target)?;
+    let point = resolve(ctx, AT_FDCWD, &target, true)?;
+    if point.file_type() != FileType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+    if flags & MS_REMOUNT != 0 {
+        fs::mount::set_read_only(&point, flags & MS_RDONLY != 0)?;
+        return Ok(0);
+    }
+    if flags & PROPAGATION != 0 && flags & (MS_BIND | MS_MOVE) == 0 {
+        return Ok(0);
+    }
+    if flags & MS_MOVE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let source = if source == 0 {
+        String::from("none")
+    } else {
+        ctx.mm().read_cstr(source, fs::PATH_MAX)?
+    };
+    let path = fs::path_of(&point);
+    if flags & MS_BIND != 0 {
+        let src = resolve(ctx, AT_FDCWD, &source, true)?;
+        fs::mount::add(
+            point,
+            src,
+            &source,
+            "none",
+            &path,
+            flags & MS_RDONLY != 0,
+            None,
+        )?;
+        return Ok(0);
+    }
+    let fstype = ctx.mm().read_cstr(fstype, 64)?;
+    let (root, info) = make_fs(ctx, &fstype, &source, &point)?;
+    let ro = flags & MS_RDONLY != 0 || info.is_some(); // disk file systems: read-only for now
+    fs::mount::add(point, root, &source, &fstype, &path, ro, info)?;
+    Ok(0)
+}
+
+/// `umount2(target, flags)`.
+pub fn umount2(ctx: &Ctx, target: u64, _flags: u64) -> KResult<u64> {
+    let target = path_arg(ctx, target)?;
+    let root = resolve(ctx, AT_FDCWD, &target, true)?;
+    fs::mount::remove(&root)?;
+    Ok(0)
 }

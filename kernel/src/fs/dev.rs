@@ -25,7 +25,7 @@ pub struct Device {
 }
 
 /// Linux's `makedev` encoding of a device number.
-fn makedev(major: u32, minor: u32) -> u64 {
+pub fn makedev(major: u32, minor: u32) -> u64 {
     let (ma, mi) = (major as u64, minor as u64);
     (mi & 0xff) | ((ma & 0xfff) << 8) | ((mi & !0xff) << 12) | ((ma & !0xfff) << 32)
 }

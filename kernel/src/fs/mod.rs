@@ -13,6 +13,8 @@
 
 pub mod cpio;
 pub mod dev;
+pub mod disk;
+pub mod mount;
 pub mod pipe;
 pub mod procfs;
 pub mod tmpfs;
@@ -32,6 +34,7 @@ pub enum FileType {
     Regular,
     Directory,
     CharDevice,
+    BlockDevice,
     Symlink,
     Fifo,
 }
@@ -42,6 +45,7 @@ impl FileType {
             Self::Regular => mode::S_IFREG,
             Self::Directory => mode::S_IFDIR,
             Self::CharDevice => mode::S_IFCHR,
+            Self::BlockDevice => mode::S_IFBLK,
             Self::Symlink => mode::S_IFLNK,
             Self::Fifo => mode::S_IFIFO,
         }
@@ -52,6 +56,7 @@ impl FileType {
         match self {
             Self::Fifo => 1,
             Self::CharDevice => 2,
+            Self::BlockDevice => 6,
             Self::Directory => 4,
             Self::Regular => 8,
             Self::Symlink => 10,
@@ -150,7 +155,7 @@ pub trait Inode: Send + Sync {
     /// Whether reads and writes use the file offset (false for devices,
     /// pipes and terminals).
     fn seekable(&self) -> bool {
-        self.file_type() == FileType::Regular
+        matches!(self.file_type(), FileType::Regular | FileType::BlockDevice)
     }
     fn ioctl(&self, _req: u32, _arg: u64, _mm: &AddressSpace) -> KResult<u64> {
         Err(Errno::ENOTTY)
@@ -246,6 +251,16 @@ static ROOT: Once<Arc<dyn Inode>> = Once::new();
 /// The root directory. Created (empty, with `/dev` and `/proc`) on first
 /// use.
 pub fn root() -> Arc<dyn Inode> {
+    mount::cross_down(base_root())
+}
+
+/// The kernel's `/dev` directory (for devtmpfs mounts).
+pub fn dev_dir() -> Arc<dyn Inode> {
+    base_root().lookup("dev").expect("/dev exists")
+}
+
+/// The boot root file system (the initramfs), under any mount on "/".
+fn base_root() -> Arc<dyn Inode> {
     ROOT.call_once(|| {
         let root = tmpfs::Dir::new_root(0o755);
         let devdir = root.create("dev", FileType::Directory, 0o755).unwrap();
@@ -268,12 +283,16 @@ pub fn path_of(inode: &Arc<dyn Inode>) -> String {
     let mut parts = Vec::new();
     let mut cur = inode.clone();
     for _ in 0..256 {
+        cur = mount::cross_up(cur);
         let Some(parent) = cur.parent() else { break };
-        if parent.ino() == cur.ino() {
+        if parent.ino() == cur.ino() && parent.dev() == cur.dev() {
             break; // the root
         }
         let Ok(entries) = parent.entries() else { break };
-        match entries.into_iter().find(|(_, i)| i.ino() == cur.ino()) {
+        match entries
+            .into_iter()
+            .find(|(_, i)| i.ino() == cur.ino() && i.dev() == cur.dev())
+        {
             Some((name, _)) => parts.push(name),
             None => break,
         }
@@ -330,14 +349,15 @@ pub fn resolve(
         match part.as_str() {
             "." => continue,
             ".." => {
-                cur = cur.parent().unwrap_or_else(|| cur.clone());
+                let up = mount::cross_up(cur.clone());
+                cur = up.parent().unwrap_or(up);
                 canon.pop();
                 continue;
             }
             p if p.len() > NAME_MAX => return Err(Errno::ENAMETOOLONG),
             _ => {}
         }
-        let next = cur.lookup(&part)?;
+        let next = mount::cross_down(cur.lookup(&part)?);
         let last = todo.is_empty();
         if next.file_type() == FileType::Symlink && (!last || follow_last || trailing_slash) {
             links += 1;

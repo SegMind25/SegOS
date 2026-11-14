@@ -1,7 +1,9 @@
 //! Device drivers. Each speaks to one kind of hardware and hands what it
 //! gets to the rest of the kernel (input to the terminal, for now).
 
+pub mod pci;
 pub mod ps2kbd;
+pub mod virtio_blk;
 
 /// Interrupt vectors of the devices routed through the I/O APIC.
 pub const KEYBOARD_VECTOR: u8 = 0x21;

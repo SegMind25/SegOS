@@ -240,7 +240,18 @@ fn loadavg() -> String {
 }
 
 fn mounts() -> String {
-    "tmpfs / tmpfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n".into()
+    let mut s =
+        String::from("rootfs / rootfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n");
+    for m in super::mount::all() {
+        s.push_str(&format!(
+            "{} {} {} {} 0 0\n",
+            m.source,
+            m.path,
+            m.fstype,
+            if m.read_only { "ro" } else { "rw" }
+        ));
+    }
+    s
 }
 
 fn version() -> String {

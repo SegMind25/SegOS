@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod abi;
+mod block;
 #[macro_use]
 mod console;
 mod drivers;
@@ -120,7 +121,12 @@ fn kernel_init(boot: &'static BootInfo) {
         hal::percpu::count(),
         mm::frame::free_count() * mm::PAGE_SIZE / (1024 * 1024)
     );
-    load_initramfs(boot);
+    drivers::pci::init();
+    drivers::virtio_blk::init();
+    match fs::disk::mount_root() {
+        Some(dev) => info!("root: {dev} (ext4, read-only)"),
+        None => load_initramfs(boot),
+    }
     let started = proc::console_stdio().and_then(|stdio| {
         proc::spawn(
             "/init",

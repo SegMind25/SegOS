@@ -146,6 +146,25 @@ pub fn map_mmio(virt: u64, phys: u64, pages: u64) -> Result<(), MapError> {
     Ok(())
 }
 
+/// Device memory window for drivers (above the APIC and I/O APIC pages).
+const MMIO_WINDOW: u64 = 0xffff_e000_1000_0000;
+static MMIO_NEXT: SpinLock<u64> = SpinLock::new(MMIO_WINDOW);
+
+/// Maps `len` bytes of device memory at physical `phys` somewhere in the
+/// kernel's MMIO window, uncached; returns the virtual address of `phys`.
+pub fn map_device(phys: u64, len: u64) -> Result<u64, MapError> {
+    let start = phys & !(PAGE_SIZE - 1);
+    let pages = (phys + len - start).div_ceil(PAGE_SIZE);
+    let virt = {
+        let mut next = MMIO_NEXT.lock();
+        let v = *next;
+        *next += (pages + 1) * PAGE_SIZE; // a guard page between mappings
+        v
+    };
+    map_mmio(virt, start, pages)?;
+    Ok(virt + (phys - start))
+}
+
 /// Unmaps one page and frees its frame.
 pub fn unmap(virt: u64) {
     let pml4 = KERNEL_PML4.load(Ordering::Relaxed);
