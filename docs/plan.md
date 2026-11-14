@@ -1,8 +1,9 @@
 # SegOS: a from-scratch operating system in Rust (plan)
 
-Status: **Phase 1 done** (boots on UEFI and BIOS; exceptions, frames,
-paging, heap; APIC timer, all CPUs started, preemptive scheduler, locks;
-13 kernel tests pass in QEMU on 4 CPUs). Next: Phase 2.
+Status: **Phase 1 done** (boots on UEFI with its own bootloader, segboot;
+exceptions, frames, paging, heap; APIC timer, all CPUs started from the
+ACPI tables, preemptive scheduler, locks; 13 kernel tests pass in QEMU on
+4 CPUs, debug and release builds; no third-party crates). Next: Phase 2.
 
 ## 1. The goal, stated precisely
 
@@ -22,8 +23,9 @@ Windows programs then come for free in the same way they do today: Wine and
 Proton are Linux programs.
 
 Non-goals (at least for the first years): running Linux kernel modules,
-NVIDIA's proprietary driver, Secure Boot signed by Microsoft, 32-bit-only
-hardware, architectures other than x86-64 (aarch64 later).
+NVIDIA's proprietary driver, Secure Boot signed by Microsoft, legacy BIOS
+boot (every PC since about 2012 has UEFI), 32-bit-only hardware,
+architectures other than x86-64 (aarch64 later).
 
 ## 2. Architecture
 
@@ -46,7 +48,7 @@ hardware, architectures other than x86-64 (aarch64 later).
  │ segkernel-hal: x86-64 only (the one place for `unsafe` asm)  │
  │  GDT/IDT, APIC/x2APIC, HPET/TSC, ACPI, PCI(e), IOMMU*        │
  ╞══════════════════════════════════════════════════════════════╡
- │ Bootloader: UEFI (Limine protocol), also Limine on BIOS      │
+ │ segboot: our own UEFI bootloader (bootinfo protocol)         │
  └──────────────────────────────────────────────────────────────┘
         * later phases
 ```
@@ -63,19 +65,32 @@ Design decisions:
 - **Drivers expose Linux's userspace interfaces**: DRM/KMS ioctls, evdev
   (`/dev/input/event*`), ALSA. Then Mesa, libinput, PipeWire and SegLinux's
   existing Smithay compositor work without changes.
-- **Boot via Limine** (UEFI + BIOS), so no bootloader is written in Phase 0.
+- **Own bootloader, segboot** (UEFI only). It was Limine during Phases 0
+  and 1; segboot replaced it so that every line of code SegOS runs is in
+  this repository. It loads the kernel ELF, builds the first page tables,
+  passes a memory map, the framebuffer and the ACPI RSDP in a small
+  `BootInfo` structure (the `bootinfo` crate), and jumps to the kernel. The
+  kernel starts the other CPUs itself from the ACPI MADT.
+- **No third-party crates.** The kernel, segboot and xtask depend only on
+  Rust's `core`, `alloc` and `std` (xtask). Things a crate would give us
+  (x86 structures, page tables, the heap allocator, the console font, the
+  FAT32 and GPT writers) are written here, small and fitted to SegOS. A
+  crate is only worth adding if writing it would cost months (TCP/IP may
+  be one; that is decided in Phase 6).
 - **Toolchain**: stable Rust pinned in `rust-toolchain.toml`, built-in target
   `x86_64-unknown-none`, built with `cargo xtask` (build, run in QEMU, test).
 
 ## 3. Repository layout (target)
 
-Phase 0 keeps everything in one `kernel` crate with `hal/` and `mm/`
+Today the kernel is one `kernel` crate with `hal/`, `mm/` and `task/`
 modules; they move into the crates below as they grow.
 
 ```
 Cargo.toml              workspace
 rust-toolchain.toml
-xtask/                  cargo xtask build|run|test|image
+xtask/                  cargo xtask build|run|test|image, GPT + FAT32 writer
+boot/                   segboot, the UEFI bootloader
+bootinfo/               the boot protocol shared by segboot and the kernel
 kernel/
   hal/                  x86-64: boot entry, interrupts, paging, APIC, ACPI
   mm/                   frame allocator, page tables, VMAs, page cache
@@ -88,7 +103,6 @@ kernel/
 userland/
   init/                 segos-init, PID 1, Rust
   tests/                syscall conformance tests (run on Linux AND SegOS)
-image/                  builds the disk image: Limine + kernel + rootfs
 docs/
 ```
 
@@ -102,7 +116,7 @@ Each phase ends with a demo that must work in QEMU and in CI.
 
 | Phase | What gets built | Done when | Rough effort* |
 |---|---|---|---|
-| 0. Bring-up | Workspace, xtask, Limine boot, serial + framebuffer console, GDT/IDT, exceptions, physical frame allocator, kernel heap, paging | Kernel prints "SegOS" in QEMU, panics show a backtrace, CI boots it | 2–4 weeks |
+| 0. Bring-up | Workspace, xtask, own UEFI bootloader (segboot), serial + framebuffer console, GDT/IDT, exceptions, physical frame allocator, kernel heap, paging | Kernel prints "SegOS" in QEMU, panics show a backtrace, CI boots it | 2–4 weeks |
 | 1. Multitasking | APIC timer, kernel threads, preemptive scheduler, SMP bring-up, spinlocks/mutexes | 4 CPUs run kernel threads in parallel | 1–2 months |
 | 2. First user process | Ring 3, `syscall`/`sysret`, ELF loader, address spaces, initramfs (cpio), tmpfs, ~40 syscalls (`read`, `write`, `mmap`, `brk`, `exit`, …) | A static musl "hello world" built on Linux runs unmodified | 1–2 months |
 | 3. A shell | `fork` with copy-on-write, `execve`, `wait4`, pipes, signals, TTY + line discipline, `ioctl(TCGETS…)`, devfs, procfs basics | BusyBox `sh` runs; `ls \| grep \| wc` works | 2–3 months |
@@ -154,17 +168,38 @@ restored into `userland/` when needed.
 | Licensing | Kernel code original under MIT/Apache-2.0; no code copied from Linux (GPL-2.0); rootfs binaries keep their own licences |
 | `unsafe` bugs | Confine to `hal` and audited modules, `#![forbid(unsafe_code)]` elsewhere, Miri for pure logic, KASAN-like checks in debug builds |
 
-## 8. First concrete steps (Phase 0)
+## 8. Next concrete steps (Phase 2)
 
-1. Delete the old tree on the working branch; add the new workspace,
-   `rust-toolchain.toml` (stable, `rust-src`, `llvm-tools`), `xtask`.
-2. Kernel entry via the `limine` crate; serial (COM1) logger; framebuffer
-   text console.
-3. GDT, TSS, IDT with handlers for all exceptions; double-fault stack.
-4. Physical memory map from Limine → bitmap/buddy frame allocator;
-   4-level paging with a higher-half direct map; `linked_list_allocator`
-   heap, later own slab allocator.
-5. `cargo xtask run` builds an ISO with Limine and boots it in QEMU with
-   OVMF; `cargo xtask test` runs in-kernel tests and exits QEMU via
-   `isa-debug-exit`.
-6. GitHub Actions workflow: build, boot in QEMU, check serial output.
+The demo: a static "hello world" built with musl on Linux, copied
+unchanged into SegOS's initramfs, runs as `/init` and its output appears on
+the console. What it takes:
+
+1. **Address spaces.** A page table per process: the lower half its own,
+   the kernel half shared (the kernel's top-level entries are all created
+   at boot so every process sees the same kernel mappings). Regions (VMAs)
+   record what each part of the lower half is; a page fault in a region
+   maps a zeroed page on demand, anything else kills the process with
+   `SIGSEGV`.
+2. **Ring 3.** User code and data segments, a TSS kernel stack per thread,
+   `syscall`/`sysret` (STAR, LSTAR, FMASK), `swapgs` with the kernel's
+   per-CPU block in `KERNEL_GS_BASE`, user `FS` base saved per thread, and
+   FPU/SSE state saved per thread (`fxsave`/`xsave`).
+3. **ELF loader** for static executables (`ET_EXEC` and static-PIE
+   `ET_DYN`), and the initial stack Linux builds: `argc`, `argv`, `envp`,
+   the auxiliary vector (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`,
+   `AT_ENTRY`, `AT_RANDOM`, `AT_HWCAP`, `AT_CLKTCK`, ...).
+4. **initramfs**: segboot also loads `\boot\initramfs` (a `newc` cpio
+   archive, as Linux uses) and passes it in `BootInfo`; the kernel unpacks
+   it into a tmpfs root.
+5. **Files**: a small VFS with tmpfs and a console device, file
+   descriptors, `open`/`openat`, `read`, `write`, `readv`/`writev`, `close`,
+   `lseek`, `fstat`/`newfstatat`, `ioctl` (`TIOCGWINSZ`, `TCGETS`).
+6. **The rest of the ~40 syscalls** a static program touches: `brk`,
+   `mmap`/`munmap`/`mprotect` (anonymous), `arch_prctl`,
+   `set_tid_address`, `exit`, `exit_group`, `getpid` and friends, `uname`,
+   `clock_gettime`, `nanosleep`, `getrandom`, signal calls answered
+   harmlessly until Phase 3. Unknown syscalls return `ENOSYS` and are
+   logged, which tells us what to write next.
+7. **Tests**: in-kernel tests for each piece, and the demo itself in CI:
+   xtask builds `userland/hello` with `musl-gcc` (as a real Linux user
+   would) and checks its output on the serial port.

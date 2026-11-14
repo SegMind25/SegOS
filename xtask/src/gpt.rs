@@ -8,7 +8,12 @@ const ENTRY_SIZE: u32 = 128;
 const ARRAY_SECTORS: u64 = (ENTRIES * ENTRY_SIZE) as u64 / SECTOR;
 
 /// EFI System Partition type GUID C12A7328-F81F-11D2-BA4B-00A0C93EC93B.
-pub const ESP_TYPE: [u8; 16] = guid(0xc12a7328, 0xf81f, 0x11d2, [0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b]);
+pub const ESP_TYPE: [u8; 16] = guid(
+    0xc12a7328,
+    0xf81f,
+    0x11d2,
+    [0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b],
+);
 
 /// A GUID in its on-disk (mixed-endian) byte order.
 const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
@@ -34,7 +39,11 @@ pub fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         crc ^= b as u32;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -67,7 +76,10 @@ pub fn write(disk: &mut [u8], disk_guid: [u8; 16], parts: &[Partition]) -> Resul
         return Err("too many partitions".into());
     }
     for p in parts {
-        if p.first_lba < first_usable() || p.last_lba > last_usable(sectors) || p.last_lba < p.first_lba {
+        if p.first_lba < first_usable()
+            || p.last_lba > last_usable(sectors)
+            || p.last_lba < p.first_lba
+        {
             return Err(format!("partition {} outside the usable area", p.name));
         }
     }

@@ -11,9 +11,12 @@
 //!   application-processor trampoline loads CR3 from 32-bit code) that map:
 //!   - the kernel's ELF segments at their link addresses (top 2 GiB), with
 //!     W/NX from the segment flags;
-//!   - all physical memory from 0 to max(4 GiB, end of the highest memory
-//!     map region) at [`BootInfo::hhdm_offset`] (the "direct map"),
-//!     read-write, no-execute, 2 MiB or 1 GiB pages;
+//!   - all physical memory from 0 to max(4 GiB, end of the highest RAM
+//!     region, end of the framebuffer), rounded up to 1 GiB, at
+//!     [`BootInfo::hhdm_offset`] (the "direct map"), read-write,
+//!     no-execute, 2 MiB or 1 GiB pages. Device memory and reserved holes
+//!     above that (64-bit PCI BARs, for example) are not mapped: the kernel
+//!     maps what it needs itself;
 //!   - the same range identity-mapped (virtual = physical), read-write,
 //!     executable. The kernel may remove it once it no longer needs it.
 //! - EFER.NXE and CR0.WP are set; the GDT and IDT are the firmware's (the

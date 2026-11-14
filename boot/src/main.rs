@@ -83,14 +83,17 @@ fn check(s: efi::Status, msg: &'static str) -> Result<(), Error> {
 #[unsafe(no_mangle)]
 /// # Safety
 /// Called by the firmware with its image handle and system table.
-pub unsafe extern "efiapi" fn efi_main(image: efi::Handle, st: *mut efi::SystemTable) -> efi::Status {
+pub unsafe extern "efiapi" fn efi_main(
+    image: efi::Handle,
+    st: *mut efi::SystemTable,
+) -> efi::Status {
     console::serial_init();
     // SAFETY: the firmware passes a valid system table.
     let st = unsafe { &*st };
     console::set_con_out(st.con_out);
-    progress!("SegOS bootloader {}", env!("CARGO_PKG_VERSION"));
+    info!("SegOS bootloader {}", env!("CARGO_PKG_VERSION"));
     let Err(e) = boot(image, st);
-    progress!("error: {e}");
+    info!("error: {e}");
     info!("cannot boot SegOS; returning to the firmware in 10 seconds");
     // SAFETY: boot services are still active on every error path of boot().
     unsafe { ((*st.boot_services).stall)(10_000_000) };
@@ -165,7 +168,12 @@ unsafe fn read_whole(bs: &efi::BootServices, file: *mut efi::File) -> Result<Ker
     // SAFETY: valid file and a buffer of `size` bytes.
     unsafe {
         check(
-            ((*file).get_info)(file, &efi::FILE_INFO_GUID, &mut size, info.as_mut_ptr().cast()),
+            ((*file).get_info)(
+                file,
+                &efi::FILE_INFO_GUID,
+                &mut size,
+                info.as_mut_ptr().cast(),
+            ),
             "cannot get the size of \\boot\\segkernel",
         )?;
         let info = &*(info.as_ptr() as *const efi::FileInfo);
@@ -337,9 +345,8 @@ fn find_rsdp(st: &efi::SystemTable) -> u64 {
         return 0;
     }
     // SAFETY: the firmware provides `number_of_table_entries` entries.
-    let tables = unsafe {
-        core::slice::from_raw_parts(st.configuration_table, st.number_of_table_entries)
-    };
+    let tables =
+        unsafe { core::slice::from_raw_parts(st.configuration_table, st.number_of_table_entries) };
     let find = |g: efi::Guid| {
         tables
             .iter()
@@ -351,7 +358,11 @@ fn find_rsdp(st: &efi::SystemTable) -> u64 {
         .unwrap_or(0)
 }
 
-fn alloc_reclaimable(bs: *mut efi::BootServices, bytes: u64, what: &'static str) -> Result<u64, Error> {
+fn alloc_reclaimable(
+    bs: *mut efi::BootServices,
+    bytes: u64,
+    what: &'static str,
+) -> Result<u64, Error> {
     let pages = bytes.div_ceil(PAGE);
     let p = mem::allocate_pages(bs, efi::ALLOCATE_ANY_PAGES, mem::RECLAIMABLE_TYPE, pages, 0)
         .map_err(|s| Error {
@@ -391,7 +402,7 @@ fn boot(image: efi::Handle, st: &efi::SystemTable) -> Result<core::convert::Infa
     let elf = match elf::Elf::parse(bytes) {
         Ok(e) => e,
         Err(msg) => {
-            progress!("bad kernel ELF: {msg}");
+            info!("bad kernel ELF: {msg}");
             // SAFETY: allocated by read_whole.
             unsafe { (bs.free_pool)(file.data) };
             return Err(Error::new("\\boot\\segkernel is not a valid SegOS kernel"));
@@ -402,7 +413,7 @@ fn boot(image: efi::Handle, st: &efi::SystemTable) -> Result<core::convert::Infa
     let kernel = load_kernel(bs_ptr, &elf, &mut pt)?;
     // SAFETY: allocated by read_whole; the segments have been copied.
     unsafe { (bs.free_pool)(file.data) };
-    progress!(
+    info!(
         "kernel loaded: {} KiB at {:#x}, entry {:#x}",
         kernel.pages * 4,
         kernel.phys,
@@ -473,7 +484,7 @@ fn boot(image: efi::Handle, st: &efi::SystemTable) -> Result<core::convert::Infa
         },
         "cannot read the memory map",
     )?;
-    let top = mem::top_of_memory(raw_map, size, desc_size)
+    let top = mem::top_of_ram(raw_map, size, desc_size)
         .max(4 * GIB)
         .max(fb.address + fb_size)
         .next_multiple_of(GIB);
@@ -505,7 +516,7 @@ fn boot(image: efi::Handle, st: &efi::SystemTable) -> Result<core::convert::Infa
         })
     };
 
-    progress!("exiting boot services");
+    info!("exiting boot services");
     console::drop_con_out();
     let mut tries = 0;
     loop {
@@ -544,9 +555,8 @@ fn boot(image: efi::Handle, st: &efi::SystemTable) -> Result<core::convert::Infa
     };
     // SAFETY: allocated above with room for `regions_cap` entries; every
     // entry is written before it is read.
-    let out = unsafe {
-        core::slice::from_raw_parts_mut(regions_phys as *mut MemoryRegion, regions_cap)
-    };
+    let out =
+        unsafe { core::slice::from_raw_parts_mut(regions_phys as *mut MemoryRegion, regions_cap) };
     let len = match mem::convert(raw_map, map_size, desc_size, fb_range, out) {
         Ok(n) => n,
         Err(e) => fatal(format_args!("{e}")),

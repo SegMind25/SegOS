@@ -61,7 +61,7 @@
       </section>
 
       <figure class="console" aria-labelledby="console-cap">
-        <div class="console-bar" aria-hidden="true"><i></i><i></i><i></i><span>qemu-system-x86_64 &middot; segos.iso</span></div>
+        <div class="console-bar" aria-hidden="true"><i></i><i></i><i></i><span>qemu-system-x86_64 &middot; segos.img</span></div>
         <div class="shot" tabindex="0" role="region" aria-label="Kernel console screenshot">
         <picture>
           <source srcset="/assets/console.webp" type="image/webp">
@@ -114,7 +114,7 @@
           <li class="abi">syscall boundary &middot; Linux ABI</li>
           <li class="ours"><em class="tag">written in Rust</em><b>segkernel</b><span>linux-abi &middot; process &middot; mm &middot; vfs &middot; net &middot; drivers &middot; sched</span></li>
           <li class="ours"><em class="tag">the small unsafe core</em><b>segkernel-hal</b><span>x86-64: GDT/IDT, APIC, ACPI, PCI(e)</span></li>
-          <li><b>Limine bootloader</b><span>UEFI and legacy BIOS</span></li>
+          <li class="ours"><em class="tag">written in Rust</em><b>segboot</b><span>its own UEFI bootloader</span></li>
         </ol>
       </div>
     </section>
@@ -157,7 +157,8 @@
           <div class="panel">
             <h3>Phase 0 &middot; Bring-up <span class="badge done">Done</span></h3>
             <ul class="checklist done">
-              <li>Boots on UEFI and legacy BIOS via Limine</li>
+              <li>Boots on UEFI with segboot, its own bootloader</li>
+              <li>No third-party crates: all the code it runs is in the repository</li>
               <li>Serial port and framebuffer text console</li>
               <li>GDT, TSS and IDT; handlers for every CPU exception</li>
               <li>Physical frame allocator from the boot memory map</li>
@@ -190,9 +191,8 @@
           <h2 id="build-title">Build it yourself</h2>
           <p>
             You need Rust (the version is pinned in <code>rust-toolchain.toml</code>),
-            QEMU, xorriso, git, make, a C compiler and OVMF. The first build
-            downloads the <a href="https://github.com/limine-bootloader/limine">Limine</a>
-            bootloader into <code>target/limine</code>.
+            QEMU and OVMF. Nothing is downloaded: the bootloader, the kernel
+            and the tool that writes the disk image are all in the repository.
           </p>
           <p>
             What you will see is the console above: the kernel boots, reports
@@ -202,7 +202,7 @@
         <div class="cmds">
           <figure class="cmd">
             <figcaption>Dependencies on Debian or Ubuntu</figcaption>
-            <pre><code><span class="p" aria-hidden="true">$ </span>sudo apt install qemu-system-x86 xorriso ovmf build-essential git</code></pre>
+            <pre><code><span class="p" aria-hidden="true">$ </span>sudo apt install qemu-system-x86 ovmf git</code></pre>
           </figure>
           <figure class="cmd">
             <figcaption>Get the source</figcaption>
@@ -211,10 +211,9 @@
           </figure>
           <figure class="cmd">
             <figcaption>Build, boot and test</figcaption>
-            <pre><code><span class="p" aria-hidden="true">$ </span>cargo xtask run          <span class="c"># build the ISO, boot it in QEMU (UEFI)</span>
-<span class="p" aria-hidden="true">$ </span>cargo xtask run --bios   <span class="c"># legacy BIOS boot</span>
+            <pre><code><span class="p" aria-hidden="true">$ </span>cargo xtask run          <span class="c"># build the disk image, boot it in QEMU</span>
 <span class="p" aria-hidden="true">$ </span>cargo xtask test         <span class="c"># in-kernel tests, in QEMU</span>
-<span class="p" aria-hidden="true">$ </span>cargo xtask image        <span class="c"># target/segos.iso, bootable from USB or DVD</span></code></pre>
+<span class="p" aria-hidden="true">$ </span>cargo xtask image        <span class="c"># target/segos.img, for a USB stick</span></code></pre>
           </figure>
         </div>
       </div>

@@ -2,17 +2,25 @@
 //!
 //! Simple and good enough until SMP and NUMA (a buddy allocator with
 //! per-CPU caches replaces it in Phase 1/4). The bitmap itself lives in the
-//! first usable region large enough, reached through the direct map.
+//! first usable region above 1 MiB large enough, reached through the direct
+//! map.
+//!
+//! Memory below 1 MiB is kept back from [`alloc_zeroed`]: it is scarce and
+//! some things need it (the real-mode trampoline that starts the other
+//! CPUs, old DMA). Only [`alloc_below`] hands it out.
 
 use super::{PAGE_SIZE, phys_to_virt};
 use crate::sync::SpinLock;
 use bootinfo::{MemoryKind, MemoryRegion};
 
+/// First frame [`FrameAllocator::alloc`] may return (1 MiB).
+const LOW_FRAMES: u64 = 0x10_0000 / PAGE_SIZE;
+
 pub struct FrameAllocator {
     bitmap: &'static mut [u64],
     frames: u64,
     free: u64,
-    /// Search hint: no free frame below this index.
+    /// Search hint: no free frame in `LOW_FRAMES..next`.
     next: u64,
 }
 
@@ -60,7 +68,7 @@ impl FrameAllocator {
         );
         self.set(i, false);
         self.free += 1;
-        self.next = self.next.min(i);
+        self.next = self.next.min(i).max(LOW_FRAMES);
     }
 }
 
@@ -77,7 +85,7 @@ pub fn init(entries: &[MemoryRegion]) {
 
     let home = entries
         .iter()
-        .find(|e| e.kind == MemoryKind::Usable && e.length >= bytes)
+        .find(|e| e.kind == MemoryKind::Usable && e.base >= 0x10_0000 && e.length >= bytes)
         .expect("no region large enough for the frame bitmap");
     let bitmap = unsafe {
         core::slice::from_raw_parts_mut(phys_to_virt(home.base).cast::<u64>(), words as usize)
@@ -88,7 +96,7 @@ pub fn init(entries: &[MemoryRegion]) {
         bitmap,
         frames,
         free: 0,
-        next: 0,
+        next: LOW_FRAMES,
     };
     for e in entries.iter().filter(|e| e.kind == MemoryKind::Usable) {
         // Usable regions are page aligned by the protocol.

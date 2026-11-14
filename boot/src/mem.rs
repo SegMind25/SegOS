@@ -21,11 +21,7 @@ pub fn allocate_pages(
     let mut addr = max;
     // SAFETY: boot services are active; `addr` is a valid out pointer.
     let s = unsafe { ((*bs).allocate_pages)(alloc_type, mem_type, pages as usize, &mut addr) };
-    if s == efi::SUCCESS {
-        Ok(addr)
-    } else {
-        Err(s)
-    }
+    if s == efi::SUCCESS { Ok(addr) } else { Err(s) }
 }
 
 fn kind_of(ty: u32) -> MemoryKind {
@@ -58,9 +54,31 @@ pub fn descriptors(
     })
 }
 
-/// End of the highest region in the map.
-pub fn top_of_memory(buf: u64, size: usize, desc_size: usize) -> u64 {
+/// Whether a UEFI memory type is RAM (as opposed to device memory or a
+/// reserved hole, which firmware may report far above the end of RAM).
+fn is_ram(ty: u32) -> bool {
+    matches!(
+        ty,
+        efi::LOADER_CODE
+            | efi::LOADER_DATA
+            | efi::BOOT_SERVICES_CODE
+            | efi::BOOT_SERVICES_DATA
+            | efi::RUNTIME_SERVICES_CODE
+            | efi::RUNTIME_SERVICES_DATA
+            | efi::CONVENTIONAL_MEMORY
+            | efi::UNUSABLE_MEMORY
+            | efi::ACPI_RECLAIM_MEMORY
+            | efi::ACPI_MEMORY_NVS
+            | efi::PERSISTENT_MEMORY
+            | KERNEL_TYPE
+            | RECLAIMABLE_TYPE
+    )
+}
+
+/// End of the highest RAM region in the map.
+pub fn top_of_ram(buf: u64, size: usize, desc_size: usize) -> u64 {
     descriptors(buf, size, desc_size)
+        .filter(|d| is_ram(d.ty))
         .map(|d| d.physical_start + d.number_of_pages * PAGE)
         .max()
         .unwrap_or(0)
