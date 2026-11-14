@@ -17,6 +17,7 @@ pub mod disk;
 pub mod ext4;
 pub mod fat;
 pub mod mount;
+pub mod pagecache;
 pub mod pipe;
 pub mod procfs;
 pub mod tmpfs;
@@ -506,7 +507,7 @@ impl File {
             return self.inode.read_stream(buf, self.nonblock());
         }
         let mut off = self.offset.lock();
-        let n = self.inode.read_at(*off, buf)?;
+        let n = pagecache::read_at(&self.inode, *off, buf)?;
         *off += n as u64;
         Ok(n)
     }
@@ -523,7 +524,7 @@ impl File {
         if *self.flags.lock() & crate::abi::open::O_APPEND != 0 {
             *off = self.inode.size();
         }
-        let n = self.inode.write_at(*off, data)?;
+        let n = pagecache::write_at(&self.inode, *off, data)?;
         *off += n as u64;
         Ok(n)
     }

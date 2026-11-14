@@ -121,6 +121,11 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
             Ok(0)
         }
         25 => mem::mremap(),
+        26 => {
+            // msync: write back shared file mappings.
+            crate::fs::pagecache::sync_all();
+            Ok(0)
+        }
         28 => Ok(0), // madvise: advice may be ignored
         32 => fs::dup(ctx, fd),
         33 => fs::dup3(ctx, fd, a[1] as i32, 0, true),
@@ -192,6 +197,7 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         157 => info::prctl(ctx, a),
         158 => process::arch_prctl(ctx, a[0] as u32, a[1]),
         162 => {
+            crate::fs::pagecache::sync_all();
             crate::block::sync_all();
             Ok(0)
         }

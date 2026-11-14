@@ -314,6 +314,7 @@ pub fn reboot(magic1: u32, magic2: u32, cmd: u32) -> KResult<u64> {
     if matches!(cmd, RESTART | POWER_OFF | HALT) {
         // Nothing cached may be lost (Linux leaves this to user space; a
         // forced power-off from BusyBox skips it, so the kernel does it).
+        crate::fs::pagecache::sync_all();
         crate::block::sync_all();
     }
     match cmd {

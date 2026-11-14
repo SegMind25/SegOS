@@ -213,6 +213,7 @@ pub fn start_flusher() {
     crate::task::spawn_named("blockflush", || {
         loop {
             crate::time::sleep_ms(5000);
+            crate::fs::pagecache::sync_all();
             sync_all();
         }
     });

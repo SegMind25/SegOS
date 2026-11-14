@@ -22,6 +22,8 @@ pub mod flags {
     /// the first write copies it (or, if it is no longer shared, just makes
     /// it writable).
     pub const COW: u64 = 1 << 9;
+    /// A shared mapping's page (MAP_SHARED): fork shares it writable.
+    pub const SHARED: u64 = 1 << 10;
     pub const NO_EXECUTE: u64 = 1 << 63;
 }
 
@@ -259,7 +261,7 @@ pub fn protect_user(pml4: u64, virt: u64, page_flags: u64) {
         if *e & flags::COW != 0 {
             f = (f & !flags::WRITABLE) | flags::COW;
         }
-        *e = (*e & ADDR_MASK) | f | flags::PRESENT;
+        *e = (*e & ADDR_MASK) | f | (*e & flags::SHARED) | flags::PRESENT;
         flush_if_current(pml4, virt);
     }
 }
@@ -293,7 +295,7 @@ pub fn fork_user(parent: u64, child: u64) -> Result<(), MapError> {
                 }
                 copy(*e & ADDR_MASK, *c & ADDR_MASK, level - 1, virt)?;
             } else {
-                if *e & flags::WRITABLE != 0 {
+                if *e & flags::WRITABLE != 0 && *e & flags::SHARED == 0 {
                     *e = (*e & !flags::WRITABLE) | flags::COW;
                 }
                 frame::get(*e & ADDR_MASK);

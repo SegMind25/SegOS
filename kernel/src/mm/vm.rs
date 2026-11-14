@@ -44,6 +44,9 @@ pub enum Kind {
     Stack,
     /// Anonymous `mmap`.
     Anon,
+    /// `MAP_SHARED`: page-cache pages of a file, or shared anonymous
+    /// memory; `fork` shares them instead of copying.
+    Shared,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -188,6 +191,23 @@ impl AddressSpace {
             }
             a += PAGE_SIZE;
         }
+    }
+
+    /// Puts `frames` at `start` (inside a region already mapped), one per
+    /// page, marked shared. Each mapping takes its own frame reference.
+    pub fn map_shared(&self, start: u64, frames: &[u64]) -> KResult<()> {
+        let r = self.inner.lock();
+        let vma = *r.find(start).ok_or(Errno::EFAULT)?;
+        let page_flags = vma.page_flags() | flags::SHARED;
+        for (i, &phys) in frames.iter().enumerate() {
+            let va = start + i as u64 * PAGE_SIZE;
+            if let Some(old) = paging::unmap_user(self.pml4, va) {
+                frame::free(old);
+            }
+            frame::get(phys);
+            paging::map_user(self.pml4, va, phys, page_flags).map_err(|_| Errno::ENOMEM)?;
+        }
+        Ok(())
     }
 
     /// Adds a region. With `fixed`, whatever was there is unmapped first;

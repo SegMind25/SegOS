@@ -106,7 +106,7 @@ pub fn pread(ctx: &Ctx, fd: i32, buf: u64, count: u64, off: i64) -> KResult<u64>
         return Err(Errno::EBADF);
     }
     let mut kbuf = vec![0u8; count.min(IO_CHUNK) as usize];
-    let n = f.inode.read_at(off as u64, &mut kbuf)?;
+    let n = fs::pagecache::read_at(&f.inode, off as u64, &mut kbuf)?;
     ctx.mm().copy_to(buf, &kbuf[..n])?;
     Ok(n as u64)
 }
@@ -124,7 +124,7 @@ pub fn pwrite(ctx: &Ctx, fd: i32, buf: u64, count: u64, off: i64) -> KResult<u64
     }
     let mut kbuf = vec![0u8; count.min(IO_CHUNK) as usize];
     ctx.mm().copy_from(buf, &mut kbuf)?;
-    Ok(f.inode.write_at(off as u64, &kbuf)? as u64)
+    Ok(fs::pagecache::write_at(&f.inode, off as u64, &kbuf)? as u64)
 }
 
 pub fn lseek(ctx: &Ctx, fd: i32, off: i64, whence: u32) -> KResult<u64> {
@@ -396,6 +396,7 @@ pub fn fcntl(ctx: &Ctx, fd: i32, cmd: u32, arg: u64) -> KResult<u64> {
 
 pub fn fsync(ctx: &Ctx, fd: i32) -> KResult<u64> {
     let f = file(ctx, fd)?;
+    fs::pagecache::sync_inode(&f.inode)?;
     if f.inode.dev() != fs::DEV_TMPFS {
         crate::block::sync_all();
     }
@@ -970,7 +971,7 @@ pub fn sendfile(ctx: &Ctx, out_fd: i32, in_fd: i32, offset: u64, count: u64) -> 
         if pos < 0 {
             return Err(Errno::EINVAL);
         }
-        let n = input.inode.read_at(pos as u64, &mut buf)?;
+        let n = fs::pagecache::read_at(&input.inode, pos as u64, &mut buf)?;
         let w = output.write(&buf[..n])?;
         pos += w as i64;
         ctx.mm().write(offset, &pos)?;
