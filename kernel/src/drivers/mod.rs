@@ -12,6 +12,7 @@ pub mod virtio_net;
 /// Interrupt vectors of the devices routed through the I/O APIC.
 pub const KEYBOARD_VECTOR: u8 = 0x21;
 pub const SERIAL_VECTOR: u8 = 0x24;
+pub const MOUSE_VECTOR: u8 = 0x2c;
 
 /// Sets up input devices and routes their interrupts to this CPU.
 pub fn init(rsdp: u64) {
@@ -19,6 +20,11 @@ pub fn init(rsdp: u64) {
     let me = crate::hal::apic::id();
     if ps2kbd::init() && crate::hal::ioapic::route_isa(1, KEYBOARD_VECTOR, me) {
         crate::info!("keyboard: PS/2");
+        if ps2kbd::MOUSE_PRESENT.load(core::sync::atomic::Ordering::Relaxed)
+            && crate::hal::ioapic::route_isa(12, MOUSE_VECTOR, me)
+        {
+            crate::info!("mouse: PS/2");
+        }
     }
     if crate::hal::ioapic::route_isa(4, SERIAL_VECTOR, me) {
         crate::hal::serial::enable_rx_interrupt();

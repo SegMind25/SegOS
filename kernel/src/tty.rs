@@ -8,6 +8,9 @@
 //! and `^Z` send SIGINT, SIGQUIT and SIGTSTP to the foreground process
 //! group. Settings are Linux's `struct termios`, changed with `ioctl`.
 
+/// The terminal is in KD_GRAPHICS mode (a program draws the screen).
+static KD_GRAPHICS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 use crate::abi::{Errno, KResult, Winsize};
 use crate::fs::poll;
 use crate::mm::vm::AddressSpace;
@@ -501,6 +504,43 @@ impl Tty {
             TCSBRK | TCXONC => Ok(0),
             KDGKBTYPE => {
                 mm.write(arg, &2u8)?; // KB_101: a PC keyboard
+                Ok(0)
+            }
+            // The virtual terminal: text or graphics, keyboard on or off.
+            0x4b3a => {
+                // KDSETMODE: KD_TEXT 0, KD_GRAPHICS 1
+                let g = arg == 1;
+                KD_GRAPHICS.store(g, Ordering::Relaxed);
+                crate::console::set_graphics(g);
+                Ok(0)
+            }
+            0x4b3b => {
+                mm.write(arg, &(KD_GRAPHICS.load(Ordering::Relaxed) as i32))?;
+                Ok(0)
+            }
+            0x4b44 => {
+                // KDGKBMODE
+                let off = crate::input::KEYBOARD_TAKEN.load(Ordering::Relaxed);
+                mm.write(arg, &(if off { 4i32 } else { 3 }))?; // K_OFF / K_UNICODE
+                Ok(0)
+            }
+            0x4b45 => {
+                // KDSKBMODE: K_OFF (4) keeps keys from the terminal.
+                crate::input::KEYBOARD_TAKEN.store(arg == 4, Ordering::Relaxed);
+                Ok(0)
+            }
+            0x4b46 | 0x4b47 | 0x4b49 | 0x4b4a => Ok(0), // KDGKBMETA, KDSKBMETA, KDGKBLED, KDSKBLED... ignored
+            0x5600 => {
+                mm.write(arg, &1i32)?; // VT_OPENQRY: tty1
+                Ok(0)
+            }
+            0x5601 => {
+                mm.write(arg, &[0u8; 8])?; // VT_GETMODE: VT_AUTO
+                Ok(0)
+            }
+            0x5602 | 0x5605 | 0x5606 | 0x5607 => Ok(0), // VT_SETMODE, RELDISP, ACTIVATE, WAITACTIVE
+            0x5603 => {
+                mm.write(arg, &[1u16, 0, 0b11])?; // VT_GETSTATE: tty1 active
                 Ok(0)
             }
             _ => Err(Errno::EINVAL),

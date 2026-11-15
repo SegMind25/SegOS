@@ -269,6 +269,10 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
             crate::drivers::ps2kbd::irq();
             super::apic::eoi();
         }
+        v if v == crate::drivers::MOUSE_VECTOR as u64 => {
+            crate::drivers::ps2kbd::mouse_irq();
+            super::apic::eoi();
+        }
         v if v == crate::drivers::SERIAL_VECTOR as u64 => {
             super::serial::irq();
             super::apic::eoi();

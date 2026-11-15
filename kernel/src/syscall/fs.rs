@@ -417,10 +417,24 @@ pub fn fcntl(ctx: &Ctx, fd: i32, cmd: u32, arg: u64) -> KResult<u64> {
     const F_SETLKW: u32 = 7;
     const F_DUPFD_CLOEXEC: u32 = 1030;
     const F_GETPIPE_SZ: u32 = 1032;
+    const F_ADD_SEALS: u32 = 1033;
+    const F_GET_SEALS: u32 = 1034;
     const FD_CLOEXEC: u64 = 1;
     let mut files = ctx.process().files.lock();
     let f = files.get(fd)?;
     match cmd {
+        F_ADD_SEALS | F_GET_SEALS => {
+            let mut seals = SEALS.lock();
+            let s = seals.get_mut(&f.inode.ino()).ok_or(Errno::EINVAL)?;
+            if cmd == F_GET_SEALS {
+                return Ok(*s as u64);
+            }
+            if *s & 1 != 0 {
+                return Err(Errno::EPERM); // F_SEAL_SEAL
+            }
+            *s |= arg as u32 & 0x3f;
+            Ok(0)
+        }
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let min = usize::try_from(arg).map_err(|_| Errno::EINVAL)?;
             if min >= fs::MAX_FDS {
@@ -1164,4 +1178,40 @@ pub fn close_range(ctx: &Ctx, first: u32, last: u32, flags: u32) -> KResult<u64>
         }
     }
     Ok(0)
+}
+
+/// Seals of memfd files, by inode number (F_ADD_SEALS / F_GET_SEALS).
+static SEALS: crate::sync::SpinLock<alloc::collections::BTreeMap<u64, u32>> =
+    crate::sync::SpinLock::new(alloc::collections::BTreeMap::new());
+
+/// `memfd_create`: a tmpfs file with no name, for sharing memory (Wayland
+/// clients hand their buffers to the compositor this way).
+pub fn memfd_create(ctx: &Ctx, name: u64, flags: u32) -> KResult<u64> {
+    const MFD_CLOEXEC: u32 = 1;
+    const MFD_ALLOW_SEALING: u32 = 2;
+    const MFD_NOEXEC_SEAL: u32 = 8;
+    const MFD_EXEC: u32 = 0x10;
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC | 4) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let name = ctx.mm().read_cstr(name, 249)?;
+    let dir = fs::tmpfs::Dir::new_root(0o700);
+    let file_name = alloc::format!("memfd:{name}");
+    let inode = dir.create(&file_name, FileType::Regular, 0o777)?;
+    dir.remove(&file_name, false)?;
+    let sealing = flags & (MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL) != 0;
+    {
+        let mut seals = SEALS.lock();
+        if seals.len() > 4096 {
+            seals.clear(); // a bound, not a policy: old memfds lose their seals
+        }
+        seals.insert(inode.ino(), if sealing { 0 } else { 1 });
+    }
+    let file = fs::File::new(inode, crate::abi::open::O_RDWR);
+    let fd = ctx
+        .process()
+        .files
+        .lock()
+        .alloc(0, file, flags & MFD_CLOEXEC != 0)?;
+    Ok(fd as u64)
 }

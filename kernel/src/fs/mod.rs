@@ -198,6 +198,12 @@ pub trait Inode: Send + Sync {
     fn open_fifo(&self, _flags: u32) -> Option<Arc<dyn Inode>> {
         None
     }
+    /// Device memory for `mmap(MAP_SHARED)` at offset `off`: the frames
+    /// of `pages` pages (the device keeps its own references). None: not
+    /// a device with memory of its own.
+    fn mmap_frames(&self, _off: u64, _pages: u64) -> Option<KResult<Vec<u64>>> {
+        None
+    }
 
     // Symbolic links.
     fn readlink(&self) -> KResult<String> {

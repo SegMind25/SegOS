@@ -16,9 +16,11 @@ mod block;
 #[macro_use]
 mod console;
 mod drivers;
+mod drm;
 mod font;
 mod fs;
 mod hal;
+mod input;
 #[macro_use]
 mod klog;
 #[cfg(feature = "ktest")]
@@ -64,6 +66,7 @@ extern "sysv64" fn kmain(boot: &'static BootInfo) -> ! {
     // Screen console last: the boot log above is on serial already if
     // anything before this point fails.
     console::init(&boot.framebuffer);
+    drm::init(&boot.framebuffer);
     if boot.framebuffer.address != 0 {
         // The banner is on serial already; the screen starts empty.
         console::print_screen(format_args!("SegOS {VERSION}\n"));

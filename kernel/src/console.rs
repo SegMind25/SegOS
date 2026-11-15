@@ -503,3 +503,24 @@ macro_rules! kprintln {
     () => { $crate::console::print(format_args!("\n")) };
     ($($arg:tt)*) => { $crate::console::print(format_args!("{}\n", format_args!($($arg)*))) };
 }
+
+/// The screen console while a program owns the screen (DRM, or the
+/// terminal in KD_GRAPHICS mode): parked here, so nothing draws.
+static PARKED: SpinLock<Option<Console>> = SpinLock::new(None);
+
+/// Hands the screen to a program (`true`) or back to the console, which
+/// then starts on a clean screen.
+pub fn set_graphics(on: bool) {
+    crate::hal::x86::without_interrupts(|| {
+        if on {
+            if let Some(c) = CONSOLE.lock().take() {
+                *PARKED.lock() = Some(c);
+            }
+        } else if let Some(mut c) = PARKED.lock().take() {
+            c.clear();
+            c.col = 0;
+            c.row = 0;
+            *CONSOLE.lock() = Some(c);
+        }
+    });
+}

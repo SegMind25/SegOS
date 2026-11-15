@@ -57,7 +57,11 @@ pub fn mmap(
         if flags & MAP_TYPE != MAP_PRIVATE && prot & PROT_WRITE != 0 && !f.writable() {
             return Err(Errno::EACCES);
         }
-        (f.inode.file_type() == FileType::Regular).then_some(f)
+        // Devices map their own memory (DRM buffers) only when shared.
+        let device_memory = f.inode.file_type() == FileType::CharDevice
+            && flags & MAP_TYPE != MAP_PRIVATE
+            && f.inode.mmap_frames(off, 0).is_some();
+        (f.inode.file_type() == FileType::Regular || device_memory).then_some(f)
     };
     let mm = ctx.mm();
     if flags & MAP_TYPE != MAP_PRIVATE {
@@ -124,6 +128,10 @@ fn map_shared(
     let mut frames = Vec::with_capacity(pages as usize);
     let result = (|| -> KResult<()> {
         match file {
+            Some(f) if f.inode.file_type() == FileType::CharDevice => {
+                frames = f.inode.mmap_frames(off, pages).unwrap()?;
+                mm.map_shared(start, &frames)
+            }
             Some(f) => {
                 let cache = crate::fs::pagecache::get(&f.inode);
                 for i in 0..pages {

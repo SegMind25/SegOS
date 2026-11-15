@@ -301,6 +301,7 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         302 => info::prlimit64(ctx, a[0] as u32, a[1] as u32, a[2], a[3]),
         316 => fs::renameat(ctx, fd, a[1], a[2] as i32, a[3], a[4] as u32),
         318 => info::getrandom(ctx, a[0], a[1]),
+        319 => fs::memfd_create(ctx, a[0], a[1] as u32),
         // rseq, clone3, membarrier: the C libraries probe these and fall
         // back without them; no log line.
         334 | 435 | 324 => Err(Errno::ENOSYS),

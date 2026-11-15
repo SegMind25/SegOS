@@ -44,6 +44,16 @@ pub fn populate(dir: &Arc<dyn Inode>) {
         ("tty1", Kind::Console, 4, 1),
         ("ttyS0", Kind::Console, 4, 64),
     ];
+    if crate::drm::present()
+        && let Ok(dri) = dir.create("dri", FileType::Directory, 0o755)
+    {
+        let _ = dri.insert("card0", crate::drm::node());
+    }
+    if let Ok(input) = dir.create("input", FileType::Directory, 0o755) {
+        for (name, node) in crate::input::nodes() {
+            let _ = input.insert(&name, node);
+        }
+    }
     for (name, kind, major, minor) in devices {
         dir.insert(
             name,

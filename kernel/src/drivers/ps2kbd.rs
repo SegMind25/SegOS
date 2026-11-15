@@ -54,6 +54,14 @@ pub fn init() -> bool {
     command(0x60);
     wait_write();
     unsafe { x86::outb(DATA, config) };
+    if mouse_init() {
+        // Mouse interrupt and clock on too.
+        config = (config | 0x02) & !0x20;
+        command(0x60);
+        wait_write();
+        unsafe { x86::outb(DATA, config) };
+        MOUSE_PRESENT.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     command(0xae); // enable the keyboard port
     true
 }
@@ -197,17 +205,19 @@ fn control(b: u8) -> u8 {
     }
 }
 
-/// Keyboard interrupt: reads the scan code and types it.
+/// Keyboard interrupt: reads the scan code, reports the key to evdev
+/// and types it on the console (unless a program has the keyboard).
 pub fn irq() {
     let code = unsafe { x86::inb(DATA) };
     let mut out = [0u8; 8];
-    let n = {
+    let (n, ev) = {
         let mut k = KEYS.lock();
         if code == 0xe0 {
             k.extended = true;
             return;
         }
-        match translate(&mut k, code) {
+        let ev = linux_key(code & 0x7f, k.extended).map(|c| (c, code & 0x80 == 0));
+        let n = match translate(&mut k, code) {
             Key::Nothing => 0,
             Key::Seq(seq) => {
                 out[..seq.len()].copy_from_slice(seq);
@@ -231,9 +241,128 @@ pub fn irq() {
                 out[n] = b;
                 n + 1
             }
-        }
+        };
+        (n, ev)
     };
-    if n > 0 {
+    if let Some((c, down)) = ev {
+        crate::input::key(c, down);
+    }
+    if n > 0 && crate::input::console_gets_keys() {
         crate::tty::console().input_bytes(&out[..n]);
     }
 }
+
+/// The Linux key code of a set-1 scan code (the same numbers, except for
+/// the keys behind the 0xE0 prefix).
+fn linux_key(code: u8, extended: bool) -> Option<u16> {
+    if !extended {
+        return (1..=0x58).contains(&code).then_some(code as u16);
+    }
+    Some(match code {
+        0x1c => 96,  // KP enter
+        0x1d => 97,  // right ctrl
+        0x35 => 98,  // KP /
+        0x37 => 99,  // print screen
+        0x38 => 100, // right alt
+        0x47 => 102, // home
+        0x48 => 103, // up
+        0x49 => 104, // page up
+        0x4b => 105, // left
+        0x4d => 106, // right
+        0x4f => 107, // end
+        0x50 => 108, // down
+        0x51 => 109, // page down
+        0x52 => 110, // insert
+        0x53 => 111, // delete
+        0x5b => 125, // left meta
+        0x5c => 126, // right meta
+        0x5d => 127, // menu
+        _ => return None,
+    })
+}
+
+// ---- The PS/2 mouse (the controller's second port) --------------------------
+
+struct Mouse {
+    packet: [u8; 4],
+    have: usize,
+    size: usize,
+    buttons: u8,
+}
+
+static MOUSE: SpinLock<Mouse> = SpinLock::new(Mouse {
+    packet: [0; 4],
+    have: 0,
+    size: 3,
+    buttons: 0,
+});
+
+fn read_data() -> Option<u8> {
+    for _ in 0..100_000 {
+        if unsafe { x86::inb(STATUS) } & 1 != 0 {
+            return Some(unsafe { x86::inb(DATA) });
+        }
+    }
+    None
+}
+
+/// Sends a byte to the mouse; true if it acknowledged.
+fn mouse_send(b: u8) -> bool {
+    command(0xd4);
+    wait_write();
+    unsafe { x86::outb(DATA, b) };
+    read_data() == Some(0xfa)
+}
+
+/// Sets the mouse up (defaults, wheel if it has one, streaming). Called
+/// by [`init`] before interrupts are routed.
+fn mouse_init() -> bool {
+    command(0xa8); // enable the mouse port
+    if !mouse_send(0xf6) {
+        return false;
+    }
+    // The IntelliMouse knock (sample rates 200, 100, 80) turns the wheel on.
+    for rate in [200u8, 100, 80] {
+        mouse_send(0xf3);
+        mouse_send(rate);
+    }
+    mouse_send(0xf2);
+    let id = read_data().unwrap_or(0);
+    MOUSE.lock().size = if id == 3 { 4 } else { 3 };
+    mouse_send(0xf4)
+}
+
+/// Mouse interrupt: one byte of a 3- or 4-byte movement packet.
+pub fn mouse_irq() {
+    let b = unsafe { x86::inb(DATA) };
+    let mut m = MOUSE.lock();
+    if m.have == 0 && b & 0x08 == 0 {
+        return; // not the first byte of a packet: resynchronise
+    }
+    let i = m.have;
+    m.packet[i] = b;
+    m.have += 1;
+    if m.have < m.size {
+        return;
+    }
+    m.have = 0;
+    let p = m.packet;
+    if p[0] & 0xc0 != 0 {
+        return; // overflow
+    }
+    let dx = p[1] as i32 - (((p[0] as i32) << 4) & 0x100);
+    let dy = p[2] as i32 - (((p[0] as i32) << 3) & 0x100);
+    let wheel = if m.size == 4 {
+        (p[3] << 4) as i8 as i32 >> 4
+    } else {
+        0
+    };
+    let buttons = p[0] & 7;
+    let changed = buttons ^ m.buttons;
+    m.buttons = buttons;
+    drop(m);
+    crate::input::mouse(dx, dy, wheel, buttons, changed);
+}
+
+pub static MOUSE_PRESENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
