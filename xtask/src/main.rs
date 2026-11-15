@@ -312,6 +312,11 @@ fn qemu(img: &Path) -> Command {
         // No option ROM: the firmware would try to boot from the network.
         .args(["-netdev", "user,id=net0"])
         .args(["-device", "virtio-net-pci,netdev=net0,romfile="]);
+    // A QMP socket, for screendumps of what SegOS shows.
+    let qmp = qmp_socket();
+    let _ = std::fs::remove_file(&qmp);
+    cmd.arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp.display()));
     let rootfs = root().join("target/rootfs.img");
     if rootfs.exists() {
         cmd.arg("-drive")
@@ -331,6 +336,114 @@ fn qemu(img: &Path) -> Command {
         cmd.args(["-enable-kvm", "-cpu", "host"]);
     }
     cmd
+}
+
+fn qmp_socket() -> PathBuf {
+    root().join("target/qmp.sock")
+}
+
+/// Asks QEMU over QMP to write what the screen shows to `file` (a PPM).
+fn screendump(file: &Path) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Write};
+    let err = |e: std::io::Error| format!("QMP: {e}");
+    let sock = std::os::unix::net::UnixStream::connect(qmp_socket()).map_err(err)?;
+    sock.set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(err)?;
+    let mut w = sock.try_clone().map_err(err)?;
+    let mut r = BufReader::new(sock);
+    // Reads until the answer to the last command (skipping events).
+    let answer = |r: &mut BufReader<std::os::unix::net::UnixStream>| -> Result<String, String> {
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).map_err(err)? == 0 {
+                return Err("QMP: QEMU closed the socket".into());
+            }
+            if line.contains("\"return\"") || line.contains("\"QMP\"") {
+                return Ok(line);
+            }
+            if line.contains("\"error\"") {
+                return Err(format!("QMP: {}", line.trim()));
+            }
+        }
+    };
+    answer(&mut r)?; // the greeting
+    w.write_all(b"{\"execute\":\"qmp_capabilities\"}\n")
+        .map_err(err)?;
+    answer(&mut r)?;
+    let _ = std::fs::remove_file(file);
+    let path = file
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    w.write_all(
+        format!("{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":\"{path}\"}}}}\n")
+            .as_bytes(),
+    )
+    .map_err(err)?;
+    answer(&mut r)?;
+    Ok(())
+}
+
+/// A binary PPM (P6, maxval 255): (width, height, RGB bytes).
+fn parse_ppm(data: &[u8]) -> Result<(usize, usize, &[u8]), String> {
+    let mut at = 0;
+    let mut fields = Vec::new();
+    while fields.len() < 4 {
+        while at < data.len() && (data[at].is_ascii_whitespace() || data[at] == b'#') {
+            if data[at] == b'#' {
+                while at < data.len() && data[at] != b'\n' {
+                    at += 1;
+                }
+            } else {
+                at += 1;
+            }
+        }
+        let start = at;
+        while at < data.len() && !data[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if start == at {
+            return Err("truncated PPM header".into());
+        }
+        fields.push(String::from_utf8_lossy(&data[start..at]).into_owned());
+    }
+    at += 1; // the one whitespace byte before the pixels
+    let num = |s: &str| {
+        s.parse::<usize>()
+            .map_err(|_| format!("bad PPM field `{s}`"))
+    };
+    if fields[0] != "P6" || num(&fields[3])? != 255 {
+        return Err(format!("not a P6 PPM with maxval 255: {fields:?}"));
+    }
+    let (w, h) = (num(&fields[1])?, num(&fields[2])?);
+    let pixels = data
+        .get(at..at + w * h * 3)
+        .ok_or("PPM shorter than its size")?;
+    Ok((w, h, pixels))
+}
+
+/// A QMP screendump: (width, height) and the colour at each of `at`
+/// (x and y as fractions of the size).
+fn screen(at: &[(f64, f64)]) -> Result<(usize, usize, Vec<&'static str>), String> {
+    let file = root().join("target/screen.ppm");
+    screendump(&file)?;
+    let data = read(&file)?;
+    let (w, h, px) = parse_ppm(&data)?;
+    let colours = at
+        .iter()
+        .map(|&(fx, fy)| {
+            let (x, y) = ((w as f64 * fx) as usize, (h as f64 * fy) as usize);
+            let i = (y * w + x) * 3;
+            match [px[i], px[i + 1], px[i + 2]] {
+                [r, g, b] if r > 200 && g < 50 && b < 50 => "red",
+                [r, g, b] if g > 200 && r < 50 && b < 50 => "green",
+                [r, g, b] if b > 200 && r < 50 && g < 50 => "blue",
+                _ => "other",
+            }
+        })
+        .collect();
+    Ok((w, h, colours))
 }
 
 fn run(img: &Path, opts: &Opts) -> Result<(), String> {
@@ -516,6 +629,71 @@ fn shell_session(img: &Path) -> Result<(), String> {
         at = end;
         println!("xtask: shell session: `{cmd}` -> {want}");
     }
+    // Phase 7: a KMS program shows a red|blue frame (SETCRTC), then flips
+    // to a green one (PAGE_FLIP); QEMU's screen is checked in both states,
+    // and once more after it ends, when the console has the screen back.
+    let mut send = |cmd: &str| {
+        let _ = stdin.write_all(format!("{cmd}\n").as_bytes());
+        let _ = stdin.flush();
+    };
+    let check_screen = |what: &str, want: &[&str], child: &mut std::process::Child| {
+        // The kernel copies to the screen at once; give QEMU's display a moment.
+        std::thread::sleep(Duration::from_millis(500));
+        let points = [(0.25, 0.5), (0.5, 0.5), (0.75, 0.5)];
+        match screen(&points) {
+            Ok((w, h, got)) if got == want => {
+                println!("xtask: shell session: {what}: {w}x{h} screen is {got:?}");
+                Ok(())
+            }
+            Ok((w, h, got)) => fail(
+                format!(
+                    "{what}: the {w}x{h} screen is {got:?} (left, centre, right), not {want:?}"
+                ),
+                child,
+            ),
+            Err(e) => fail(format!("{what}: screendump: {e}"), child),
+        }
+    };
+    let cmd = "drmtest --pause &";
+    send(cmd);
+    let Some(end) = wait_for("DRMTEST-SHOWN", at, 60) else {
+        return fail(format!("`{cmd}` did not print `DRMTEST-SHOWN`"), &mut child);
+    };
+    let log = text();
+    for line in log[at..end].lines() {
+        if let Some(i) = line.find("drm: ").or_else(|| line.find("evdev: ")) {
+            println!("xtask: shell session:   {}", line[i..].trim_end());
+        }
+    }
+    at = end;
+    println!("xtask: shell session: `{cmd}` -> DRMTEST-SHOWN");
+    // The centre column is the first of the right half.
+    check_screen("SETCRTC", &["red", "blue", "blue"], &mut child)?;
+    let cmd = "kill -USR1 %1";
+    send(cmd);
+    let Some(end) = wait_for("DRMTEST-OK ", at, 60) else {
+        return fail(format!("`{cmd}` did not print `DRMTEST-OK`"), &mut child);
+    };
+    let log = text();
+    for line in log[at..end].lines() {
+        if let Some(i) = line.find("drm: ") {
+            println!("xtask: shell session:   {}", line[i..].trim_end());
+        }
+    }
+    at = end;
+    let size: String = log[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    println!("xtask: shell session: `{cmd}` -> DRMTEST-OK {size}");
+    check_screen("PAGE_FLIP", &["green", "green", "green"], &mut child)?;
+    let cmd = "kill %1; wait; echo KILLED-$((40 + 2))";
+    send(cmd);
+    if wait_for("KILLED-42", at, 60).is_none() {
+        return fail(format!("`{cmd}` did not print `KILLED-42`"), &mut child);
+    }
+    println!("xtask: shell session: `{cmd}` -> KILLED-42");
+    check_screen("console", &["other", "other", "other"], &mut child)?;
     let _ = stdin.write_all(b"poweroff -f\n");
     let _ = stdin.flush();
     let start = std::time::Instant::now();

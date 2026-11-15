@@ -4,6 +4,8 @@
 //! - BusyBox: Ubuntu's statically linked `busybox-static`, unmodified, with
 //!   a symbolic link for each of its applets (`/bin/sh`, `/bin/ls`, ...).
 //! - `userland/hello/hello.c`: the Phase 2 demo, `/usr/bin/hello`.
+//! - `userland/drm/drmtest.c`: a KMS and evdev check, `/usr/bin/drmtest`
+//!   (`cargo xtask test` runs it and checks the screen).
 //! - `userland/tests/`: conformance tests. `NAME.c` programs (built with
 //!   musl-gcc) and `NAME.sh` scripts (run by BusyBox's sh), each with a
 //!   `NAME.expected` file holding exactly what it prints on Linux.
@@ -180,6 +182,14 @@ pub fn build() -> Result<Userland, String> {
     programs.push(Program {
         path: "usr/bin/hello".into(),
         file: hello,
+        expected: None,
+        script: false,
+    });
+    let drmtest = out.join("drmtest");
+    compile(&src.join("drm/drmtest.c"), &drmtest)?;
+    programs.push(Program {
+        path: "usr/bin/drmtest".into(),
+        file: drmtest,
         expected: None,
         script: false,
     });
