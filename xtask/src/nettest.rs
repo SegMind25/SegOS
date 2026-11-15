@@ -210,27 +210,20 @@ pub fn start() -> Result<Servers, String> {
     );
     // sshd insists on its privilege separation directory, even unprivileged.
     let _ = std::fs::create_dir_all("/run/sshd");
+    // Its own configuration: the system's may not be readable unprivileged.
+    let config = format!(
+        "Port {SSH_PORT}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\n\
+         StrictModes no\nUsePAM no\nPidFile none\nPasswordAuthentication no\n\
+         KbdInteractiveAuthentication no\nPermitRootLogin yes\n",
+        d.join("hostkey").display(),
+        d.join("authorized_keys").display()
+    );
+    write(&d.join("sshd_config"), config.as_bytes(), 0o600)?;
     let log = std::fs::File::create(d.join("sshd.log")).map_err(|e| e.to_string())?;
     s.children.push(
         Command::new(sshd().unwrap())
-            .args(["-D", "-e", "-p", &SSH_PORT.to_string()])
-            .args(["-o", "ListenAddress=127.0.0.1", "-o", "StrictModes=no"])
-            .args([
-                "-o",
-                "UsePAM=no",
-                "-o",
-                "PidFile=none",
-                "-o",
-                "PermitRootLogin=yes",
-            ])
-            .args(["-o", "PasswordAuthentication=no"])
-            .arg("-h")
-            .arg(d.join("hostkey"))
-            .arg("-o")
-            .arg(format!(
-                "AuthorizedKeysFile={}",
-                d.join("authorized_keys").display()
-            ))
+            .args(["-D", "-e", "-f"])
+            .arg(d.join("sshd_config"))
             .stdout(Stdio::null())
             .stderr(log)
             .spawn()
