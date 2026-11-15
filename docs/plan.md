@@ -9,7 +9,7 @@ Threads, futexes, epoll, eventfd, timerfd and signalfd are in. Six
 conformance tests print byte for byte what they print on Linux; 26 kernel
 tests pass in QEMU on 4 CPUs (debug and release); CI types commands into
 the shell, bash, python3 and gcc over the serial port. No third-party
-crates. Next: Phase 7, graphics and input.
+crates. Next: Phase 8, desktop applications.
 
 ## 1. The goal, stated precisely
 
@@ -367,14 +367,38 @@ user network (10.0.2.2, `segos-host` in `/etc/hosts`).
 Not yet: IPv6, IP fragments, window scaling and SACK, congestion
 control, an e1000 driver for real PCs.
 
-## 13. Next concrete steps (Phase 7: graphics and input)
+## 13. Phase 7, as built
 
-The demo: a Wayland compositor and desktop shell run on SegOS.
+The demo: Ubuntu's unmodified weston 13 (DRM backend, pixman renderer)
+runs on SegOS with kiosk and desktop shells; `weston-simple-shm` draws in
+it; keyboard and mouse work through libinput. `cargo xtask test` checks
+it on QEMU's screen (QMP screendumps): the client's picture, Esc
+reaching the client, and the console back after weston exits.
 
-1. **virtio-gpu** with a DRM/KMS interface (dumb buffers, mode setting,
-   page flips), then simple-framebuffer on real PCs.
-2. **Input**: evdev devices for the PS/2 keyboard and mouse, then xHCI
-   and USB HID.
-3. **Memory sharing**: `memfd_create`, `SCM_RIGHTS` of buffers, dma-buf.
-4. **Tests**: a client drawing into a dumb buffer, checked by reading
-   the framebuffer back.
+- **DRM/KMS** (`drm.rs`), as Linux's simpledrm: `/dev/dri/card0` on the
+  firmware framebuffer, one CRTC, primary plane, encoder and connector;
+  dumb buffers mapped with `mmap`, ADDFB/ADDFB2, SETCRTC, PAGE_FLIP with
+  events, DIRTYFB. The console steps aside while a program shows a
+  picture. `userland/drm/drmtest.c` checks it pixel by pixel.
+- **Input** (`input.rs`): evdev `/dev/input/event0` (keyboard, Linux key
+  codes) and `event1` (a new PS/2 mouse driver with wheel), the evdev
+  ioctls, EVIOCGRAB; terminal KD/VT ioctls (graphics mode, keyboard off).
+- **What weston, libudev and libinput needed**: `/sys` laid out as udev
+  expects (class and dev links, `uevent`, `subsystem`), the udev database
+  in `/run/udev/data`, tmpfs on `/run`, `memfd_create` with seals,
+  `mremap` (grow, shrink, move; wl_shm pools), `flock`, `fallocate`,
+  `O_PATH` on symbolic links, `statx` mount ids, SYSFS_MAGIC.
+
+Not yet: GPU acceleration (virtio-gpu, then AMD/Intel), atomic KMS,
+hardware cursors, USB (xHCI) keyboards and mice, dma-buf.
+
+## 14. Next concrete steps (Phase 8: desktop applications)
+
+The demo: Firefox and Chromium run on the Wayland desktop.
+
+1. **GPU**: virtio-gpu with 3D (virgl) or a Mesa software path (llvmpipe)
+   over shared memory; atomic KMS.
+2. **What browsers need**: seccomp-BPF, user and PID namespaces (the
+   Chromium sandbox), `inotify`, `/dev/shm`, fontconfig, D-Bus.
+3. **Sound**: virtio-snd or Intel HDA behind an ALSA interface.
+4. **USB**: xHCI with HID keyboards and mice, for real PCs.

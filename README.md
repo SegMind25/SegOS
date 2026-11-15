@@ -4,7 +4,7 @@ An operating system written from scratch in Rust, aiming to run **unmodified
 Linux applications** (and, through Wine/Proton, Windows ones) by implementing
 the Linux system call interface in a new kernel.
 
-Status: **Phase 6 (networking) done**. SegOS boots on UEFI with
+Status: **Phase 7 (graphics and input) done**. SegOS boots on UEFI with
 its own bootloader, finds its disks (virtio, NVMe and SATA drivers,
 interrupt-driven) and boots from a read-write **ext4 root file system**.
 On it, **unmodified Linux programs** run as Ubuntu builds them,
@@ -15,8 +15,10 @@ signals, pipes, mounts, FAT32, a block cache and a page cache. And it is
 **on the network**: its own TCP/IP stack in Rust (virtio-net, ARP, IPv4,
 ICMP, UDP, TCP, DHCP, netlink), so Ubuntu's `curl` fetches pages over
 **HTTPS** and `ssh` logs in to another machine. Eight conformance tests
-print byte for byte what they print on Linux. Next is Phase 7: graphics
-and input.
+print byte for byte what they print on Linux. And it has **a desktop**:
+Ubuntu's unmodified Wayland compositor, **weston**, runs on SegOS's own
+DRM/KMS device with keyboard and mouse through evdev and libinput, and
+shows Wayland clients. Next is Phase 8: desktop applications.
 
 The operating system itself is all in this repository: the bootloader, the
 kernel and the build tool use no third-party crates, only Rust's `core`,
@@ -204,7 +206,7 @@ flowchart TB
     end
     subgraph D["Desktop and games"]
         direction LR
-        P7["7 · Graphics, input<br/>a desktop"]:::next --> P8["8 · Desktop apps<br/>Firefox, Chromium"] --> P9["9 · Games<br/>Wine/Proton, Steam"] --> P10["10 · Release<br/>installer, updates"]
+        P7["7 · Graphics, input<br/>a desktop"]:::done -->  P8["8 · Desktop apps<br/>Firefox, Chromium"]:::next --> P9["9 · Games<br/>Wine/Proton, Steam"] --> P10["10 · Release<br/>installer, updates"]
     end
     F --> L --> D
     classDef done fill:#1f6f43,stroke:#2ea043,color:#fff

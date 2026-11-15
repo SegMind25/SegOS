@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Roadmap: SegOS</title>
-  <meta name="description" content="The SegOS roadmap: 11 phases from kernel bring-up to running Steam and Proton games on a from-scratch Rust kernel that implements the Linux ABI. Phases 0 to 6 are done: unmodified bash, Python, gcc, curl over HTTPS and ssh run on SegOS. Phase 7, graphics and input, is next.">
+  <meta name="description" content="The SegOS roadmap: 11 phases from kernel bring-up to running Steam and Proton games on a from-scratch Rust kernel that implements the Linux ABI. Phases 0 to 7 are done: unmodified bash, Python, gcc, curl, ssh and the weston Wayland desktop run on SegOS. Phase 8, desktop apps, is next.">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f7f5f1" media="(prefers-color-scheme: light)">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="SegOS">
   <meta property="og:title" content="SegOS roadmap: from bring-up to Steam">
-  <meta property="og:description" content="11 phases, each ending in a working demo. Phases 0 to 6 done: bring-up to real disks, the full Linux userland and networking (curl https, ssh). Phase 7, graphics, next.">
+  <meta property="og:description" content="11 phases, each ending in a working demo. Phases 0 to 7 done: bring-up to a Wayland desktop (weston) with networking and the full Linux userland. Phase 8, desktop apps, next.">
   <meta property="og:image" content="/assets/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -51,10 +51,10 @@
         </p>
       </section>
 
-      <div class="progress" role="img" aria-label="Progress: phases 0 to 6 done, phase 7 next, phases 8 to 10 planned">
-        <span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="wip"></span><span></span><span></span><span></span>
+      <div class="progress" role="img" aria-label="Progress: phases 0 to 7 done, phase 8 next, phases 9 to 10 planned">
+        <span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="wip"></span><span></span><span></span>
       </div>
-      <p class="progress-legend">Phases 0&ndash;6 done &middot; Phase 7 next &middot; Phases 8&ndash;10 planned</p>
+      <p class="progress-legend">Phases 0&ndash;7 done &middot; Phase 8 next &middot; Phases 9&ndash;10 planned</p>
 
       <div class="table-wrap">
         <table class="phases">
@@ -118,19 +118,19 @@
               <td data-label="Effort" class="effort">2&ndash;3 months</td>
               <td class="status"><span class="badge done">Done</span></td>
             </tr>
-            <tr class="is-wip">
+            <tr>
               <th scope="row"><span class="num">7</span> Graphics and input</th>
               <td data-label="What gets built">DRM/KMS on virtio-gpu (then simple-framebuffer, then AMD/Intel), evdev, xHCI + USB HID, <code>memfd</code>, dma-buf</td>
               <td data-label="Done when">SegLinux&rsquo;s Rust compositor and shell run unchanged on SegOS</td>
               <td data-label="Effort" class="effort">4&ndash;6 months</td>
-              <td class="status"><span class="badge wip">Next</span></td>
+              <td class="status"><span class="badge done">Done</span></td>
             </tr>
             <tr>
               <th scope="row"><span class="num">8</span> Desktop apps</th>
               <td data-label="What gets built">Sound (virtio-snd, Intel HDA &rarr; ALSA interface), <code>inotify</code>, <code>fanotify</code>, seccomp, namespaces (for Flatpak/Chromium sandbox), <code>io_uring</code> subset</td>
               <td data-label="Done when">Firefox, Chromium, LibreOffice, Discord run</td>
               <td data-label="Effort" class="effort">6+ months</td>
-              <td class="status"><span class="badge planned">Planned</span></td>
+              <td class="status"><span class="badge wip">Next</span></td>
             </tr>
             <tr>
               <th scope="row"><span class="num">9</span> Games</th>

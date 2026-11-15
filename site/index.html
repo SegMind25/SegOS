@@ -10,7 +10,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="SegOS">
   <meta property="og:title" content="SegOS: a from-scratch OS in Rust that speaks Linux">
-  <meta property="og:description" content="A new kernel in Rust that implements the Linux syscall ABI, so unmodified Linux apps (and Windows apps via Wine/Proton) can run on it. Phases 0 to 6 done: unmodified bash, Python, gcc, curl (HTTPS) and ssh run on it.">
+  <meta property="og:description" content="A new kernel in Rust that implements the Linux syscall ABI, so unmodified Linux apps (and Windows apps via Wine/Proton) can run on it. Phases 0 to 7 done: unmodified bash, Python, gcc, curl, ssh and the weston Wayland desktop run on it.">
   <meta property="og:image" content="/assets/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -153,7 +153,7 @@
         <div class="section-head">
           <p class="kicker">Status</p>
           <h2 id="status-title">Where it is right now</h2>
-          <p>Each phase ends with a demo that has to work in QEMU and in CI. Phases 0 to 6 have passed; Phase 7, graphics and input, is next.</p>
+          <p>Each phase ends with a demo that has to work in QEMU and in CI. Phases 0 to 7 have passed; Phase 8, desktop applications, is next.</p>
         </div>
         <div class="grid">
           <div class="panel">
@@ -219,13 +219,21 @@
             </ul>
           </div>
           <div class="panel">
-            <h3>Phase 7 &middot; Graphics and input <span class="badge wip">Next</span></h3>
-            <ul class="checklist">
-              <li>DRM/KMS on virtio-gpu, then real GPUs</li>
-              <li>evdev input, USB (xHCI) keyboards and mice</li>
-              <li><code>memfd</code>, dma-buf</li>
+            <h3>Phase 7 &middot; Graphics and input <span class="badge done">Done</span></h3>
+            <ul class="checklist done">
+              <li>Ubuntu&rsquo;s weston (Wayland) runs, kiosk and desktop shells, with clients</li>
+              <li>DRM/KMS on the firmware framebuffer: dumb buffers, page flips</li>
+              <li>evdev keyboard and PS/2 mouse, found by libudev and libinput</li>
+              <li><code>memfd</code>, <code>mremap</code>, <code>flock</code>, a udev-shaped <code>/sys</code></li>
             </ul>
-            <p class="notice"><span>Done when a Wayland compositor and desktop shell run.</span></p>
+          </div>
+          <div class="panel">
+            <h3>Phase 8 &middot; Desktop apps <span class="badge wip">Next</span></h3>
+            <ul class="checklist">
+              <li>Sound, <code>inotify</code>, seccomp, namespaces</li>
+              <li>GPU drivers (virtio-gpu, then AMD/Intel)</li>
+            </ul>
+            <p class="notice"><span>Done when Firefox and Chromium run.</span></p>
           </div>
         </div>
         <p style="margin-top:1.5rem"><a href="/roadmap">All 11 phases, from bring-up to Steam &rarr;</a></p>
