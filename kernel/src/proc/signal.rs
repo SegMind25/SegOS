@@ -47,6 +47,7 @@ pub mod signo {
     pub const SIGTTOU: i32 = 22;
     pub const SIGURG: i32 = 23;
     pub const SIGWINCH: i32 = 28;
+    pub const SIGSYS: i32 = 31;
 }
 use signo::*;
 
@@ -112,6 +113,8 @@ fn ignored(sig: i32, act: &SigAction) -> bool {
 /// What `siginfo_t` says about a signal (128 bytes in user memory).
 #[derive(Clone, Copy, Default)]
 pub struct SigInfo {
+    /// si_errno (SIGSYS from seccomp: the filter's data).
+    pub errno: i32,
     pub code: i32,
     /// The first union words: si_pid/si_uid, or si_addr.
     pub a: u64,
@@ -129,6 +132,7 @@ impl SigInfo {
 
     pub fn user(sender: u32) -> Self {
         Self {
+            errno: 0,
             code: Self::SI_USER,
             a: sender as u64,
             b: 0,
@@ -137,6 +141,7 @@ impl SigInfo {
 
     pub fn tkill(sender: u32) -> Self {
         Self {
+            errno: 0,
             code: Self::SI_TKILL,
             a: sender as u64,
             b: 0,
@@ -145,6 +150,7 @@ impl SigInfo {
 
     pub fn kernel() -> Self {
         Self {
+            errno: 0,
             code: Self::SI_KERNEL,
             a: 0,
             b: 0,
@@ -154,6 +160,7 @@ impl SigInfo {
     /// A fault at `addr` (SIGSEGV, SIGBUS...), with its si_code.
     pub fn fault(code: i32, addr: u64) -> Self {
         Self {
+            errno: 0,
             code,
             a: addr,
             b: 0,
@@ -167,6 +174,7 @@ impl SigInfo {
             (Self::CLD_KILLED, status & 0x7f)
         };
         Self {
+            errno: 0,
             code,
             a: p.pid as u64,
             b: value as u64,
@@ -175,15 +183,31 @@ impl SigInfo {
 
     pub fn child_stopped(p: &Process, sig: i32) -> Self {
         Self {
+            errno: 0,
             code: Self::CLD_STOPPED,
             a: p.pid as u64,
             b: sig as u64,
         }
     }
 
+    /// SIGSYS from a seccomp filter's `SECCOMP_RET_TRAP`: the system call
+    /// `nr` made at `ip` (the address after the instruction), `data`
+    /// from the filter.
+    pub fn seccomp(ip: u64, nr: u64, data: i32) -> Self {
+        const SYS_SECCOMP: i32 = 1;
+        const AUDIT_ARCH_X86_64: u64 = 0xc000_003e;
+        Self {
+            errno: data,
+            code: SYS_SECCOMP,
+            a: ip,
+            b: (nr & 0xffff_ffff) | AUDIT_ARCH_X86_64 << 32,
+        }
+    }
+
     pub fn to_bytes(self, sig: i32) -> [u8; 128] {
         let mut b = [0u8; 128];
         b[0..4].copy_from_slice(&sig.to_le_bytes());
+        b[4..8].copy_from_slice(&self.errno.to_le_bytes());
         b[8..12].copy_from_slice(&self.code.to_le_bytes());
         b[16..24].copy_from_slice(&self.a.to_le_bytes());
         b[24..32].copy_from_slice(&self.b.to_le_bytes());

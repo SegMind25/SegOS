@@ -194,17 +194,21 @@ pub fn inotify_init(ctx: &Ctx, flags: u32) -> KResult<u64> {
     install(ctx, Inotify::create(), O_RDONLY, flags)
 }
 
-pub fn inotify_add_watch(ctx: &Ctx, fd: i32, path: u64, _mask: u32) -> KResult<u64> {
+pub fn inotify_add_watch(ctx: &Ctx, fd: i32, path: u64, mask: u32) -> KResult<u64> {
     let f = file(ctx, fd)?;
     let ino = object::<Inotify>(&f)?;
     let path = super::path_arg(ctx, path)?;
     let cwd = ctx.process().cwd.lock().clone();
-    fs::lookup(&cwd, &path)?;
-    Ok(ino.next_wd.fetch_add(1, Ordering::Relaxed))
+    let target = if mask & event::in_mask::IN_DONT_FOLLOW != 0 {
+        fs::lookup_nofollow(&cwd, &path)?
+    } else {
+        fs::lookup(&cwd, &path)?
+    };
+    Ok(ino.add_watch(&target, mask)? as u64)
 }
 
-pub fn inotify_rm_watch(ctx: &Ctx, fd: i32, _wd: i32) -> KResult<u64> {
+pub fn inotify_rm_watch(ctx: &Ctx, fd: i32, wd: i32) -> KResult<u64> {
     let f = file(ctx, fd)?;
-    object::<Inotify>(&f)?;
+    object::<Inotify>(&f)?.rm_watch(wd)?;
     Ok(0)
 }

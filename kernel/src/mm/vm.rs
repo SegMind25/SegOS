@@ -45,7 +45,8 @@ pub enum Kind {
     /// Anonymous `mmap`.
     Anon,
     /// `MAP_SHARED`: page-cache pages of a file, or shared anonymous
-    /// memory; `fork` shares them instead of copying.
+    /// memory; `fork` shares them instead of copying. (A private file
+    /// mapping is `Anon` with a `file`.)
     Shared,
 }
 
@@ -56,9 +57,10 @@ pub struct Vma {
     /// PROT_* bits.
     pub prot: u32,
     pub kind: Kind,
-    /// A shared file mapping's file, and the file offset at `start` (for
-    /// `mremap` to map more of it).
+    /// A file mapping's file, and the file offset at `start`.
     pub file: Option<(Arc<dyn crate::fs::Inode>, u64)>,
+    /// The mapped file's path when it was opened (for /proc/<pid>/maps).
+    pub path: Option<Arc<str>>,
 }
 
 impl Vma {
@@ -253,6 +255,7 @@ impl AddressSpace {
                 prot,
                 kind,
                 file: None,
+                path: None,
             },
         );
         Ok(())
@@ -266,11 +269,19 @@ impl AddressSpace {
             .ok_or(Errno::ENOMEM)
     }
 
-    /// Records the file a shared mapping at `start` (just made by `map`)
-    /// shows, from file offset `off`.
-    pub fn set_file(&self, start: u64, file: Arc<dyn crate::fs::Inode>, off: u64) {
+    /// Records the file a mapping at `start` (just made by `map`) shows,
+    /// from file offset `off`: a shared mapping's pages are the file's
+    /// page-cache pages; a private one's are faulted in from them.
+    pub fn set_file(
+        &self,
+        start: u64,
+        file: Arc<dyn crate::fs::Inode>,
+        off: u64,
+        path: Option<Arc<str>>,
+    ) {
         if let Some(v) = self.inner.lock().vmas.get_mut(&start) {
             v.file = Some((file, off));
+            v.path = path;
         }
     }
 
@@ -307,9 +318,11 @@ impl AddressSpace {
         if vma.end < old_end {
             return Err(Errno::EFAULT);
         }
+        // (A private file mapping's new pages fault in from the file.)
         let tail_file = |start: u64| {
             vma.file
                 .clone()
+                .filter(|_| vma.kind == Kind::Shared)
                 .map(|(f, off)| (start + old_len, f, off + (old - vma.start) + old_len))
         };
         let new_end = old + new_len;
@@ -432,6 +445,7 @@ impl AddressSpace {
                             prot: PROT_READ | PROT_WRITE,
                             kind: Kind::Heap,
                             file: None,
+                            path: None,
                         },
                     );
                 }
@@ -467,6 +481,43 @@ impl AddressSpace {
                 return Self::break_cow(pml4, page, e, vma.page_flags());
             }
             return Ok(paging::entry_phys(e));
+        }
+        // A private file mapping shows the file's page-cache page,
+        // copy-on-write; the first write (or a write fault) copies it.
+        if vma.kind != Kind::Shared
+            && let Some((file, off)) = &vma.file
+        {
+            let pos = off + (page - vma.start);
+            if pos < file.size() {
+                // (`page` takes a reference: this mapping's, or ours to
+                // drop after copying.)
+                let cached = crate::fs::pagecache::get(file).page(pos / PAGE_SIZE)?;
+                if !write {
+                    let fl = (vma.page_flags() & !flags::WRITABLE) | flags::COW;
+                    if paging::map_user(pml4, page, cached, fl).is_err() {
+                        frame::free(cached);
+                        return Err(Errno::ENOMEM);
+                    }
+                    return Ok(cached);
+                }
+                let Some(phys) = frame::alloc_zeroed() else {
+                    frame::free(cached);
+                    return Err(Errno::ENOMEM);
+                };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        phys_to_virt(cached),
+                        phys_to_virt(phys),
+                        PAGE_SIZE as usize,
+                    )
+                };
+                frame::free(cached);
+                if paging::map_user(pml4, page, phys, vma.page_flags()).is_err() {
+                    frame::free(phys);
+                    return Err(Errno::ENOMEM);
+                }
+                return Ok(phys);
+            }
         }
         let phys = frame::alloc_zeroed().ok_or(Errno::ENOMEM)?;
         if paging::map_user(pml4, page, phys, vma.page_flags()).is_err() {

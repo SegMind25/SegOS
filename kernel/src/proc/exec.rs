@@ -27,6 +27,8 @@ pub struct Prepared {
     /// on Linux: `execve("/proc/self/exe")` makes a process named "exe").
     pub invoked: String,
     pub argv: Vec<String>,
+    /// `SEGOS_STRACE` from the environment (see `Process::trace`).
+    pub trace: Option<u32>,
 }
 
 /// Interpreters may themselves be scripts this many times (Linux: 4).
@@ -120,6 +122,10 @@ pub fn prepare(
             exe: canonical,
             invoked: execfn,
             argv,
+            trace: envp
+                .iter()
+                .find_map(|e| e.strip_prefix("SEGOS_STRACE="))
+                .and_then(|v| v.parse().ok()),
         });
     }
     Err(Errno::ELOOP)
@@ -133,6 +139,9 @@ pub fn set_identity(p: &Process, img: &Prepared) {
     *p.name.lock() = name;
     *p.exe.lock() = img.exe.clone();
     *p.cmdline.lock() = img.argv.clone();
+    if let Some(t) = img.trace {
+        p.trace.store(t, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// `execve` for the calling thread: on success the thread returns to user

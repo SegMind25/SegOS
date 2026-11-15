@@ -6,7 +6,6 @@ use crate::abi::{Errno, KResult};
 use crate::fs::FileType;
 use crate::mm::PAGE_SIZE;
 use crate::mm::vm::{Kind, MMAP_MIN, USER_END};
-use alloc::vec;
 use alloc::vec::Vec;
 
 const MAP_TYPE: u32 = 0x0f;
@@ -134,11 +133,21 @@ fn map_shared(
             }
             Some(f) => {
                 let cache = crate::fs::pagecache::get(&f.inode);
-                for i in 0..pages {
-                    frames.push(cache.page(off / PAGE_SIZE + i)?);
+                if prot & PROT_WRITE != 0 {
+                    cache.mark_writable();
                 }
-                mm.set_file(start, f.inode.clone(), off);
-                mm.map_shared(start, &frames)
+                // `page` hands out a reference each; the mappings take
+                // their own.
+                let r = (0..pages)
+                    .try_for_each(|i| cache.page(off / PAGE_SIZE + i).map(|p| frames.push(p)))
+                    .and_then(|()| {
+                        mm.set_file(start, f.inode.clone(), off, f.path());
+                        mm.map_shared(start, &frames)
+                    });
+                for &p in &frames {
+                    crate::mm::frame::free(p);
+                }
+                r
             }
             None => {
                 for _ in 0..pages {
@@ -160,19 +169,17 @@ fn map_shared(
     Ok(start)
 }
 
-/// Copies a file's contents into a fresh private mapping. (Read now, not
-/// on fault: tmpfs files are in memory already. Demand paging from the
-/// page cache comes with real disks.)
-fn fill(ctx: &Ctx, start: u64, len: u64, file: Option<&crate::fs::File>, off: u64) -> KResult<u64> {
-    let Some(f) = file else {
-        return Ok(start);
-    };
-    let size = f.inode.size();
-    if off < size {
-        let n = (size - off).min(len) as usize;
-        let mut buf = vec![0u8; n];
-        let got = f.inode.read_at(off, &mut buf)?;
-        ctx.mm().fill(start, &buf[..got])?;
+/// A fresh private mapping of a file: its pages fault in from the file's
+/// page cache, shared copy-on-write until written.
+fn fill(
+    ctx: &Ctx,
+    start: u64,
+    _len: u64,
+    file: Option<&crate::fs::File>,
+    off: u64,
+) -> KResult<u64> {
+    if let Some(f) = file {
+        ctx.mm().set_file(start, f.inode.clone(), off, f.path());
     }
     Ok(start)
 }
@@ -218,11 +225,15 @@ pub fn mremap(ctx: &Ctx, old: u64, old_len: u64, new_len: u64, flags: u32) -> KR
     if let Some((start, inode, off)) = tail {
         let end = addr + new_len.next_multiple_of(PAGE_SIZE);
         let cache = crate::fs::pagecache::get(&inode);
+        cache.mark_writable();
         let mut frames = Vec::new();
-        for i in 0..(end - start) / PAGE_SIZE {
-            frames.push(cache.page(off / PAGE_SIZE + i)?);
+        let r = (0..(end - start) / PAGE_SIZE)
+            .try_for_each(|i| cache.page(off / PAGE_SIZE + i).map(|p| frames.push(p)))
+            .and_then(|()| mm.map_shared(start, &frames));
+        for &p in &frames {
+            crate::mm::frame::free(p);
         }
-        mm.map_shared(start, &frames)?;
+        r?;
     }
     Ok(addr)
 }

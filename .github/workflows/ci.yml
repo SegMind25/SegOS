@@ -13,12 +13,19 @@ jobs:
       # musl-gcc, exactly as a Linux user would build them. (xtask also
       # fetches Ubuntu's busybox-static with apt-get download.)
       - name: Install QEMU, OVMF and musl
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf musl-tools e2fsprogs openssh-client openssh-server weston xkb-data fonts-dejavu-core && sudo mkdir -p /run/sshd
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf musl-tools e2fsprogs openssh-client openssh-server weston xkb-data fonts-dejavu-core libgtk-3-0t64 libasound2t64 libx11-xcb1 adwaita-icon-theme librsvg2-common shared-mime-info gsettings-desktop-schemas xz-utils && sudo mkdir -p /run/sshd
       - name: Allow KVM (faster QEMU)
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      # Mozilla's Firefox release, which xtask downloads into target/firefox
+      # (firefox.rs pins the version).
+      - name: Cache the Firefox download
+        uses: actions/cache@v4
+        with:
+          path: target/firefox/*.tar.xz
+          key: firefox-${{ hashFiles('xtask/src/firefox.rs') }}
       - name: Rust toolchain (from rust-toolchain.toml)
         run: rustup show
       - name: Format

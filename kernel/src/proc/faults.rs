@@ -50,6 +50,33 @@ pub fn user_exception(frame: &mut TrapFrame) {
         act.handler > signal::SIG_IGN
             && u.sig.mask.load(core::sync::atomic::Ordering::Relaxed) & (1 << (sig - 1)) == 0
     };
+    if handled && sig == signo::SIGSEGV {
+        static SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if SHOWN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 20 {
+            let place = u
+                .mm()
+                .regions()
+                .into_iter()
+                .find(|v| v.start <= frame.rip && frame.rip < v.end)
+                .and_then(|v| {
+                    v.file.map(|(_, off)| {
+                        alloc::format!(
+                            " ({}+{:#x})",
+                            v.path.as_deref().unwrap_or("?"),
+                            frame.rip - v.start + off
+                        )
+                    })
+                })
+                .unwrap_or_default();
+            crate::debug!(
+                "{}[{}]: SIGSEGV (handled) at rip {:#x}{place}, address {cr2:#x}, error {:#x}",
+                p.name.lock().as_str(),
+                p.pid,
+                frame.rip,
+                frame.error_code
+            );
+        }
+    }
     if !handled {
         crate::info!(
             "{}[{}]: {} at rip {:#x}{} (vector {}, error {:#x}): killed by signal {}",

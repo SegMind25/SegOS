@@ -127,4 +127,26 @@ ok   inotify_add_watch(fd, "/proc", IN_CREATE) >= 1
 ok   inotify_add_watch(fd, "/no/such/dir", IN_CREATE) == -1 && errno == ENOENT
 ok   read(fd, buf, sizeof buf) == -1 && errno == EAGAIN
 ok   revents(fd, POLLIN) == 0
+ok   mkdtemp(dir) != NULL
+ok   wd >= 2
+ok   inotify_add_watch(fd, dir, IN_DELETE | IN_MASK_CREATE) == -1 && errno == EEXIST
+ok   inotify_add_watch(fd, dir, IN_ACCESS | IN_MASK_ADD) == wd
+ok   f >= 0 && write(f, "x", 1) == 1 && close(f) == 0
+ok   rename(path, path2) == 0 && chmod(path2, 0600) == 0
+ok   mkdir(path, 0755) == 0 && rmdir(path) == 0
+ok   ioctl(fd, FIONREAD, &n) == 0 && n > 0
+ok   revents(fd, POLLIN) == POLLIN
+ok   inotify_events(fd, events, sizeof events) == n
+     2:100:a 2:2:a 2:8:a 2:40*:a 2:80=:b 2:4:b 2:40000100:sub 2:40000200:sub
+ok   inotify_add_watch(fd, path2, IN_MODIFY | IN_ONLYDIR) == -1 && errno == ENOTDIR
+ok   wd2 == wd + 1
+ok   f >= 0 && write(f, "y", 1) == 1 && close(f) == 0
+ok   unlink(path2) == 0
+ok   inotify_events(fd, events, sizeof events) > 0
+     2:2:b 3:2: 2:8:b 3:400: 3:8000: 2:200:b
+ok   inotify_rm_watch(fd, wd2) == -1 && errno == EINVAL
+ok   inotify_rm_watch(fd, wd) == 0
+ok   inotify_events(fd, events, sizeof events) > 0
+     2:8000:
+ok   rmdir(dir) == 0
 PASSED

@@ -5,6 +5,8 @@ use crate::abi::open::*;
 use crate::abi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, Errno, Iovec, KResult,
 };
+use crate::fs::event;
+use crate::fs::event::in_mask::*;
 use crate::fs::{self, File, FileType, Inode, poll as pollbits};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -22,6 +24,43 @@ fn file(ctx: &Ctx, fd: i32) -> KResult<Arc<File>> {
     ctx.process().files.lock().get(fd)
 }
 
+/// The directory entry (directory, name) that is `inode`, found from
+/// `path` (as given, from `dirfd`), if it still is.
+fn entry_of(
+    ctx: &Ctx,
+    dirfd: i32,
+    path: &str,
+    inode: &Arc<dyn Inode>,
+) -> Option<(Arc<dyn Inode>, alloc::string::String)> {
+    let base = dir_of(ctx, dirfd, path).ok()?;
+    let (dir, name) = fs::lookup_parent(&base, path).ok()?;
+    let found = dir.lookup(&name).ok()?;
+    (found.dev() == inode.dev() && found.ino() == inode.ino()).then_some((dir, name))
+}
+
+/// inotify: `mask` about `inode`, for the watches on it and on the
+/// directory `path` (from `dirfd`) shows it in.
+fn notify_path(ctx: &Ctx, dirfd: i32, path: &str, inode: &Arc<dyn Inode>, mask: u32) {
+    if !event::watching() {
+        return;
+    }
+    let entry = entry_of(ctx, dirfd, path, inode);
+    let dir = entry.as_ref().map(|(d, n)| (d, n.as_str()));
+    event::notify(Some(inode), dir, mask, 0, false);
+}
+
+/// inotify: `mask` about the file open as `f` (its directory found by the
+/// path it was opened by).
+fn notify_file(ctx: &Ctx, f: &File, mask: u32) {
+    if !event::watching() || f.inode.anon_name().is_some() {
+        return;
+    }
+    match f.path() {
+        Some(p) => notify_path(ctx, AT_FDCWD, &p, &f.inode, mask),
+        None => event::notify(Some(&f.inode), None, mask, 0, false),
+    }
+}
+
 pub fn read(ctx: &Ctx, fd: i32, buf: u64, count: u64) -> KResult<u64> {
     let f = file(ctx, fd)?;
     if f.inode.file_type() == FileType::Directory {
@@ -30,6 +69,9 @@ pub fn read(ctx: &Ctx, fd: i32, buf: u64, count: u64) -> KResult<u64> {
     let mut kbuf = vec![0u8; count.min(IO_CHUNK) as usize];
     let n = f.read(&mut kbuf)?;
     ctx.mm().copy_to(buf, &kbuf[..n])?;
+    if n > 0 {
+        notify_file(ctx, &f, IN_ACCESS);
+    }
     Ok(n as u64)
 }
 
@@ -37,7 +79,11 @@ pub fn write(ctx: &Ctx, fd: i32, buf: u64, count: u64) -> KResult<u64> {
     let f = file(ctx, fd)?;
     let mut kbuf = vec![0u8; count.min(IO_CHUNK) as usize];
     ctx.mm().copy_from(buf, &mut kbuf)?;
-    Ok(f.write(&kbuf)? as u64)
+    let n = f.write(&kbuf)?;
+    if n > 0 {
+        notify_file(ctx, &f, IN_MODIFY);
+    }
+    Ok(n as u64)
 }
 
 pub(super) fn iovecs(ctx: &Ctx, iov: u64, count: u64) -> KResult<Vec<Iovec>> {
@@ -77,6 +123,9 @@ pub fn readv(ctx: &Ctx, fd: i32, iov: u64, count: u64) -> KResult<u64> {
             break;
         }
     }
+    if total > 0 {
+        notify_file(ctx, &f, IN_ACCESS);
+    }
     Ok(total)
 }
 
@@ -91,7 +140,11 @@ pub fn writev(ctx: &Ctx, fd: i32, iov: u64, count: u64) -> KResult<u64> {
         data.resize(start + len, 0);
         ctx.mm().copy_from(e.base, &mut data[start..])?;
     }
-    Ok(f.write(&data)? as u64)
+    let n = f.write(&data)?;
+    if n > 0 {
+        notify_file(ctx, &f, IN_MODIFY);
+    }
+    Ok(n as u64)
 }
 
 pub fn pread(ctx: &Ctx, fd: i32, buf: u64, count: u64, off: i64) -> KResult<u64> {
@@ -108,6 +161,9 @@ pub fn pread(ctx: &Ctx, fd: i32, buf: u64, count: u64, off: i64) -> KResult<u64>
     let mut kbuf = vec![0u8; count.min(IO_CHUNK) as usize];
     let n = fs::pagecache::read_at(&f.inode, off as u64, &mut kbuf)?;
     ctx.mm().copy_to(buf, &kbuf[..n])?;
+    if n > 0 {
+        notify_file(ctx, &f, IN_ACCESS);
+    }
     Ok(n as u64)
 }
 
@@ -124,7 +180,11 @@ pub fn pwrite(ctx: &Ctx, fd: i32, buf: u64, count: u64, off: i64) -> KResult<u64
     }
     let mut kbuf = vec![0u8; count.min(IO_CHUNK) as usize];
     ctx.mm().copy_from(buf, &mut kbuf)?;
-    Ok(fs::pagecache::write_at(&f.inode, off as u64, &kbuf)? as u64)
+    let n = fs::pagecache::write_at(&f.inode, off as u64, &kbuf)?;
+    if n > 0 {
+        notify_file(ctx, &f, IN_MODIFY);
+    }
+    Ok(n as u64)
 }
 
 pub fn lseek(ctx: &Ctx, fd: i32, off: i64, whence: u32) -> KResult<u64> {
@@ -170,8 +230,18 @@ fn dir_of(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<Arc<dyn Inode>> {
 }
 
 fn resolve(ctx: &Ctx, dirfd: i32, path: &str, follow: bool) -> KResult<Arc<dyn Inode>> {
+    resolve_named(ctx, dirfd, path, follow).map(|(i, _)| i)
+}
+
+/// [`resolve`], with the canonical absolute path.
+fn resolve_named(
+    ctx: &Ctx,
+    dirfd: i32,
+    path: &str,
+    follow: bool,
+) -> KResult<(Arc<dyn Inode>, alloc::string::String)> {
     let base = dir_of(ctx, dirfd, path)?;
-    fs::resolve(&base, path, follow).map(|(i, _)| i)
+    fs::resolve(&base, path, follow)
 }
 
 fn resolve_parent(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<(Arc<dyn Inode>, String)> {
@@ -198,8 +268,9 @@ fn umask(ctx: &Ctx) -> u32 {
 pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResult<u64> {
     let path = path_arg(ctx, path)?;
     let follow = flags & O_NOFOLLOW == 0;
-    let inode = if flags & O_CREAT != 0 {
-        match resolve(ctx, dirfd, &path, follow) {
+    let mut created = false;
+    let (inode, name) = if flags & O_CREAT != 0 {
+        match resolve_named(ctx, dirfd, &path, follow) {
             Ok(existing) => {
                 if flags & O_EXCL != 0 {
                     return Err(Errno::EEXIST);
@@ -212,7 +283,12 @@ pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResul
                 }
                 let (dir, name) = resolve_parent(ctx, dirfd, &path)?;
                 match dir.create(&name, FileType::Regular, mode & 0o7777 & !umask(ctx)) {
-                    Ok(i) => i,
+                    Ok(i) => {
+                        created = true;
+                        event::notify_entry(&dir, &name, false, IN_CREATE, 0);
+                        let at = fs::path_of(&dir);
+                        (i, alloc::format!("{}/{name}", at.trim_end_matches('/')))
+                    }
                     // A dangling symbolic link in the way.
                     Err(Errno::EEXIST) => return Err(Errno::ENOENT),
                     Err(e) => return Err(e),
@@ -221,7 +297,7 @@ pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResul
             Err(e) => return Err(e),
         }
     } else {
-        resolve(ctx, dirfd, &path, follow)?
+        resolve_named(ctx, dirfd, &path, follow)?
     };
     let ty = inode.file_type();
     let acc = flags & O_ACCMODE;
@@ -236,9 +312,12 @@ pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResul
     if ty == FileType::Directory && (acc != O_RDONLY || flags & O_CREAT != 0) {
         return Err(Errno::EISDIR);
     }
-    if flags & O_TRUNC != 0 && ty == FileType::Regular && acc != O_RDONLY {
+    let truncated = flags & O_TRUNC != 0 && ty == FileType::Regular && acc != O_RDONLY;
+    if truncated {
         inode.truncate(0)?;
     }
+    // (A file just created is not reported as modified.)
+    let truncated = truncated && inode.size() == 0 && !name.is_empty() && !created;
     // O_PATH only names the file: a device or FIFO is not opened.
     let inode = if flags & O_PATH != 0 {
         inode
@@ -248,6 +327,13 @@ pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResul
     };
     let status = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK | O_DIRECTORY | O_PATH);
     let f = File::new(inode, status);
+    f.set_path(&name);
+    if flags & O_PATH == 0 {
+        if truncated {
+            notify_file(ctx, &f, IN_MODIFY);
+        }
+        notify_file(ctx, &f, IN_OPEN);
+    }
     let fd = ctx
         .process()
         .files
@@ -263,6 +349,15 @@ pub fn close(ctx: &Ctx, fd: i32) -> KResult<u64> {
         files.close(fd)?;
         f
     };
+    // The last descriptor of the open file: IN_CLOSE_*.
+    if Arc::strong_count(&f) == 1 && *f.flags.lock() & O_PATH == 0 {
+        let mask = if f.writable() {
+            IN_CLOSE_WRITE
+        } else {
+            IN_CLOSE_NOWRITE
+        };
+        notify_file(ctx, &f, mask);
+    }
     // The last reference may close a pipe end: drop it outside the lock.
     drop(f);
     Ok(0)
@@ -496,6 +591,7 @@ pub fn ftruncate(ctx: &Ctx, fd: i32, len: i64) -> KResult<u64> {
         return Err(Errno::EINVAL);
     }
     f.inode.truncate(len as u64)?;
+    notify_file(ctx, &f, IN_MODIFY);
     Ok(0)
 }
 
@@ -526,6 +622,7 @@ pub fn fallocate(ctx: &Ctx, fd: i32, mode: u32, offset: i64, len: i64) -> KResul
     let end = offset.checked_add(len).ok_or(Errno::EFBIG)? as u64;
     if end > f.inode.size() {
         f.inode.truncate(end)?;
+        notify_file(ctx, &f, IN_MODIFY);
     }
     Ok(0)
 }
@@ -538,7 +635,11 @@ pub fn truncate(ctx: &Ctx, path: u64, len: i64) -> KResult<u64> {
     }
     match inode.file_type() {
         FileType::Directory => Err(Errno::EISDIR),
-        FileType::Regular => inode.truncate(len as u64).map(|()| 0),
+        FileType::Regular => {
+            inode.truncate(len as u64)?;
+            notify_path(ctx, AT_FDCWD, &path, &inode, IN_MODIFY);
+            Ok(0)
+        }
         _ => Err(Errno::EINVAL),
     }
 }
@@ -581,6 +682,7 @@ pub fn mkdirat(ctx: &Ctx, dirfd: i32, path: u64, mode: u32) -> KResult<u64> {
         return Err(Errno::EEXIST);
     }
     dir.create(&name, FileType::Directory, mode & 0o7777 & !umask(ctx))?;
+    event::notify_entry(&dir, &name, true, IN_CREATE, 0);
     Ok(0)
 }
 
@@ -597,6 +699,7 @@ pub fn mknodat(ctx: &Ctx, dirfd: i32, path: u64, mode: u32) -> KResult<u64> {
         _ => return Err(Errno::EPERM),
     };
     dir.create(&name, ty, perm)?;
+    event::notify_entry(&dir, &name, false, IN_CREATE, 0);
     Ok(0)
 }
 
@@ -619,8 +722,25 @@ pub fn unlinkat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32) -> KResult<u64> {
     if dir_wanted && name == "." {
         return Err(Errno::EINVAL);
     }
+    let inode = dir.lookup(&name).ok().filter(|_| event::watching());
     dir.remove(&name, dir_wanted)?;
+    if let Some(inode) = inode {
+        notify_removed(&dir, &name, &inode);
+    }
     Ok(0)
+}
+
+/// inotify: `name` (`inode`) left `dir`.
+fn notify_removed(dir: &Arc<dyn Inode>, name: &str, inode: &Arc<dyn Inode>) {
+    let is_dir = inode.file_type() == FileType::Directory;
+    if !is_dir {
+        event::notify(Some(inode), None, IN_ATTRIB, 0, false); // its link count
+    }
+    // As Linux: the inode's own end first, then the directory's event.
+    if is_dir || inode.nlink() == 0 {
+        event::notify(Some(inode), None, IN_DELETE_SELF, 0, true);
+    }
+    event::notify_entry(dir, name, is_dir, IN_DELETE, 0);
 }
 
 pub fn renameat(
@@ -665,6 +785,9 @@ pub fn renameat(
                 _ => {}
             }
             to_dir.remove(&to, target_dir)?;
+            if event::watching() {
+                event::notify(Some(&existing), None, IN_DELETE_SELF, 0, true);
+            }
         }
         Err(Errno::ENOENT) => {}
         Err(e) => return Err(e),
@@ -676,6 +799,12 @@ pub fn renameat(
     }
     if is_dir {
         inode.set_parent(&to_dir);
+    }
+    if event::watching() {
+        let cookie = event::move_cookie();
+        event::notify_entry(&from_dir, &from, is_dir, IN_MOVED_FROM, cookie);
+        event::notify_entry(&to_dir, &to, is_dir, IN_MOVED_TO, cookie);
+        event::notify(Some(&inode), None, IN_MOVE_SELF, 0, false);
     }
     Ok(0)
 }
@@ -690,6 +819,8 @@ pub fn linkat(ctx: &Ctx, olddir: i32, old: u64, newdir: i32, new: u64) -> KResul
     let (dir, name) = resolve_parent(ctx, newdir, &new)?;
     dir.insert(&name, inode.clone())?;
     inode.link_added();
+    event::notify(Some(&inode), None, IN_ATTRIB, 0, false);
+    event::notify_entry(&dir, &name, false, IN_CREATE, 0);
     Ok(0)
 }
 
@@ -698,6 +829,7 @@ pub fn symlinkat(ctx: &Ctx, target: u64, newdir: i32, path: u64) -> KResult<u64>
     let path = path_arg(ctx, path)?;
     let (dir, name) = resolve_parent(ctx, newdir, &path)?;
     dir.symlink(&name, &target)?;
+    event::notify_entry(&dir, &name, false, IN_CREATE, 0);
     Ok(0)
 }
 
@@ -720,12 +852,16 @@ pub fn readlinkat(ctx: &Ctx, dirfd: i32, path: u64, buf: u64, size: u64) -> KRes
 
 pub fn fchmodat(ctx: &Ctx, dirfd: i32, path: u64, mode: u32) -> KResult<u64> {
     let path = path_arg(ctx, path)?;
-    resolve(ctx, dirfd, &path, true)?.set_perm(mode & 0o7777)?;
+    let inode = resolve(ctx, dirfd, &path, true)?;
+    inode.set_perm(mode & 0o7777)?;
+    notify_path(ctx, dirfd, &path, &inode, IN_ATTRIB);
     Ok(0)
 }
 
 pub fn fchmod(ctx: &Ctx, fd: i32, mode: u32) -> KResult<u64> {
-    file(ctx, fd)?.inode.set_perm(mode & 0o7777)?;
+    let f = file(ctx, fd)?;
+    f.inode.set_perm(mode & 0o7777)?;
+    notify_file(ctx, &f, IN_ATTRIB);
     Ok(0)
 }
 
@@ -772,6 +908,7 @@ pub fn utimes(ctx: &Ctx, nr: u64, a: [u64; 6]) -> KResult<u64> {
     if let Some(t) = mtime {
         inode.set_mtime(t);
     }
+    event::notify(Some(&inode), None, IN_ATTRIB, 0, false);
     Ok(0)
 }
 
@@ -1260,6 +1397,7 @@ pub fn memfd_create(ctx: &Ctx, name: u64, flags: u32) -> KResult<u64> {
         seals.insert(inode.ino(), if sealing { 0 } else { 1 });
     }
     let file = fs::File::new(inode, crate::abi::open::O_RDWR);
+    file.set_path(&alloc::format!("/memfd:{name} (deleted)"));
     let fd = ctx
         .process()
         .files

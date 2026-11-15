@@ -22,6 +22,7 @@ pub mod exec;
 pub mod faults;
 pub mod futex;
 pub mod itimer;
+pub mod seccomp;
 pub mod signal;
 
 use crate::abi::{Errno, KResult};
@@ -92,6 +93,10 @@ pub struct Process {
     pub(crate) shared_sig: signal::SigQueue,
     /// Monotonic ns at creation (for /proc).
     pub start_ns: u64,
+    /// A debugging aid: log this process's failing system calls (1) or
+    /// all of them (2). Set by `SEGOS_STRACE=1` or `=2` in the
+    /// environment of `execve`; children inherit it.
+    pub trace: AtomicU32,
 }
 
 impl Process {
@@ -185,6 +190,18 @@ pub struct UserThread {
     /// Exiting ends only this thread (`exit`, or killed by another
     /// thread's `exit_group` or `execve`), not the whole group.
     thread_only: AtomicBool,
+    /// Scheduling policy (low 32 bits) and real-time priority (high 32),
+    /// as `sched_setscheduler` set them. (The scheduler treats every
+    /// thread alike; programs read back what they set.)
+    pub sched: AtomicU64,
+    /// A thread's own name (`PR_SET_NAME` in a thread other than the
+    /// main one); None: the process's.
+    pub comm: SpinLock<Option<String>>,
+    /// seccomp mode (`seccomp::MODE_*`) and the newest filter.
+    pub seccomp_mode: AtomicU32,
+    pub seccomp: SpinLock<Option<Arc<seccomp::Filter>>>,
+    /// `PR_SET_NO_NEW_PRIVS` (inherited, never cleared).
+    pub no_new_privs: AtomicBool,
 }
 
 unsafe impl Sync for UserThread {}
@@ -315,6 +332,7 @@ fn new_process(
         group_exit: AtomicI32::new(NO_EXIT),
         shared_sig: signal::SigQueue::default(),
         start_ns: crate::time::monotonic_ns(),
+        trace: AtomicU32::new(0),
     }
 }
 
@@ -333,7 +351,24 @@ fn new_thread(process: Arc<Process>, mm: Arc<AddressSpace>) -> UserThread {
         pending_exit: AtomicI32::new(NO_EXIT),
         vfork_done: SpinLock::new(None),
         thread_only: AtomicBool::new(false),
+        sched: AtomicU64::new(0),
+        comm: SpinLock::new(None),
+        seccomp_mode: AtomicU32::new(seccomp::MODE_DISABLED),
+        seccomp: SpinLock::new(None),
+        no_new_privs: AtomicBool::new(false),
     }
+}
+
+/// What a new thread inherits from its creator `t`: seccomp filters and
+/// `no_new_privs`.
+fn inherit_restrictions(thread: &UserThread, t: &UserThread) {
+    thread
+        .seccomp_mode
+        .store(t.seccomp_mode.load(Ordering::Relaxed), Ordering::Relaxed);
+    *thread.seccomp.lock() = t.seccomp.lock().clone();
+    thread
+        .no_new_privs
+        .store(t.no_new_privs.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
 /// Starts `thread` (of `p`) with `frame`, adding it to the process's
@@ -446,6 +481,7 @@ pub fn clone(
     *child.exe.get_mut() = parent.exe.lock().clone();
     *child.cmdline.get_mut() = parent.cmdline.lock().clone();
     child.umask = AtomicU32::new(parent.umask.load(Ordering::Relaxed));
+    child.trace = AtomicU32::new(parent.trace.load(Ordering::Relaxed));
     *child.sigactions.get_mut() = *parent.sigactions.lock();
     child
         .has_ctty
@@ -465,6 +501,7 @@ pub fn clone(
         .gs_base
         .store(t.gs_base.load(Ordering::Relaxed), Ordering::Relaxed);
     thread.sig.inherit(&t.sig);
+    inherit_restrictions(&thread, t);
     // The parent's FPU registers are live in the CPU (the kernel never
     // touches them): copy them.
     x86::fxsave(unsafe { &mut *thread.fpu.get() });
@@ -528,6 +565,7 @@ fn clone_thread(
         .store(t.gs_base.load(Ordering::Relaxed), Ordering::Relaxed);
     // The signal mask is inherited; the alternate stack is not.
     thread.sig.set_mask(t.sig.mask.load(Ordering::Relaxed));
+    inherit_restrictions(&thread, t);
     x86::fxsave(unsafe { &mut *thread.fpu.get() });
     if flags & CLONE_CHILD_CLEARTID != 0 {
         thread.clear_child_tid.store(ctid, Ordering::Relaxed);

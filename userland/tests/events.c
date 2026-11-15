@@ -16,6 +16,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <sys/ioctl.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -427,6 +428,28 @@ static void epolls(void)
 
 /* --- inotify -------------------------------------------------------- */
 
+static int inotify_events(int fd, char *out, size_t size)
+{
+	char buf[4096] __attribute__((aligned(8)));
+	ssize_t n = read(fd, buf, sizeof buf);
+	size_t used = 0;
+	static uint32_t cookie;
+	out[0] = 0;
+	for (ssize_t at = 0; at < n;) {
+		struct inotify_event *e = (struct inotify_event *)(buf + at);
+		const char *same = "";
+		if (e->cookie) {
+			same = cookie == e->cookie ? "=" : "*";
+			cookie = e->cookie;
+		}
+		used += snprintf(out + used, size - used, "%s%d:%x%s:%s",
+				 used ? " " : "", e->wd, e->mask, same,
+				 e->len ? e->name : "");
+		at += sizeof *e + e->len;
+	}
+	return n;
+}
+
 static void inotify(void)
 {
 	section("inotify");
@@ -438,6 +461,45 @@ static void inotify(void)
 	char buf[256];
 	CHECK(read(fd, buf, sizeof buf) == -1 && errno == EAGAIN);
 	CHECK(revents(fd, POLLIN) == 0);
+
+	char dir[] = "/tmp/inotifyXXXXXX", path[64], path2[64];
+	CHECK(mkdtemp(dir) != NULL);
+	int wd = inotify_add_watch(fd, dir, IN_CREATE | IN_DELETE | IN_MODIFY |
+					    IN_MOVED_FROM | IN_MOVED_TO |
+					    IN_CLOSE_WRITE | IN_ATTRIB);
+	CHECK(wd >= 2);
+	CHECK(inotify_add_watch(fd, dir, IN_DELETE | IN_MASK_CREATE) == -1 &&
+	      errno == EEXIST);
+	CHECK(inotify_add_watch(fd, dir, IN_ACCESS | IN_MASK_ADD) == wd);
+	snprintf(path, sizeof path, "%s/a", dir);
+	int f = open(path, O_CREAT | O_WRONLY, 0644);
+	CHECK(f >= 0 && write(f, "x", 1) == 1 && close(f) == 0);
+	snprintf(path2, sizeof path2, "%s/b", dir);
+	CHECK(rename(path, path2) == 0 && chmod(path2, 0600) == 0);
+	snprintf(path, sizeof path, "%s/sub", dir);
+	CHECK(mkdir(path, 0755) == 0 && rmdir(path) == 0);
+	int n = 0;
+	CHECK(ioctl(fd, FIONREAD, &n) == 0 && n > 0);
+	CHECK(revents(fd, POLLIN) == POLLIN);
+	char events[1024];
+	CHECK(inotify_events(fd, events, sizeof events) == n);
+	printf("     %s\n", events);
+
+	/* A watch on the file itself: IN_DELETE_SELF, then IN_IGNORED. */
+	CHECK(inotify_add_watch(fd, path2, IN_MODIFY | IN_ONLYDIR) == -1 &&
+	      errno == ENOTDIR);
+	int wd2 = inotify_add_watch(fd, path2, IN_MODIFY | IN_DELETE_SELF);
+	CHECK(wd2 == wd + 1);
+	f = open(path2, O_WRONLY);
+	CHECK(f >= 0 && write(f, "y", 1) == 1 && close(f) == 0);
+	CHECK(unlink(path2) == 0);
+	CHECK(inotify_events(fd, events, sizeof events) > 0);
+	printf("     %s\n", events);
+	CHECK(inotify_rm_watch(fd, wd2) == -1 && errno == EINVAL);
+	CHECK(inotify_rm_watch(fd, wd) == 0);
+	CHECK(inotify_events(fd, events, sizeof events) > 0);
+	printf("     %s\n", events);
+	CHECK(rmdir(dir) == 0);
 	close(fd);
 }
 

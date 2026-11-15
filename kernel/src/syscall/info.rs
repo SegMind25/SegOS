@@ -268,6 +268,10 @@ pub fn prctl(ctx: &Ctx, a: [u64; 6]) -> KResult<u64> {
     const PR_SET_CHILD_SUBREAPER: u64 = 36;
     const PR_SET_NO_NEW_PRIVS: u64 = 38;
     const PR_GET_NO_NEW_PRIVS: u64 = 39;
+    const PR_CAPBSET_READ: u64 = 23;
+    const PR_GET_SECCOMP: u64 = 21;
+    const PR_SET_SECCOMP: u64 = 22;
+    const PR_SET_PTRACER: u64 = 0x5961_6d61;
     match a[0] {
         PR_SET_NAME => {
             let mut raw = [0u8; 16];
@@ -280,21 +284,48 @@ pub fn prctl(ctx: &Ctx, a: [u64; 6]) -> KResult<u64> {
             }
             raw[15] = 0;
             let end = raw.iter().position(|&b| b == 0).unwrap_or(15);
-            *ctx.process().name.lock() =
-                alloc::string::String::from_utf8_lossy(&raw[..end]).into_owned();
+            let name = alloc::string::String::from_utf8_lossy(&raw[..end]).into_owned();
+            // The main thread's name is the process's (/proc/<pid>/comm).
+            if ctx.thread().tid == ctx.process().pid {
+                *ctx.process().name.lock() = name;
+            } else {
+                *ctx.thread().comm.lock() = Some(name);
+            }
             Ok(0)
         }
         PR_GET_NAME => {
             let mut raw = [0u8; 16];
-            let name = ctx.process().name.lock().clone();
+            let own = ctx.thread().comm.lock().clone();
+            let name = own.unwrap_or_else(|| ctx.process().name.lock().clone());
             let n = name.len().min(15);
             raw[..n].copy_from_slice(&name.as_bytes()[..n]);
             ctx.mm().copy_to(a[1], &raw)?;
             Ok(0)
         }
         PR_GET_DUMPABLE => Ok(1),
-        PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_CHILD_SUBREAPER | PR_SET_NO_NEW_PRIVS => Ok(0),
-        PR_GET_NO_NEW_PRIVS => Ok(0),
+        // Every capability is in the bounding set (CAP_LAST_CAP is 40).
+        PR_CAPBSET_READ if a[1] <= 40 => Ok(1),
+        PR_SET_PTRACER => Ok(0),
+        PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_CHILD_SUBREAPER => Ok(0),
+        PR_SET_NO_NEW_PRIVS if a[1] == 1 && a[2..5] == [0, 0, 0] => {
+            ctx.thread()
+                .no_new_privs
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS => Ok(ctx
+            .thread()
+            .no_new_privs
+            .load(core::sync::atomic::Ordering::Relaxed) as u64),
+        PR_GET_SECCOMP => Ok(ctx
+            .thread()
+            .seccomp_mode
+            .load(core::sync::atomic::Ordering::Relaxed) as u64),
+        PR_SET_SECCOMP => match a[1] {
+            1 => super::process::set_strict(ctx),
+            2 => super::process::set_filter(ctx, a[2], false, false, false),
+            _ => Err(Errno::EINVAL),
+        },
         _ => Err(Errno::EINVAL),
     }
 }
@@ -407,4 +438,149 @@ pub fn getitimer(ctx: &Ctx, which: u32, cur: u64) -> KResult<u64> {
 pub fn alarm(ctx: &Ctx, secs: u64) -> KResult<u64> {
     let (left, _) = crate::proc::itimer::set(ctx.process(), secs * 1_000_000_000, 0);
     Ok(left.div_ceil(1_000_000_000))
+}
+
+// ---------------------------------------------------------------- sched_*
+
+const SCHED_OTHER: u32 = 0;
+const SCHED_FIFO: u32 = 1;
+const SCHED_RR: u32 = 2;
+const SCHED_BATCH: u32 = 3;
+const SCHED_IDLE: u32 = 5;
+const SCHED_RESET_ON_FORK: u32 = 0x4000_0000;
+
+/// The thread `tid` names (0: the caller).
+fn sched_target(ctx: &Ctx, tid: u32) -> KResult<alloc::sync::Arc<crate::task::Task>> {
+    if (tid as i32) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    if tid == 0 {
+        return Ok(crate::task::current());
+    }
+    let _ = ctx;
+    crate::proc::find_thread(tid).ok_or(Errno::ESRCH)
+}
+
+fn sched_state(t: &crate::task::Task) -> (u32, u32) {
+    let v = t
+        .user()
+        .map_or(0, |u| u.sched.load(core::sync::atomic::Ordering::Relaxed));
+    (v as u32, (v >> 32) as u32)
+}
+
+fn sched_store(t: &crate::task::Task, policy: u32, prio: u32) -> KResult<()> {
+    let base = policy & !SCHED_RESET_ON_FORK;
+    let valid = match base {
+        SCHED_FIFO | SCHED_RR => (1..=99).contains(&prio),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => prio == 0,
+        _ => return Err(Errno::EINVAL),
+    };
+    if !valid {
+        return Err(Errno::EINVAL);
+    }
+    if let Some(u) = t.user() {
+        u.sched.store(
+            policy as u64 | (prio as u64) << 32,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    Ok(())
+}
+
+/// `sched_setscheduler(tid, policy, param)`.
+pub fn sched_setscheduler(ctx: &Ctx, tid: u32, policy: u32, param: u64) -> KResult<u64> {
+    let t = sched_target(ctx, tid)?;
+    let prio: i32 = ctx.mm().read(param)?;
+    sched_store(&t, policy, prio as u32)?;
+    Ok(0)
+}
+
+/// `sched_getscheduler(tid)`.
+pub fn sched_getscheduler(ctx: &Ctx, tid: u32) -> KResult<u64> {
+    Ok(sched_state(&*sched_target(ctx, tid)?).0 as u64)
+}
+
+/// `sched_setparam(tid, param)`: a new priority, the same policy.
+pub fn sched_setparam(ctx: &Ctx, tid: u32, param: u64) -> KResult<u64> {
+    let t = sched_target(ctx, tid)?;
+    let prio: i32 = ctx.mm().read(param)?;
+    sched_store(&t, sched_state(&t).0, prio as u32)?;
+    Ok(0)
+}
+
+/// `sched_getparam(tid, param)`.
+pub fn sched_getparam(ctx: &Ctx, tid: u32, param: u64) -> KResult<u64> {
+    let (_, prio) = sched_state(&*sched_target(ctx, tid)?);
+    ctx.mm().write(param, &(prio as i32))?;
+    Ok(0)
+}
+
+/// `sched_get_priority_max` (`max`) and `_min`.
+pub fn sched_priority_limit(policy: u32, max: bool) -> KResult<u64> {
+    match policy {
+        SCHED_FIFO | SCHED_RR => Ok(if max { 99 } else { 1 }),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => Ok(0),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// `sched_rr_get_interval(tid, ts)`: the scheduler's 10 ms tick.
+pub fn sched_rr_get_interval(ctx: &Ctx, tid: u32, ts: u64) -> KResult<u64> {
+    sched_target(ctx, tid)?;
+    ctx.mm().write(ts, &[0i64, 10_000_000])?;
+    Ok(0)
+}
+
+/// `sched_setaffinity(tid, len, mask)`: every thread may run on every
+/// CPU; a mask with none of them is EINVAL, as on Linux.
+pub fn sched_setaffinity(ctx: &Ctx, tid: u32, len: u64, mask: u64) -> KResult<u64> {
+    sched_target(ctx, tid)?;
+    let cpus = crate::hal::percpu::count();
+    let mut buf = vec![0u8; (len as usize).min(cpus.div_ceil(8))];
+    ctx.mm().copy_from(mask, &mut buf)?;
+    if (0..cpus).all(|c| buf.get(c / 8).is_none_or(|b| b & (1 << (c % 8)) == 0)) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(0)
+}
+
+/// `sched_setattr(tid, attr, flags)`.
+pub fn sched_setattr(ctx: &Ctx, tid: u32, attr: u64, flags: u32) -> KResult<u64> {
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let t = sched_target(ctx, tid)?;
+    // struct sched_attr: size, policy, flags, nice, priority, ...
+    let head: [u32; 7] = ctx.mm().read(attr)?;
+    let (policy, prio) = (head[1], head[6]);
+    sched_store(&t, policy, prio)?;
+    Ok(0)
+}
+
+/// `sched_getattr(tid, attr, size, flags)`.
+pub fn sched_getattr(ctx: &Ctx, tid: u32, attr: u64, size: u32, flags: u32) -> KResult<u64> {
+    const SCHED_ATTR_SIZE: u32 = 56;
+    if flags != 0 || size < 48 {
+        return Err(Errno::EINVAL);
+    }
+    let (policy, prio) = sched_state(&*sched_target(ctx, tid)?);
+    let mut out = [0u8; SCHED_ATTR_SIZE as usize];
+    let n = SCHED_ATTR_SIZE.min(size);
+    out[0..4].copy_from_slice(&n.to_le_bytes());
+    out[4..8].copy_from_slice(&(policy & !SCHED_RESET_ON_FORK).to_le_bytes());
+    out[24..28].copy_from_slice(&prio.to_le_bytes());
+    ctx.mm().copy_to(attr, &out[..n as usize])?;
+    Ok(0)
+}
+
+/// `get_mempolicy(mode, nodemask, maxnode, addr, flags)`: one NUMA node,
+/// the default policy.
+pub fn get_mempolicy(ctx: &Ctx, mode: u64, nodemask: u64, maxnode: u64) -> KResult<u64> {
+    if mode != 0 {
+        ctx.mm().write(mode, &0i32)?;
+    }
+    if nodemask != 0 && maxnode > 0 {
+        ctx.mm().write(nodemask, &1u64)?;
+    }
+    Ok(0)
 }

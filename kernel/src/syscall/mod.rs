@@ -54,7 +54,12 @@ extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         let task = crate::proc::current();
         let mm = task.user().unwrap().mm();
         let ctx = Ctx { task, mm };
-        dispatch(&ctx, frame, nr, a)
+        let r = match filter(&ctx, frame, nr, a) {
+            None => dispatch(&ctx, frame, nr, a),
+            Some(r) => r,
+        };
+        trace(&ctx, nr, a, &r);
+        r
     };
     frame.rax = match result {
         Ok(v) => v,
@@ -71,6 +76,82 @@ extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
     let restartable = (nr != SYS_RT_SIGRETURN).then_some(nr);
     crate::proc::signal::on_return_to_user(frame, restartable);
     x86::disable_interrupts();
+}
+
+/// seccomp: what the thread's filters say about the call. None: run it;
+/// otherwise its result without running it.
+fn filter(ctx: &Ctx, frame: &TrapFrame, nr: u64, a: [u64; 6]) -> Option<KResult<u64>> {
+    use crate::proc::seccomp::{self, Verdict};
+    let t = ctx.thread();
+    let verdict = match t.seccomp_mode.load(Ordering::Relaxed) {
+        seccomp::MODE_DISABLED => return None,
+        seccomp::MODE_STRICT if seccomp::strict_allows(nr) => return None,
+        seccomp::MODE_STRICT => {
+            t.request_exit(crate::proc::signo::SIGKILL);
+            return Some(Err(Errno::EPERM));
+        }
+        _ => {
+            let f = t.seccomp.lock().clone()?;
+            seccomp::evaluate(&f, nr, &a, frame.rip)
+        }
+    };
+    match verdict {
+        Verdict::Allow => None,
+        Verdict::Errno(e) => Some(Err(e)),
+        Verdict::Trap(data) => {
+            // As Linux: the handler sees RAX holding the call's number.
+            crate::proc::signal::force(
+                t,
+                crate::proc::signo::SIGSYS,
+                crate::proc::signal::SigInfo::seccomp(frame.rip, nr, data as i32),
+            );
+            Some(Ok(nr))
+        }
+        Verdict::Kill { process } => {
+            let status = crate::proc::signo::SIGSYS;
+            if process {
+                t.request_exit(status);
+            } else {
+                t.request_thread_exit(status);
+            }
+            Some(Err(Errno::ENOSYS))
+        }
+    }
+}
+
+/// `SEGOS_STRACE`: logs the call if the process asked for it.
+fn trace(ctx: &Ctx, nr: u64, a: [u64; 6], r: &KResult<u64>) {
+    let level = ctx.process().trace.load(Ordering::Relaxed);
+    if level == 0 || (level == 1 && r.is_ok()) || nr == SYS_RT_SIGRETURN {
+        return;
+    }
+    let p = ctx.process();
+    let res = match r {
+        Ok(v) => alloc::format!("{v:#x}"),
+        Err(e) => alloc::format!("-{}", e.0),
+    };
+    let path_at = match nr {
+        2 | 4 | 6 | 21 | 59 | 80 | 83 | 84 | 87 | 89 | 137 => Some(a[0]),
+        257 | 258 | 262 | 263 | 267 | 269 | 332 | 439 => Some(a[1]),
+        _ => None,
+    };
+    let path = path_at
+        .and_then(|at| ctx.mm().read_cstr(at, 256).ok())
+        .map(|s| alloc::format!(" \"{s}\""))
+        .unwrap_or_default();
+    let comm = ctx.thread().comm.lock().clone();
+    let name = comm.unwrap_or_else(|| p.name.lock().clone());
+    crate::debug!(
+        "strace {}[{}/{}]: {nr}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}){path} = {res}",
+        name,
+        p.pid,
+        ctx.thread().tid,
+        a[0],
+        a[1],
+        a[2],
+        a[3],
+        a[4]
+    );
 }
 
 /// Unknown system calls already reported (bit n: number n, below 512).
@@ -128,7 +209,8 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
             crate::fs::pagecache::sync_all();
             Ok(0)
         }
-        28 => Ok(0), // madvise: advice may be ignored
+        28 => Ok(0),  // madvise: advice may be ignored
+        221 => Ok(0), // fadvise64: likewise
         32 => fs::dup(ctx, fd),
         33 => fs::dup3(ctx, fd, a[1] as i32, 0, true),
         34 => process::pause(ctx),
@@ -227,6 +309,7 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         138 => fs::statfs(ctx, a[0], a[1], true),
         140 | 141 => Ok(0), // getpriority, setpriority: everyone at nice 0
         157 => info::prctl(ctx, a),
+        317 => process::seccomp(ctx, a[0] as u32, a[1] as u32, a[2]),
         158 => process::arch_prctl(ctx, a[0] as u32, a[1]),
         162 => {
             crate::fs::pagecache::sync_all();
@@ -238,6 +321,19 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         201 => info::time(ctx, a[0]),
         202 => process::futex(ctx, a),
         204 => info::sched_getaffinity(ctx, a[1], a[2]),
+        203 => info::sched_setaffinity(ctx, a[0] as u32, a[1], a[2]),
+        142 => info::sched_setparam(ctx, a[0] as u32, a[1]),
+        143 => info::sched_getparam(ctx, a[0] as u32, a[1]),
+        144 => info::sched_setscheduler(ctx, a[0] as u32, a[1] as u32, a[2]),
+        145 => info::sched_getscheduler(ctx, a[0] as u32),
+        146 => info::sched_priority_limit(a[0] as u32, true),
+        147 => info::sched_priority_limit(a[0] as u32, false),
+        148 => info::sched_rr_get_interval(ctx, a[0] as u32, a[1]),
+        314 => info::sched_setattr(ctx, a[0] as u32, a[1], a[2] as u32),
+        315 => info::sched_getattr(ctx, a[0] as u32, a[1], a[2] as u32, a[3] as u32),
+        // mbind, set_mempolicy: one node, nothing to choose between.
+        237 | 238 => Ok(0),
+        239 => info::get_mempolicy(ctx, a[0], a[1], a[2]),
         217 => fs::getdents64(ctx, fd, a[1], a[2]),
         218 => {
             ctx.thread().clear_child_tid.store(a[0], Ordering::Relaxed);

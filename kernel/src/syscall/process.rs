@@ -399,3 +399,108 @@ pub fn rt_sigtimedwait(ctx: &Ctx, set: u64, info: u64, timeout: u64, size: u64) 
             .map_err(|_| Errno::EINTR)?;
     }
 }
+
+/// `seccomp(op, flags, args)`.
+pub fn seccomp(ctx: &Ctx, op: u32, flags: u32, args: u64) -> KResult<u64> {
+    use crate::proc::seccomp as sc;
+    const SET_MODE_STRICT: u32 = 0;
+    const SET_MODE_FILTER: u32 = 1;
+    const GET_ACTION_AVAIL: u32 = 2;
+    const GET_NOTIF_SIZES: u32 = 3;
+    const FLAG_TSYNC: u32 = 1;
+    const FLAG_LOG: u32 = 2;
+    const FLAG_SPEC_ALLOW: u32 = 4;
+    const FLAG_TSYNC_ESRCH: u32 = 16;
+    match op {
+        SET_MODE_STRICT if flags == 0 && args == 0 => set_strict(ctx),
+        SET_MODE_FILTER => {
+            if flags & !(FLAG_TSYNC | FLAG_LOG | FLAG_SPEC_ALLOW | FLAG_TSYNC_ESRCH) != 0 {
+                // No user-space notification (NEW_LISTENER) here.
+                return Err(Errno::EINVAL);
+            }
+            set_filter(
+                ctx,
+                args,
+                flags & FLAG_TSYNC != 0,
+                flags & FLAG_LOG != 0,
+                flags & FLAG_TSYNC_ESRCH != 0,
+            )
+        }
+        GET_ACTION_AVAIL if flags == 0 => {
+            let action: u32 = ctx.mm().read(args)?;
+            if sc::action_available(action) {
+                Ok(0)
+            } else {
+                Err(Errno::EOPNOTSUPP)
+            }
+        }
+        // struct seccomp_notif_sizes: notif, notif_resp, data.
+        GET_NOTIF_SIZES if flags == 0 => {
+            ctx.mm().write(args, &[80u16, 24, 64])?;
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// `SECCOMP_MODE_STRICT` for the calling thread.
+pub fn set_strict(ctx: &Ctx) -> KResult<u64> {
+    use crate::proc::seccomp as sc;
+    let t = ctx.thread();
+    match t.seccomp_mode.load(Ordering::Relaxed) {
+        sc::MODE_DISABLED => {
+            t.seccomp_mode.store(sc::MODE_STRICT, Ordering::Relaxed);
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// Installs the filter at `prog` (a `struct sock_fprog`) for the calling
+/// thread, or (`tsync`) for every thread of its process. Root may always
+/// install one (no `no_new_privs` needed).
+pub fn set_filter(ctx: &Ctx, prog: u64, tsync: bool, log: bool, esrch: bool) -> KResult<u64> {
+    use crate::proc::seccomp as sc;
+    let t = ctx.thread();
+    if t.seccomp_mode.load(Ordering::Relaxed) == sc::MODE_STRICT {
+        return Err(Errno::EINVAL);
+    }
+    let current = t.seccomp.lock().clone();
+    let filter = sc::load(ctx.mm(), prog, current.clone(), log)?;
+    let threads = if tsync {
+        ctx.process().threads()
+    } else {
+        alloc::vec![crate::task::current()]
+    };
+    if tsync {
+        // Every other thread must be at an ancestor of ours (or have
+        // none); otherwise the first one that is not is the answer.
+        for task in &threads {
+            let Some(u) = task.user() else { continue };
+            let theirs = u.seccomp.lock().clone();
+            let ok = u.seccomp_mode.load(Ordering::Relaxed) != sc::MODE_STRICT
+                && match (&theirs, &current) {
+                    (None, _) => true,
+                    (Some(f), Some(c)) => c.descends_from(f),
+                    (Some(_), None) => false,
+                };
+            if !ok {
+                return if esrch {
+                    Err(Errno::ESRCH)
+                } else {
+                    Ok(u.tid as u64)
+                };
+            }
+        }
+    }
+    for task in &threads {
+        let Some(u) = task.user() else { continue };
+        *u.seccomp.lock() = Some(filter.clone());
+        u.seccomp_mode.store(sc::MODE_FILTER, Ordering::Relaxed);
+        if tsync {
+            u.no_new_privs
+                .store(t.no_new_privs.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+    Ok(0)
+}

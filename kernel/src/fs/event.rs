@@ -1,5 +1,5 @@
 //! Event file descriptors: `eventfd`, `timerfd`, `signalfd`, `epoll` and
-//! a placeholder `inotify`.
+//! `inotify`.
 //!
 //! Each is an anonymous inode that `read`, `write`, `poll` and `epoll`
 //! work on like any other file. Blocking reads sleep on the object's own
@@ -676,31 +676,324 @@ impl Inode for Epoll {
 
 // ---------------------------------------------------------------- inotify
 
-/// `inotify_init1`: a valid descriptor that never reports an event.
+/// inotify event bits (linux/inotify.h).
+pub mod in_mask {
+    pub const IN_ACCESS: u32 = 0x1;
+    pub const IN_MODIFY: u32 = 0x2;
+    pub const IN_ATTRIB: u32 = 0x4;
+    pub const IN_CLOSE_WRITE: u32 = 0x8;
+    pub const IN_CLOSE_NOWRITE: u32 = 0x10;
+    pub const IN_OPEN: u32 = 0x20;
+    pub const IN_MOVED_FROM: u32 = 0x40;
+    pub const IN_MOVED_TO: u32 = 0x80;
+    pub const IN_CREATE: u32 = 0x100;
+    pub const IN_DELETE: u32 = 0x200;
+    pub const IN_DELETE_SELF: u32 = 0x400;
+    pub const IN_MOVE_SELF: u32 = 0x800;
+    pub const IN_Q_OVERFLOW: u32 = 0x4000;
+    pub const IN_IGNORED: u32 = 0x8000;
+    pub const IN_ONLYDIR: u32 = 0x0100_0000;
+    pub const IN_DONT_FOLLOW: u32 = 0x0200_0000;
+    pub const IN_EXCL_UNLINK: u32 = 0x0400_0000;
+    pub const IN_MASK_CREATE: u32 = 0x1000_0000;
+    pub const IN_MASK_ADD: u32 = 0x2000_0000;
+    pub const IN_ISDIR: u32 = 0x4000_0000;
+    pub const IN_ONESHOT: u32 = 0x8000_0000;
+    pub const IN_ALL_EVENTS: u32 = 0xfff;
+}
+use in_mask::*;
+
+/// Events an instance queues at most (Linux's max_queued_events).
+const INOTIFY_MAX_EVENTS: usize = 16384;
+
+struct Watch {
+    wd: i32,
+    /// The watched inode, by (device, inode number).
+    key: (u64, u64),
+    mask: u32,
+}
+
+struct InotifyEvent {
+    wd: i32,
+    mask: u32,
+    cookie: u32,
+    name: alloc::string::String,
+}
+
+impl InotifyEvent {
+    /// `struct inotify_event` and its name, NUL-padded to 16 bytes.
+    fn len(&self) -> usize {
+        16 + Self::name_len(&self.name)
+    }
+    fn name_len(name: &str) -> usize {
+        if name.is_empty() {
+            0
+        } else {
+            (name.len() + 1).next_multiple_of(16)
+        }
+    }
+}
+
+#[derive(Default)]
+struct InotifyState {
+    watches: Vec<Watch>,
+    queue: alloc::collections::VecDeque<InotifyEvent>,
+    next_wd: i32,
+}
+
+/// `inotify_init1`: watches on files and directories; events queue up
+/// for `read`, which returns whole `struct inotify_event`s.
 pub struct Inotify {
     ino: u64,
-    pub next_wd: AtomicU64,
+    state: SpinLock<InotifyState>,
+    wait: WaitQueue,
+    generation: AtomicU64,
 }
+
+/// Every live instance, and how many watches they have in all (the file
+/// system calls skip the work while there are none).
+static INSTANCES: SpinLock<Vec<Weak<Inotify>>> = SpinLock::new(Vec::new());
+static WATCHES: AtomicU64 = AtomicU64::new(0);
 
 impl Inotify {
     pub fn create() -> Arc<dyn Inode> {
-        Arc::new(Self {
+        let me = Arc::new(Self {
             ino: new_ino(),
-            next_wd: AtomicU64::new(1),
-        })
+            state: SpinLock::new(InotifyState {
+                next_wd: 1,
+                ..Default::default()
+            }),
+            wait: WaitQueue::new(),
+            generation: AtomicU64::new(0),
+        });
+        let mut all = INSTANCES.lock();
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Arc::downgrade(&me));
+        me
+    }
+
+    /// `inotify_add_watch` on `target`: returns the watch descriptor.
+    pub fn add_watch(&self, target: &Arc<dyn Inode>, mask: u32) -> KResult<i32> {
+        if mask & IN_MASK_ADD != 0 && mask & IN_MASK_CREATE != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if mask & IN_ALL_EVENTS == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if mask & IN_ONLYDIR != 0 && target.file_type() != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        let key = (target.dev(), target.ino());
+        let keep = mask & (IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT);
+        let mut st = self.state.lock();
+        if let Some(w) = st.watches.iter_mut().find(|w| w.key == key) {
+            if mask & IN_MASK_CREATE != 0 {
+                return Err(Errno::EEXIST);
+            }
+            w.mask = if mask & IN_MASK_ADD != 0 {
+                w.mask | keep
+            } else {
+                keep
+            };
+            return Ok(w.wd);
+        }
+        let wd = st.next_wd;
+        st.next_wd += 1;
+        st.watches.push(Watch {
+            wd,
+            key,
+            mask: keep,
+        });
+        WATCHES.fetch_add(1, Ordering::Relaxed);
+        Ok(wd)
+    }
+
+    /// `inotify_rm_watch`: the watch goes, with an IN_IGNORED event.
+    pub fn rm_watch(&self, wd: i32) -> KResult<()> {
+        let mut st = self.state.lock();
+        let i = st
+            .watches
+            .iter()
+            .position(|w| w.wd == wd)
+            .ok_or(Errno::EINVAL)?;
+        st.watches.remove(i);
+        WATCHES.fetch_sub(1, Ordering::Relaxed);
+        Self::queue(&mut st, wd, IN_IGNORED, 0, "");
+        drop(st);
+        self.changed();
+        Ok(())
+    }
+
+    fn queue(st: &mut InotifyState, wd: i32, mask: u32, cookie: u32, name: &str) {
+        // An event like the last one queued is merged into it, as Linux does.
+        if let Some(last) = st.queue.back()
+            && last.wd == wd
+            && last.mask == mask
+            && last.cookie == cookie
+            && last.name == name
+        {
+            return;
+        }
+        if st.queue.len() >= INOTIFY_MAX_EVENTS {
+            if st.queue.back().is_none_or(|e| e.mask != IN_Q_OVERFLOW) {
+                st.queue.push_back(InotifyEvent {
+                    wd: -1,
+                    mask: IN_Q_OVERFLOW,
+                    cookie: 0,
+                    name: alloc::string::String::new(),
+                });
+            }
+            return;
+        }
+        st.queue.push_back(InotifyEvent {
+            wd,
+            mask,
+            cookie,
+            name: name.into(),
+        });
+    }
+
+    /// Queues `mask` for the watch on `key`, if it wants it. `self_gone`:
+    /// the watched inode was deleted, which ends the watch.
+    fn deliver(&self, key: (u64, u64), mask: u32, cookie: u32, name: &str, self_gone: bool) {
+        let mut st = self.state.lock();
+        let Some(i) = st.watches.iter().position(|w| w.key == key) else {
+            return;
+        };
+        let (wd, wmask) = (st.watches[i].wd, st.watches[i].mask);
+        let mut queued = false;
+        if wmask & mask & IN_ALL_EVENTS != 0 {
+            Self::queue(&mut st, wd, mask, cookie, name);
+            queued = true;
+        }
+        if self_gone || (queued && wmask & IN_ONESHOT != 0) {
+            st.watches.remove(i);
+            WATCHES.fetch_sub(1, Ordering::Relaxed);
+            Self::queue(&mut st, wd, IN_IGNORED, 0, "");
+            queued = true;
+        }
+        drop(st);
+        if queued {
+            self.changed();
+        }
+    }
+
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.wait.wake_all();
+        poll_notify();
+    }
+
+    fn pending_bytes(&self) -> usize {
+        self.state.lock().queue.iter().map(|e| e.len()).sum()
+    }
+}
+
+/// Reports `mask` about `inode` to the watches on it, and (with `name`)
+/// to the watches on the directory `dir` it is in: what the file system
+/// calls use. `cookie` ties IN_MOVED_FROM to IN_MOVED_TO. `self_gone`:
+/// `inode` was deleted (its watches end).
+pub fn notify(
+    inode: Option<&Arc<dyn Inode>>,
+    dir: Option<(&Arc<dyn Inode>, &str)>,
+    mask: u32,
+    cookie: u32,
+    self_gone: bool,
+) {
+    if WATCHES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let isdir = inode.is_some_and(|i| i.file_type() == FileType::Directory);
+    let mask = if isdir { mask | IN_ISDIR } else { mask };
+    let all: Vec<Arc<Inotify>> = INSTANCES
+        .lock()
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .collect();
+    for ino in all {
+        if let Some((d, name)) = dir {
+            ino.deliver((d.dev(), d.ino()), mask, cookie, name, false);
+        }
+        if let Some(i) = inode {
+            ino.deliver((i.dev(), i.ino()), mask, cookie, "", self_gone);
+        }
+    }
+}
+
+/// Reports `mask` (IN_CREATE, IN_DELETE, IN_MOVED_*) about the entry
+/// `name` of `dir` to the watches on `dir` only.
+pub fn notify_entry(dir: &Arc<dyn Inode>, name: &str, is_dir: bool, mask: u32, cookie: u32) {
+    if WATCHES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mask = if is_dir { mask | IN_ISDIR } else { mask };
+    let all: Vec<Arc<Inotify>> = INSTANCES
+        .lock()
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .collect();
+    for ino in all {
+        ino.deliver((dir.dev(), dir.ino()), mask, cookie, name, false);
+    }
+}
+
+/// Whether any inotify watch exists (callers skip finding names if not).
+pub fn watching() -> bool {
+    WATCHES.load(Ordering::Relaxed) != 0
+}
+
+/// A fresh cookie for a rename's pair of events.
+pub fn move_cookie() -> u32 {
+    static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Drop for Inotify {
+    fn drop(&mut self) {
+        let n = self.state.get_mut().watches.len() as u64;
+        WATCHES.fetch_sub(n, Ordering::Relaxed);
     }
 }
 
 impl Inode for Inotify {
     anon_inode!("inotify");
 
-    fn read_stream(&self, _buf: &mut [u8], nonblock: bool) -> KResult<usize> {
-        if nonblock {
-            return Err(Errno::EAGAIN);
+    fn read_stream(&self, buf: &mut [u8], nonblock: bool) -> KResult<usize> {
+        loop {
+            {
+                let mut st = self.state.lock();
+                if let Some(first) = st.queue.front() {
+                    if first.len() > buf.len() {
+                        return Err(Errno::EINVAL);
+                    }
+                    let mut at = 0;
+                    while let Some(e) = st.queue.front() {
+                        let len = e.len();
+                        if at + len > buf.len() {
+                            break;
+                        }
+                        let e = st.queue.pop_front().unwrap();
+                        let name_len = InotifyEvent::name_len(&e.name);
+                        buf[at..at + 4].copy_from_slice(&e.wd.to_le_bytes());
+                        buf[at + 4..at + 8].copy_from_slice(&e.mask.to_le_bytes());
+                        buf[at + 8..at + 12].copy_from_slice(&e.cookie.to_le_bytes());
+                        buf[at + 12..at + 16].copy_from_slice(&(name_len as u32).to_le_bytes());
+                        let name = &mut buf[at + 16..at + len];
+                        name.fill(0);
+                        name[..e.name.len()].copy_from_slice(e.name.as_bytes());
+                        at += len;
+                    }
+                    drop(st);
+                    self.changed();
+                    return Ok(at);
+                }
+            }
+            if nonblock {
+                return Err(Errno::EAGAIN);
+            }
+            self.wait
+                .wait_interruptible(|| !self.state.lock().queue.is_empty())?;
         }
-        static NOBODY: WaitQueue = WaitQueue::new();
-        NOBODY.wait_interruptible(|| false)?;
-        Err(Errno::EAGAIN)
     }
 
     fn write_stream(&self, _data: &[u8], _nonblock: bool) -> KResult<usize> {
@@ -708,6 +1001,25 @@ impl Inode for Inotify {
     }
 
     fn poll(&self) -> u16 {
-        0
+        if self.state.lock().queue.is_empty() {
+            0
+        } else {
+            poll::POLLIN
+        }
+    }
+
+    fn poll_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn ioctl(&self, req: u32, arg: u64, mm: &crate::mm::vm::AddressSpace) -> KResult<u64> {
+        const FIONREAD: u32 = 0x541b;
+        match req {
+            FIONREAD => {
+                mm.write(arg, &(self.pending_bytes() as i32))?;
+                Ok(0)
+            }
+            _ => Err(Errno::ENOTTY),
+        }
     }
 }

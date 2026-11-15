@@ -8,6 +8,10 @@
 //! periodic flush; a cache whose pages no mapping uses any more is then
 //! dropped. Files that are not shared-mapped are read and written straight
 //! through their file system (and the block cache under it).
+//!
+//! Private file mappings (shared libraries) fault their pages in from
+//! here too, copy-on-write: every process running a library shares one
+//! copy of its code.
 
 use super::Inode;
 use crate::abi::KResult;
@@ -16,11 +20,19 @@ use crate::sync::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub struct Cache {
     inode: Arc<dyn Inode>,
     /// Page index → frame (the cache holds one reference to each).
     pages: SpinLock<BTreeMap<u64, u64>>,
+    /// Dropped by [`sync_all`] (its frames are gone): users of an old
+    /// reference to it go to the inode's current cache instead.
+    dead: AtomicBool,
+    /// Some writable shared mapping showed the pages: they may differ
+    /// from the file. (Private mappings copy a page before writing it, and
+    /// `write` updates the file too, so only these need writing back.)
+    writable: AtomicBool,
 }
 
 static CACHES: SpinLock<Vec<Arc<Cache>>> = SpinLock::new(Vec::new());
@@ -47,6 +59,8 @@ pub fn get(inode: &Arc<dyn Inode>) -> Arc<Cache> {
     let c = Arc::new(Cache {
         inode: inode.clone(),
         pages: SpinLock::new(BTreeMap::new()),
+        dead: AtomicBool::new(false),
+        writable: AtomicBool::new(false),
     });
     caches.push(c.clone());
     c
@@ -54,10 +68,20 @@ pub fn get(inode: &Arc<dyn Inode>) -> Arc<Cache> {
 
 impl Cache {
     /// The frame holding page `idx`, read from the file the first time
-    /// (zeros past the end of the file).
+    /// (zeros past the end of the file), with a reference taken for the
+    /// caller: it maps the frame or lets go with `frame::free`. (Taken
+    /// under the lock, so that [`sync_all`] cannot free the frame first.)
     pub fn page(&self, idx: u64) -> KResult<u64> {
-        if let Some(&p) = self.pages.lock().get(&idx) {
-            return Ok(p);
+        {
+            let pages = self.pages.lock();
+            if self.dead.load(Ordering::Relaxed) {
+                drop(pages);
+                return get(&self.inode).page(idx);
+            }
+            if let Some(&p) = pages.get(&idx) {
+                frame::get(p);
+                return Ok(p);
+            }
         }
         let phys = frame::alloc_zeroed().ok_or(crate::abi::Errno::ENOMEM)?;
         let buf =
@@ -77,11 +101,18 @@ impl Cache {
             }
         }
         let mut pages = self.pages.lock();
+        if self.dead.load(Ordering::Relaxed) {
+            drop(pages);
+            frame::free(phys);
+            return get(&self.inode).page(idx);
+        }
         if let Some(&p) = pages.get(&idx) {
             frame::free(phys); // another thread loaded it meanwhile
+            frame::get(p);
             return Ok(p);
         }
         pages.insert(idx, phys);
+        frame::get(phys);
         Ok(phys)
     }
 
@@ -99,6 +130,7 @@ impl Cache {
             let n = (PAGE_SIZE as usize - o).min(len - done);
             let src = unsafe { core::slice::from_raw_parts(phys_to_virt(phys).add(o), n) };
             buf[done..done + n].copy_from_slice(src);
+            frame::free(phys);
             done += n;
         }
         Ok(done)
@@ -121,20 +153,42 @@ impl Cache {
         }
     }
 
-    /// Writes every cached page (up to the file's size) to the file.
+    /// Notes that a writable shared mapping shows the pages.
+    pub fn mark_writable(&self) {
+        self.writable.store(true, Ordering::Relaxed);
+    }
+
+    /// Writes every cached page (up to the file's size) to the file, if a
+    /// writable shared mapping may have changed them.
     pub fn write_back(&self) -> KResult<()> {
+        if !self.writable.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let size = self.inode.size();
-        let pages: Vec<(u64, u64)> = self.pages.lock().iter().map(|(&i, &p)| (i, p)).collect();
-        for (idx, phys) in pages {
+        // References of our own: the frames stay while being written.
+        let pages: Vec<(u64, u64)> = self
+            .pages
+            .lock()
+            .iter()
+            .map(|(&i, &p)| {
+                frame::get(p);
+                (i, p)
+            })
+            .collect();
+        let mut result = Ok(());
+        for &(idx, phys) in &pages {
             let off = idx * PAGE_SIZE;
-            if off >= size {
+            if off >= size || result.is_err() {
                 continue;
             }
             let n = (size - off).min(PAGE_SIZE) as usize;
             let data = unsafe { core::slice::from_raw_parts(phys_to_virt(phys), n) };
-            self.inode.write_at(off, data)?;
+            result = self.inode.write_at(off, data).map(|_| ());
         }
-        Ok(())
+        for (_, p) in pages {
+            frame::free(p);
+        }
+        result
     }
 
     /// Whether some mapping still uses one of its pages.
@@ -176,9 +230,15 @@ pub fn sync_all() {
             crate::warn!("page cache: write-back failed ({e:?})");
             continue;
         }
-        if !c.mapped() {
-            CACHES.lock().retain(|o| !Arc::ptr_eq(o, &c));
-            for (_, p) in core::mem::take(&mut *c.pages.lock()) {
+        // Dropped only if no mapping (and no `page` caller) holds a page,
+        // decided under the cache's lock: `page` takes its references
+        // under it too.
+        let mut caches = CACHES.lock();
+        let mut pages = c.pages.lock();
+        if pages.values().all(|&p| frame::ref_count(p) <= 1) && !c.dead.load(Ordering::Relaxed) {
+            c.dead.store(true, Ordering::Relaxed);
+            caches.retain(|o| !Arc::ptr_eq(o, &c));
+            for (_, p) in core::mem::take(&mut *pages) {
                 frame::free(p);
             }
         }

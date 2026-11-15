@@ -1,0 +1,46 @@
+# probes
+ok   prctl(PR_GET_SECCOMP) == 0
+ok   prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, NULL, 0, 0) == -1 && errno == EFAULT
+ok   syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, NULL) == -1 && errno == EFAULT
+ok   syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &action) == 0
+ok   syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &action) == -1 && errno == EOPNOTSUPP
+ok   prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 0
+# filters
+ok   prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+ok   install_prctl(first, sizeof first / sizeof first[0]) == 0
+ok   prctl(PR_GET_SECCOMP) == SECCOMP_MODE_FILTER
+ok   syscall(SYS_getppid) == -1 && errno == 42
+ok   syscall(SYS_getpid) > 0
+ok   syscall(SYS_getpriority, 0x1ff, 0) == -1 && errno == 9
+ok   syscall(SYS_getpriority, 0x7f, 0) == -1 && errno == 7
+ok   syscall(SYS_getpriority, 0, 0) >= 0
+ok   traps == 1 && r == 4242
+ok   trapped_nr == SYS_getsid && trapped_arch == (long)AUDIT_ARCH_X86_64
+ok   trapped_data == 0x55 && trapped_rax == SYS_getsid
+ok   install(second, sizeof second / sizeof second[0], 0) == 0
+ok   syscall(SYS_getppid) == -1 && errno == 1
+ok   syscall(SYS_getpgrp) == -1 && errno == 3
+ok   syscall(SYS_getsid) == 4242 && traps == 2
+ok   (long)res == 1
+ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
+ok   WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS
+ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
+# tsync
+ok   prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+ok   install(f, sizeof f / sizeof f[0], SECCOMP_FILTER_FLAG_TSYNC) == 0
+ok   done && seen_in_thread == 5
+ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
+# strict
+ok   write in strict mode
+ok   WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL
+ok   prctl(PR_GET_SECCOMP) == 0 && syscall(SYS_getppid) > 0
+# bad programs
+ok   prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+ok   prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1
+ok   install(jump_out, 2, 0) == -1 && errno == EINVAL
+ok   install(no_return, 1, 0) == -1 && errno == EINVAL
+ok   install(past_data, 2, 0) == -1 && errno == EINVAL
+ok   install(misaligned, 2, 0) == -1 && errno == EINVAL
+ok   install(misaligned, 0, 0) == -1 && errno == EINVAL
+ok   prctl(PR_GET_SECCOMP) == 0
+PASSED

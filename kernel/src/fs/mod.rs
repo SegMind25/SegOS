@@ -210,6 +210,11 @@ pub trait Inode: Send + Sync {
     fn readlink(&self) -> KResult<String> {
         Err(Errno::EINVAL)
     }
+    /// A "magic" link (`/proc/<pid>/fd/<n>`): following it reaches this
+    /// inode directly instead of looking its target's name up.
+    fn magic_target(&self) -> Option<Arc<dyn Inode>> {
+        None
+    }
 
     // Directories.
     fn lookup(&self, _name: &str) -> KResult<Arc<dyn Inode>> {
@@ -404,6 +409,15 @@ pub fn resolve(
                 return Err(Errno::ELOOP);
             }
             let target = next.readlink()?;
+            if let Some(inode) = next.magic_target() {
+                cur = inode;
+                canon = target
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+                continue;
+            }
             if target.starts_with('/') {
                 cur = root();
                 canon.clear();
@@ -511,6 +525,9 @@ pub struct File {
     pub flags: SpinLock<u32>,
     /// Whether it has held a `flock` lock (to release on the last close).
     pub locked: core::sync::atomic::AtomicBool,
+    /// The absolute path it was opened by, if known (for /proc/<pid>/fd
+    /// and /proc/<pid>/maps: a regular file's inode knows no name).
+    path: SpinLock<Option<Arc<str>>>,
 }
 
 impl Drop for File {
@@ -528,7 +545,16 @@ impl File {
             offset: Mutex::new(0),
             flags: SpinLock::new(flags),
             locked: core::sync::atomic::AtomicBool::new(false),
+            path: SpinLock::new(None),
         })
+    }
+
+    pub fn set_path(&self, path: &str) {
+        *self.path.lock() = Some(Arc::from(path));
+    }
+
+    pub fn path(&self) -> Option<Arc<str>> {
+        self.path.lock().clone()
     }
 
     pub fn readable(&self) -> bool {

@@ -8,6 +8,7 @@
 
 mod cpio;
 mod fat;
+mod firefox;
 mod glibc;
 mod gpt;
 mod nettest;
@@ -40,6 +41,8 @@ environment:
   MUSL_GCC  the musl C compiler (default musl-gcc)
   BUSYBOX   a statically linked x86-64 busybox (default: Ubuntu's
             busybox-static, downloaded with apt-get into target/busybox)
+  SEGOS_REUSE_ROOTFS  keep target/rootfs.img from the last build (kernel work)
+  SEGOS_NO_FIREFOX    leave Firefox off the root disk
 
 The image is a GPT disk with one FAT32 EFI system partition holding
 segboot, the kernel and the initramfs (userland/ built with musl); write it
@@ -212,7 +215,11 @@ fn read(p: &Path) -> Result<Vec<u8>, String> {
 fn image(opts: &Opts, ktest: bool) -> Result<PathBuf, String> {
     let (bootloader, kernel) = build_all(opts, ktest)?;
     let u = userland::build()?;
-    root_disk(&u)?;
+    if std::env::var_os("SEGOS_REUSE_ROOTFS").is_none()
+        || !root().join("target/rootfs.img").exists()
+    {
+        root_disk(&u)?;
+    }
     let initramfs = userland::initramfs(&u)?;
     let files = [
         ("EFI/BOOT/BOOTX64.EFI", read(&bootloader)?),
@@ -260,7 +267,8 @@ fn root_disk(u: &userland::Userland) -> Result<PathBuf, String> {
     let target = root().join("target");
     let tree = target.join("rootfs");
     userland::tree(u, &tree)?;
-    let copied = glibc::add(&tree)?;
+    let firefox_libs = firefox::add(&tree)?;
+    let copied = glibc::add(&tree, &firefox_libs)?;
     nettest::prepare(&tree)?;
     if copied > 0 {
         eprintln!("xtask: root disk: {copied} files of Ubuntu's glibc userland");
@@ -302,7 +310,7 @@ fn root_disk(u: &userland::Userland) -> Result<PathBuf, String> {
 fn qemu(img: &Path) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     let ovmf = std::env::var("OVMF").unwrap_or_else(|_| "/usr/share/ovmf/OVMF.fd".into());
-    cmd.args(["-M", "q35", "-m", "512M", "-smp", "4", "-no-reboot"])
+    cmd.args(["-M", "q35", "-m", "2G", "-smp", "4", "-no-reboot"])
         .args(["-serial", "stdio"])
         .args(["-bios", &ovmf])
         .arg("-drive")
@@ -566,7 +574,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
         ("echo SEGOS-$((6 * 7))-OK", "SEGOS-42-OK"),
         (
             "ls /tests | grep expected | wc -l | sed 's/^/COUNT=/'",
-            "COUNT=8",
+            "COUNT=9",
         ),
         ("hello | tr a-z A-Z", "HELLO, WORLD!"),
         ("cat /proc/self/comm | tr a-z A-Z", "CAT"),
@@ -600,6 +608,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
             "THREADS-328350",
         ));
     }
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
     // Phase 6: networking, against servers on the build machine.
     let servers =
         if rootfs.join("curl").exists() && rootfs.join("ssh").exists() && nettest::available() {
@@ -608,7 +617,6 @@ fn shell_session(img: &Path) -> Result<(), String> {
             None
         };
     if let Some(s) = &servers {
-        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
         steps.push((
             "ip -4 addr show dev eth0 | grep -o 'inet [0-9.]*/[0-9]*' | tr a-z A-Z",
             "INET 10.0.2.15/24",
@@ -646,10 +654,26 @@ fn shell_session(img: &Path) -> Result<(), String> {
             "GCC-42",
         ));
     }
-    for (cmd, want) in steps {
+    // Phase 8: Firefox, headless, renders a page to a PNG; Ubuntu's
+    // python3 reads the colours back (see pngcheck.py). Slow without KVM.
+    let firefox = root()
+        .join("target/rootfs/opt/firefox/firefox-bin")
+        .exists();
+    let mut slow: Vec<(&str, &str)> = Vec::new();
+    if firefox {
+        slow.push((
+            leak(format!(
+                "HOME=/root MOZ_CRASHREPORTER_DISABLE=1 firefox --headless --screenshot /tmp/ff.png file://{dir}/page.html > /tmp/ff.log 2>&1; python3 {dir}/pngcheck.py /tmp/ff.png",
+                dir = firefox::TEST_DIR
+            )),
+            "top=red middle=red bottom=blue",
+        ));
+    }
+    let steps = steps.into_iter().map(|(c, w)| (c, w, 120));
+    for (cmd, want, secs) in steps.chain(slow.into_iter().map(|(c, w)| (c, w, 900))) {
         let _ = stdin.write_all(format!("{cmd}\n").as_bytes());
         let _ = stdin.flush();
-        let Some(end) = wait_for(want, at, 120) else {
+        let Some(end) = wait_for(want, at, secs) else {
             return fail(format!("`{cmd}` did not print `{want}`"), &mut child);
         };
         at = end;

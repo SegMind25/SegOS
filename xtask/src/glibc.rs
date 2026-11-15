@@ -50,10 +50,33 @@ const PACKAGES: &[&str] = &[
     "fontconfig-config",
     "ca-certificates",
     "netbase",
+    // Phase 8: what GTK 3 reads at run time, for Firefox (whose own
+    // shared libraries come from `firefox.rs`).
+    "libgtk-3-0t64",
+    "libgtk-3-common",
+    "libglib2.0-0t64",
+    "gsettings-desktop-schemas",
+    "libgdk-pixbuf-2.0-0",
+    "libgdk-pixbuf2.0-common",
+    "librsvg2-common",
+    "shared-mime-info",
+    "hicolor-icon-theme",
+    "adwaita-icon-theme",
 ];
 
 /// Files no package lists (generated at install time) but programs need.
-const EXTRA: &[&str] = &["/etc/ssl/certs/ca-certificates.crt"];
+const EXTRA: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/usr/share/glib-2.0/schemas/gschemas.compiled",
+    "/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache",
+    "/usr/lib/x86_64-linux-gnu/gio/modules/giomodule.cache",
+    "/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache",
+    "/usr/share/mime/mime.cache",
+    "/usr/share/mime/globs2",
+    "/usr/share/mime/magic",
+    "/usr/share/icons/hicolor/icon-theme.cache",
+    "/usr/share/icons/Adwaita/icon-theme.cache",
+];
 
 /// Paths not worth the space.
 fn skipped(p: &str) -> bool {
@@ -115,7 +138,7 @@ fn libraries(file: &Path) -> Vec<String> {
         .collect()
 }
 
-fn is_elf(p: &Path) -> bool {
+pub fn is_elf(p: &Path) -> bool {
     use std::io::Read;
     let mut magic = [0u8; 4];
     std::fs::File::open(p)
@@ -163,8 +186,9 @@ fn copy(host: &str, tree: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Adds the glibc layer to `tree`. Returns how many files were copied.
-pub fn add(tree: &Path) -> Result<usize, String> {
+/// Adds the glibc layer to `tree`, with the host files `extra` (and the
+/// libraries they load). Returns how many files were copied.
+pub fn add(tree: &Path, extra: &[String]) -> Result<usize, String> {
     if std::env::var_os("SEGOS_NO_GLIBC").is_some() {
         return Ok(0);
     }
@@ -178,6 +202,7 @@ pub fn add(tree: &Path) -> Result<usize, String> {
         }
     }
     files.extend(EXTRA.iter().map(|s| s.to_string()));
+    files.extend(extra.iter().cloned());
     if files.is_empty() {
         eprintln!("xtask: no glibc packages found (not Debian/Ubuntu?): root disk without them");
         return Ok(0);

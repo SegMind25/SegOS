@@ -68,6 +68,10 @@ impl Inode for GenFile {
 struct Link {
     ino: u64,
     target: Box<dyn Fn() -> KResult<String> + Send + Sync>,
+    /// For `/proc/<pid>/fd/<n>`: the open file itself, which a lookup
+    /// through the link reaches whatever its name (a memfd, a deleted
+    /// file), as Linux's "magic links" do.
+    inode: Option<Arc<dyn Inode>>,
 }
 
 impl Inode for Link {
@@ -85,6 +89,9 @@ impl Inode for Link {
     }
     fn readlink(&self) -> KResult<String> {
         (self.target)()
+    }
+    fn magic_target(&self) -> Option<Arc<dyn Inode>> {
+        self.inode.clone()
     }
 }
 
@@ -171,6 +178,7 @@ fn link(ino: u64, target: impl Fn() -> KResult<String> + Send + Sync + 'static) 
     Arc::new(Link {
         ino,
         target: Box::new(target),
+        inode: None,
     })
 }
 
@@ -383,15 +391,68 @@ fn pid_status(p: &Process) -> String {
         'Z' => "Z (zombie)",
         _ => "S (sleeping)",
     };
+    // The main (oldest) thread's restrictions.
+    let (nnp, seccomp) = p
+        .threads()
+        .first()
+        .and_then(|t| {
+            t.user().map(|u| {
+                (
+                    u.no_new_privs.load(Ordering::Relaxed) as u32,
+                    u.seccomp_mode.load(Ordering::Relaxed),
+                )
+            })
+        })
+        .unwrap_or((0, 0));
     format!(
         "Name:\t{}\nUmask:\t{:04o}\nState:\t{state}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{}\n\
-         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t{}\n",
+         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t{}\n\
+         NoNewPrivs:\t{nnp}\nSeccomp:\t{seccomp}\n",
         p.name.lock().as_str(),
         p.umask.load(Ordering::Relaxed),
         p.ppid.load(Ordering::Relaxed),
         p.thread_count().max(1),
         pid = p.pid,
     )
+}
+
+/// `/proc/<pid>/maps`: the address space's regions, as Linux prints them.
+fn pid_maps(p: &Process) -> String {
+    use crate::abi::mman::{PROT_EXEC, PROT_READ, PROT_WRITE};
+    use crate::mm::vm::Kind;
+    let Some(mm) = p.threads().iter().find_map(|t| t.user().map(|u| u.mm())) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for v in mm.regions() {
+        let bit = |b: u32, c: char| if v.prot & b != 0 { c } else { '-' };
+        let (off, ino, name) = match (&v.file, v.kind) {
+            (Some((f, off)), _) => (
+                *off,
+                f.ino(),
+                v.path.as_deref().map(String::from).unwrap_or_default(),
+            ),
+            (None, Kind::Heap) => (0, 0, "[heap]".into()),
+            (None, Kind::Stack) => (0, 0, "[stack]".into()),
+            _ => (0, 0, String::new()),
+        };
+        let line = format!(
+            "{:08x}-{:08x} {}{}{}{} {off:08x} 00:00 {ino}",
+            v.start,
+            v.end,
+            bit(PROT_READ, 'r'),
+            bit(PROT_WRITE, 'w'),
+            bit(PROT_EXEC, 'x'),
+            if v.kind == Kind::Shared { 's' } else { 'p' },
+        );
+        if name.is_empty() {
+            out.push_str(&line);
+        } else {
+            out.push_str(&format!("{line:<72} {name}"));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// What `/proc/<pid>/fd/<n>` points to.
@@ -410,7 +471,10 @@ fn fd_target(f: &super::File) -> String {
                 _ => format!("/dev/char/{}:{}", (rdev >> 8) & 0xfff, rdev & 0xff),
             }
         }
-        _ => path_of(&f.inode),
+        _ => f
+            .path()
+            .map(|p| String::from(&*p))
+            .unwrap_or_else(|| path_of(&f.inode)),
     }
 }
 
@@ -456,6 +520,7 @@ fn pid_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
             ),
             ("fd".into(), fd_dir(pid, me)),
             ("task".into(), task_dir(pid, me)),
+            ("maps".into(), file(ino_of(pid, 0x10), me, with(pid_maps))),
         ]
     })
 }
@@ -514,7 +579,11 @@ fn thread_dir(pid: u32, tid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
             (
                 "comm".into(),
                 file(ino_of(tid, 13), me, move || alive()
-                    .map(|p| format!("{}\n", p.name.lock().as_str()))
+                    .map(|p| {
+                        let own = crate::proc::find_thread(tid)
+                            .and_then(|t| t.user().and_then(|u| u.comm.lock().clone()));
+                        format!("{}\n", own.unwrap_or_else(|| p.name.lock().clone()))
+                    })
                     .unwrap_or_default())
             ),
         ]
@@ -530,7 +599,11 @@ fn fd_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
         fds.into_iter()
             .map(|(fd, f)| {
                 let target = fd_target(&f);
-                let l = link(ino_of(pid, 0x100 + fd as u64), move || Ok(target.clone()));
+                let l: Arc<dyn Inode> = Arc::new(Link {
+                    ino: ino_of(pid, 0x100 + fd as u64),
+                    target: Box::new(move || Ok(target.clone())),
+                    inode: Some(f.inode.clone()),
+                });
                 (fd.to_string(), l)
             })
             .collect()
