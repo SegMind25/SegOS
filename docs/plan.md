@@ -9,7 +9,7 @@ Threads, futexes, epoll, eventfd, timerfd and signalfd are in. Six
 conformance tests print byte for byte what they print on Linux; 26 kernel
 tests pass in QEMU on 4 CPUs (debug and release); CI types commands into
 the shell, bash, python3 and gcc over the serial port. No third-party
-crates. Next: Phase 6, networking.
+crates. Next: Phase 7, graphics and input.
 
 ## 1. The goal, stated precisely
 
@@ -332,19 +332,49 @@ root disk; they are guest software on the test disk, not part of SegOS.
   recorded on Linux; the shell session runs bash, GNU `seq`, python3 (an
   8-thread pool) and gcc.
 
-## 12. Next concrete steps (Phase 6: networking)
+## 12. Phase 6, as built
 
-The demo: `curl https://…` and `ssh` work on SegOS (QEMU's virtio-net and
-Intel e1000, then a real PC's network card).
+The demo: on SegOS, Ubuntu's `curl` downloads over HTTPS from a server on
+another machine (certificate verified, 4 MiB with a matching md5) and
+`ssh` logs in to it with a key and runs a command. In CI the other
+machine is the build machine: `cargo xtask test` starts a Python HTTPS
+server and an unprivileged sshd there, which SegOS reaches through QEMU's
+user network (10.0.2.2, `segos-host` in `/etc/hosts`).
 
-1. **Network drivers**: virtio-net first, then e1000/e1000e; MSI-X.
-2. **A TCP/IP stack in Rust**: Ethernet, ARP, IPv4 (then IPv6), ICMP,
-   UDP, TCP with retransmission, windows and congestion control; DHCP.
-3. **Sockets**: `socket`, `bind`, `listen`, `accept4`, `connect`,
-   `send*`/`recv*`, `shutdown`, socket options, `poll`/`epoll` on sockets;
-   Unix domain sockets with `SCM_RIGHTS`; `socketpair`.
-4. **Netlink** (route and link messages) so `ip` and glibc's
-   `getaddrinfo`/`getifaddrs` work; `/etc/resolv.conf` and DNS through
-   glibc.
-5. **Tests**: socket conformance tests recorded on Linux, and a CI run
-   that fetches a page from a server on the host with `curl`.
+- **virtio-net** (`drivers/virtio_net.rs`): receive and transmit
+  virtqueues, a page per frame, no offloads; received frames raise MSI-X.
+- **The stack** (`net/`), written for SegOS: interfaces `lo` and `ethN`,
+  Ethernet and ARP (queueing until the answer), routing (subnet, default
+  gateway, local addresses through loopback), IPv4 without fragments,
+  ICMP (echo replies; raw and ping sockets), UDP, and TCP: three-way
+  handshake both ways, listen backlog, retransmission with back-off,
+  flow control with 64 KiB windows, zero-window probes, half-close,
+  RST, TIME_WAIT. A network thread runs input and the timers.
+- **DHCP** client at boot; `/proc/net/pnp` lists the DNS servers and
+  `/etc/resolv.conf` links to it, as with Linux's kernel autoconfig.
+- **Sockets**: AF_INET stream, datagram and ICMP; options (`SO_ERROR`
+  for non-blocking connect, `TCP_NODELAY`, `SO_REUSEADDR`, ...);
+  `SIOCGIF*` ioctls; NETLINK_ROUTE dumps of links, addresses and routes,
+  and changes to them (`ip addr add`, `ip route add default`, `ip link
+  set up`); `sendmmsg`/`recvmmsg` for glibc's resolver; `/proc/net/dev`,
+  `route`, `tcp`.
+- **Smaller**: `close_range`, `alarm`/`setitimer`/`getitimer` (ping's
+  interval timer).
+- **Tests**: `userland/tests/inet.c` (TCP and UDP over loopback, 63
+  checks, recorded on Linux); the shell session checks DHCP, `ping`,
+  `curl` over HTTPS and `ssh`.
+
+Not yet: IPv6, IP fragments, window scaling and SACK, congestion
+control, an e1000 driver for real PCs.
+
+## 13. Next concrete steps (Phase 7: graphics and input)
+
+The demo: a Wayland compositor and desktop shell run on SegOS.
+
+1. **virtio-gpu** with a DRM/KMS interface (dumb buffers, mode setting,
+   page flips), then simple-framebuffer on real PCs.
+2. **Input**: evdev devices for the PS/2 keyboard and mouse, then xHCI
+   and USB HID.
+3. **Memory sharing**: `memfd_create`, `SCM_RIGHTS` of buffers, dma-buf.
+4. **Tests**: a client drawing into a dumb buffer, checked by reading
+   the framebuffer back.

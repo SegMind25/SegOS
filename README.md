@@ -4,16 +4,19 @@ An operating system written from scratch in Rust, aiming to run **unmodified
 Linux applications** (and, through Wine/Proton, Windows ones) by implementing
 the Linux system call interface in a new kernel.
 
-Status: **Phase 5 (the Linux userland) done**. SegOS boots on UEFI with
+Status: **Phase 6 (networking) done**. SegOS boots on UEFI with
 its own bootloader, finds its disks (virtio, NVMe and SATA drivers,
 interrupt-driven) and boots from a read-write **ext4 root file system**.
 On it, **unmodified Linux programs** run as Ubuntu builds them,
 dynamically linked against glibc: **bash, GNU coreutils, Python 3.13 and
 gcc**, which compiles a C program on SegOS that then runs. Behind them:
 threads, futexes, `epoll`/`eventfd`/`timerfd`/`signalfd`, `fork`,
-signals, pipes, mounts, FAT32, a block cache and a page cache. Six
-conformance tests print byte for byte what they print on Linux. Next is
-Phase 6: networking.
+signals, pipes, mounts, FAT32, a block cache and a page cache. And it is
+**on the network**: its own TCP/IP stack in Rust (virtio-net, ARP, IPv4,
+ICMP, UDP, TCP, DHCP, netlink), so Ubuntu's `curl` fetches pages over
+**HTTPS** and `ssh` logs in to another machine. Eight conformance tests
+print byte for byte what they print on Linux. Next is Phase 7: graphics
+and input.
 
 The operating system itself is all in this repository: the bootloader, the
 kernel and the build tool use no third-party crates, only Rust's `core`,
@@ -197,11 +200,11 @@ flowchart TB
     end
     subgraph L["Linux userland"]
         direction LR
-        P4["4 · Real disks<br/>NVMe, SATA, ext4"]:::next --> P5["5 · Full userland<br/>glibc: bash, python, gcc"] --> P6["6 · Networking<br/>TCP/IP: curl, ssh"]
+        P4["4 · Real disks<br/>NVMe, SATA, ext4"]:::done --> P5["5 · Full userland<br/>glibc: bash, python, gcc"]:::done --> P6["6 · Networking<br/>TCP/IP: curl, ssh"]:::done
     end
     subgraph D["Desktop and games"]
         direction LR
-        P7["7 · Graphics, input<br/>a desktop"] --> P8["8 · Desktop apps<br/>Firefox, Chromium"] --> P9["9 · Games<br/>Wine/Proton, Steam"] --> P10["10 · Release<br/>installer, updates"]
+        P7["7 · Graphics, input<br/>a desktop"]:::next --> P8["8 · Desktop apps<br/>Firefox, Chromium"] --> P9["9 · Games<br/>Wine/Proton, Steam"] --> P10["10 · Release<br/>installer, updates"]
     end
     F --> L --> D
     classDef done fill:#1f6f43,stroke:#2ea043,color:#fff

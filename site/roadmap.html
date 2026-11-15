@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Roadmap: SegOS</title>
-  <meta name="description" content="The SegOS roadmap: 11 phases from kernel bring-up to running Steam and Proton games on a from-scratch Rust kernel that implements the Linux ABI. Phases 0 to 5 are done: unmodified bash, coreutils, Python and gcc run on SegOS. Phase 6, networking, is next.">
+  <meta name="description" content="The SegOS roadmap: 11 phases from kernel bring-up to running Steam and Proton games on a from-scratch Rust kernel that implements the Linux ABI. Phases 0 to 6 are done: unmodified bash, Python, gcc, curl over HTTPS and ssh run on SegOS. Phase 7, graphics and input, is next.">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f7f5f1" media="(prefers-color-scheme: light)">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="SegOS">
   <meta property="og:title" content="SegOS roadmap: from bring-up to Steam">
-  <meta property="og:description" content="11 phases, each ending in a working demo. Phases 0 to 5 done: bring-up to real disks and the full Linux userland (bash, Python, gcc). Phase 6, networking, next.">
+  <meta property="og:description" content="11 phases, each ending in a working demo. Phases 0 to 6 done: bring-up to real disks, the full Linux userland and networking (curl https, ssh). Phase 7, graphics, next.">
   <meta property="og:image" content="/assets/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -51,10 +51,10 @@
         </p>
       </section>
 
-      <div class="progress" role="img" aria-label="Progress: phases 0 to 5 done, phase 6 next, phases 7 to 10 planned">
-        <span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="wip"></span><span></span><span></span><span></span><span></span>
+      <div class="progress" role="img" aria-label="Progress: phases 0 to 6 done, phase 7 next, phases 8 to 10 planned">
+        <span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span><span class="wip"></span><span></span><span></span><span></span>
       </div>
-      <p class="progress-legend">Phases 0&ndash;5 done &middot; Phase 6 next &middot; Phases 7&ndash;10 planned</p>
+      <p class="progress-legend">Phases 0&ndash;6 done &middot; Phase 7 next &middot; Phases 8&ndash;10 planned</p>
 
       <div class="table-wrap">
         <table class="phases">
@@ -111,19 +111,19 @@
               <td data-label="Effort" class="effort">3&ndash;4 months</td>
               <td class="status"><span class="badge done">Done</span></td>
             </tr>
-            <tr class="is-wip">
+            <tr>
               <th scope="row"><span class="num">6</span> Networking</th>
-              <td data-label="What gets built">virtio-net, e1000, TCP/IP (smoltcp, later own), unix sockets incl. <code>SCM_RIGHTS</code>, netlink (route, uevent)</td>
+              <td data-label="What gets built">virtio-net, its own TCP/IP stack (IPv4, ICMP, UDP, TCP, DHCP), unix sockets incl. <code>SCM_RIGHTS</code>, netlink (route)</td>
               <td data-label="Done when"><code>curl https://&hellip;</code> and <code>ssh</code> work</td>
               <td data-label="Effort" class="effort">2&ndash;3 months</td>
-              <td class="status"><span class="badge wip">Next</span></td>
+              <td class="status"><span class="badge done">Done</span></td>
             </tr>
-            <tr>
+            <tr class="is-wip">
               <th scope="row"><span class="num">7</span> Graphics and input</th>
               <td data-label="What gets built">DRM/KMS on virtio-gpu (then simple-framebuffer, then AMD/Intel), evdev, xHCI + USB HID, <code>memfd</code>, dma-buf</td>
               <td data-label="Done when">SegLinux&rsquo;s Rust compositor and shell run unchanged on SegOS</td>
               <td data-label="Effort" class="effort">4&ndash;6 months</td>
-              <td class="status"><span class="badge planned">Planned</span></td>
+              <td class="status"><span class="badge wip">Next</span></td>
             </tr>
             <tr>
               <th scope="row"><span class="num">8</span> Desktop apps</th>

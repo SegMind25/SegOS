@@ -10,7 +10,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="SegOS">
   <meta property="og:title" content="SegOS: a from-scratch OS in Rust that speaks Linux">
-  <meta property="og:description" content="A new kernel in Rust that implements the Linux syscall ABI, so unmodified Linux apps (and Windows apps via Wine/Proton) can run on it. Phases 0 to 5 done: unmodified bash, coreutils, Python and gcc run on it.">
+  <meta property="og:description" content="A new kernel in Rust that implements the Linux syscall ABI, so unmodified Linux apps (and Windows apps via Wine/Proton) can run on it. Phases 0 to 6 done: unmodified bash, Python, gcc, curl (HTTPS) and ssh run on it.">
   <meta property="og:image" content="/assets/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -153,7 +153,7 @@
         <div class="section-head">
           <p class="kicker">Status</p>
           <h2 id="status-title">Where it is right now</h2>
-          <p>Each phase ends with a demo that has to work in QEMU and in CI. Phases 0 to 5 have passed; Phase 6, networking, is next.</p>
+          <p>Each phase ends with a demo that has to work in QEMU and in CI. Phases 0 to 6 have passed; Phase 7, graphics and input, is next.</p>
         </div>
         <div class="grid">
           <div class="panel">
@@ -210,13 +210,22 @@
             </ul>
           </div>
           <div class="panel">
-            <h3>Phase 6 &middot; Networking <span class="badge wip">Next</span></h3>
-            <ul class="checklist">
-              <li>virtio-net and Intel e1000 drivers</li>
-              <li>A TCP/IP stack in Rust: IPv4, TCP, UDP, DHCP</li>
-              <li>Sockets, Unix domain sockets, netlink</li>
+            <h3>Phase 6 &middot; Networking <span class="badge done">Done</span></h3>
+            <ul class="checklist done">
+              <li>Ubuntu&rsquo;s <code>curl</code> fetches over HTTPS; <code>ssh</code> logs in to another machine</li>
+              <li>Its own TCP/IP stack in Rust: Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP</li>
+              <li>A virtio-net driver with MSI-X interrupts</li>
+              <li>Sockets: AF_INET, AF_UNIX with <code>SCM_RIGHTS</code>, netlink for <code>ip</code></li>
             </ul>
-            <p class="notice"><span>Done when <code>curl</code> and <code>ssh</code> work.</span></p>
+          </div>
+          <div class="panel">
+            <h3>Phase 7 &middot; Graphics and input <span class="badge wip">Next</span></h3>
+            <ul class="checklist">
+              <li>DRM/KMS on virtio-gpu, then real GPUs</li>
+              <li>evdev input, USB (xHCI) keyboards and mice</li>
+              <li><code>memfd</code>, dma-buf</li>
+            </ul>
+            <p class="notice"><span>Done when a Wayland compositor and desktop shell run.</span></p>
           </div>
         </div>
         <p style="margin-top:1.5rem"><a href="/roadmap">All 11 phases, from bring-up to Steam &rarr;</a></p>
