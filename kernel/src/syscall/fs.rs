@@ -171,7 +171,11 @@ fn dir_of(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<Arc<dyn Inode>> {
 
 fn resolve(ctx: &Ctx, dirfd: i32, path: &str, follow: bool) -> KResult<Arc<dyn Inode>> {
     let base = dir_of(ctx, dirfd, path)?;
-    fs::resolve(&base, path, follow).map(|(i, _)| i)
+    if follow {
+        fs::lookup(&base, path)
+    } else {
+        fs::lookup_nofollow(&base, path)
+    }
 }
 
 fn resolve_parent(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<(Arc<dyn Inode>, String)> {
@@ -518,13 +522,16 @@ pub fn renameat(
         return Err(Errno::EBUSY);
     }
     let inode = from_dir.lookup(&from)?;
+    if from_dir.dev() != to_dir.dev() {
+        return Err(Errno::EXDEV);
+    }
     let is_dir = inode.file_type() == FileType::Directory;
     if is_dir && fs::is_within(&to_dir, &inode) {
         return Err(Errno::EINVAL); // into itself
     }
     match to_dir.lookup(&to) {
         Ok(existing) => {
-            if existing.ino() == inode.ino() {
+            if fs::same(&existing, &inode) {
                 return Ok(0); // the same file: nothing to do
             }
             if flags & RENAME_NOREPLACE != 0 {
@@ -560,6 +567,9 @@ pub fn linkat(ctx: &Ctx, olddir: i32, old: u64, newdir: i32, new: u64) -> KResul
         return Err(Errno::EPERM);
     }
     let (dir, name) = resolve_parent(ctx, newdir, &new)?;
+    if dir.dev() != inode.dev() {
+        return Err(Errno::EXDEV);
+    }
     dir.insert(&name, inode.clone())?;
     inode.link_added();
     Ok(0)
@@ -654,27 +664,33 @@ pub fn statfs(ctx: &Ctx, target: u64, buf: u64, by_fd: bool) -> KResult<u64> {
         let p = path_arg(ctx, target)?;
         resolve(ctx, AT_FDCWD, &p, true)?
     };
-    let (magic, total, free) = match inode.dev() {
-        fs::DEV_PROC => (PROC_SUPER_MAGIC, 0, 0),
-        fs::DEV_PIPEFS => (PIPEFS_MAGIC, 0, 0),
-        _ => (
-            TMPFS_MAGIC,
-            crate::mm::frame::total_count(),
-            crate::mm::frame::free_count(),
-        ),
+    let (magic, bsize, total, free, files, ffree) = match inode.fs_stats() {
+        Some(s) => s,
+        None => match inode.dev() {
+            fs::DEV_PROC => (PROC_SUPER_MAGIC, 4096, 0, 0, 0, 0),
+            fs::DEV_PIPEFS => (PIPEFS_MAGIC, 4096, 0, 0, 0, 0),
+            _ => (
+                TMPFS_MAGIC,
+                4096,
+                crate::mm::frame::total_count(),
+                crate::mm::frame::free_count(),
+                1 << 20,
+                1 << 20,
+            ),
+        },
     };
     let words: [u64; 12] = [
-        magic,   // f_type
-        4096,    // f_bsize
-        total,   // f_blocks
-        free,    // f_bfree
-        free,    // f_bavail
-        1 << 20, // f_files
-        1 << 20, // f_ffree
-        0,       // f_fsid
-        255,     // f_namelen
-        4096,    // f_frsize
-        0,       // f_flags
+        magic, // f_type
+        bsize, // f_bsize
+        total, // f_blocks
+        free,  // f_bfree
+        free,  // f_bavail
+        files, // f_files
+        ffree, // f_ffree
+        0,     // f_fsid
+        255,   // f_namelen
+        bsize, // f_frsize
+        0,     // f_flags
         0,
     ];
     let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -961,4 +977,60 @@ pub fn sendfile(ctx: &Ctx, out_fd: i32, in_fd: i32, offset: u64, count: u64) -> 
         }
     }
     Ok(done as u64)
+}
+
+/// `mount`: proc, sysfs, tmpfs, devtmpfs, ext2/3/4 from a block device,
+/// and bind mounts. Remounts and propagation changes succeed and change
+/// nothing.
+pub fn mount(ctx: &Ctx, source: u64, target: u64, fstype: u64, flags: u64) -> KResult<u64> {
+    const MS_RDONLY: u64 = 1;
+    const MS_REMOUNT: u64 = 32;
+    const MS_BIND: u64 = 4096;
+    const MS_PROPAGATION: u64 = (1 << 15) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+    let target_path = path_arg(ctx, target)?;
+    let point = resolve(ctx, AT_FDCWD, &target_path, true)?;
+    if flags & (MS_REMOUNT | MS_PROPAGATION) != 0 {
+        return Ok(0);
+    }
+    let src = if source != 0 {
+        path_arg(ctx, source)?
+    } else {
+        String::new()
+    };
+    let readonly = flags & MS_RDONLY != 0;
+    if flags & MS_BIND != 0 {
+        let dir = resolve(ctx, AT_FDCWD, &src, true)?;
+        fs::mount::mount(Some(point), dir, &src, "none", readonly)?;
+        return Ok(0);
+    }
+    let ty = if fstype != 0 {
+        path_arg(ctx, fstype)?
+    } else {
+        String::new()
+    };
+    let root: Arc<dyn Inode> = match ty.as_str() {
+        "proc" => fs::procfs::root(&fs::root()),
+        "tmpfs" | "ramfs" => fs::tmpfs::Dir::new_root(0o1777),
+        "devtmpfs" => fs::lookup(&fs::initial_root(), "/dev")?,
+        "sysfs" => fs::procfs::sysfs(),
+        "ext4" | "ext3" | "ext2" => {
+            let dev = resolve(ctx, AT_FDCWD, &src, true)?;
+            if dev.file_type() != FileType::BlockDevice {
+                return Err(Errno::ENOTBLK);
+            }
+            let disk = crate::block::by_rdev(dev.rdev()).ok_or(Errno::ENXIO)?;
+            fs::ext4::Ext4::mount(disk)?
+        }
+        "" => return Err(Errno::EINVAL),
+        _ => return Err(Errno::ENODEV),
+    };
+    fs::mount::mount(Some(point), root, &src, &ty, readonly)?;
+    Ok(0)
+}
+
+pub fn umount(ctx: &Ctx, target: u64) -> KResult<u64> {
+    let p = path_arg(ctx, target)?;
+    let root = resolve(ctx, AT_FDCWD, &p, true)?;
+    fs::mount::umount(&root)?;
+    Ok(0)
 }

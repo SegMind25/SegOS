@@ -11,11 +11,16 @@
 //! root holding their own inodes. Real file systems and mounts come in
 //! Phase 4.
 
+pub mod boot;
 pub mod cpio;
 pub mod dev;
+pub mod ext4;
+pub mod mount;
 pub mod pipe;
 pub mod procfs;
 pub mod tmpfs;
+
+pub use mount::{path_of, same};
 
 use crate::abi::{Errno, KResult, Stat, mode};
 use crate::mm::vm::AddressSpace;
@@ -34,6 +39,7 @@ pub enum FileType {
     CharDevice,
     Symlink,
     Fifo,
+    BlockDevice,
 }
 
 impl FileType {
@@ -44,6 +50,7 @@ impl FileType {
             Self::CharDevice => mode::S_IFCHR,
             Self::Symlink => mode::S_IFLNK,
             Self::Fifo => mode::S_IFIFO,
+            Self::BlockDevice => mode::S_IFBLK,
         }
     }
 
@@ -55,6 +62,7 @@ impl FileType {
             Self::Directory => 4,
             Self::Regular => 8,
             Self::Symlink => 10,
+            Self::BlockDevice => 6,
         }
     }
 }
@@ -213,6 +221,46 @@ pub trait Inode: Send + Sync {
         true
     }
 
+    /// The name of `child` in this directory, if the file system can tell
+    /// without loading every entry (else entries() is searched).
+    fn name_of(&self, _child: &Arc<dyn Inode>) -> Option<String> {
+        None
+    }
+
+    /// The frame holding page `idx` of the file, for `mmap`; the caller
+    /// owns one reference. File systems with a page cache return the
+    /// cached frame (so mappings and `write` see the same bytes); the
+    /// default is a private copy.
+    fn page(&self, idx: u64) -> KResult<u64> {
+        let phys = crate::mm::frame::alloc_zeroed().ok_or(Errno::ENOMEM)?;
+        // SAFETY: a fresh frame, through the direct map.
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(
+                crate::mm::phys_to_virt(phys),
+                crate::mm::PAGE_SIZE as usize,
+            )
+        };
+        if let Err(e) = self.read_at(idx * crate::mm::PAGE_SIZE, buf) {
+            crate::mm::frame::free(phys);
+            return Err(e);
+        }
+        Ok(phys)
+    }
+    /// Whether [`Inode::page`] returns shared page-cache frames (needed for
+    /// writable MAP_SHARED mappings).
+    fn shares_pages(&self) -> bool {
+        false
+    }
+    /// Writes page `idx` (changed through a shared mapping) to the disk.
+    fn write_page(&self, _idx: u64) -> KResult<()> {
+        Ok(())
+    }
+    /// statfs numbers: (magic, block size, blocks, free blocks, inodes,
+    /// free inodes).
+    fn fs_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64)> {
+        None
+    }
+
     fn not_a_file(&self) -> Errno {
         if self.file_type() == FileType::Directory {
             Errno::EISDIR
@@ -241,19 +289,36 @@ pub trait Inode: Send + Sync {
     }
 }
 
-static ROOT: Once<Arc<dyn Inode>> = Once::new();
+static ROOT: SpinLock<Option<Arc<dyn Inode>>> = SpinLock::new(None);
+static INITIAL: Once<Arc<dyn Inode>> = Once::new();
 
-/// The root directory. Created (empty, with `/dev` and `/proc`) on first
-/// use.
+/// The tmpfs the kernel starts with (the initramfs goes here), with
+/// `/dev` and `/proc`.
+pub fn initial_root() -> Arc<dyn Inode> {
+    INITIAL
+        .call_once(|| {
+            let root = tmpfs::Dir::new_root(0o755);
+            let devdir = root.create("dev", FileType::Directory, 0o755).unwrap();
+            dev::populate(&devdir);
+            root.insert("proc", procfs::root(&root)).unwrap();
+            let _ = mount::mount(None, root.clone(), "rootfs", "tmpfs", false);
+            root
+        })
+        .clone()
+}
+
+/// The root directory.
 pub fn root() -> Arc<dyn Inode> {
-    ROOT.call_once(|| {
-        let root = tmpfs::Dir::new_root(0o755);
-        let devdir = root.create("dev", FileType::Directory, 0o755).unwrap();
-        dev::populate(&devdir);
-        root.insert("proc", procfs::root(&root)).unwrap();
-        root
-    })
-    .clone()
+    if let Some(r) = ROOT.lock().as_ref() {
+        return r.clone();
+    }
+    let r = initial_root();
+    ROOT.lock().get_or_insert(r).clone()
+}
+
+/// Makes `dir` the root directory (booting from a disk).
+pub fn set_root(dir: Arc<dyn Inode>) {
+    *ROOT.lock() = Some(dir);
 }
 
 /// Longest path accepted, as Linux's PATH_MAX.
@@ -262,34 +327,6 @@ const NAME_MAX: usize = 255;
 /// Symbolic links followed in one lookup before ELOOP (Linux: 40).
 const MAX_SYMLINKS: usize = 40;
 
-/// The absolute path of a directory (or other inode), found by walking up
-/// the tree and looking each step's name up in its parent.
-pub fn path_of(inode: &Arc<dyn Inode>) -> String {
-    let mut parts = Vec::new();
-    let mut cur = inode.clone();
-    for _ in 0..256 {
-        let Some(parent) = cur.parent() else { break };
-        if parent.ino() == cur.ino() {
-            break; // the root
-        }
-        let Ok(entries) = parent.entries() else { break };
-        match entries.into_iter().find(|(_, i)| i.ino() == cur.ino()) {
-            Some((name, _)) => parts.push(name),
-            None => break,
-        }
-        cur = parent;
-    }
-    let mut out = String::new();
-    for p in parts.iter().rev() {
-        out.push('/');
-        out.push_str(p);
-    }
-    if out.is_empty() {
-        out.push('/');
-    }
-    out
-}
-
 /// Resolves `path` from `cwd` (absolute paths from the root), following
 /// symbolic links (the last one only if `follow_last`). Returns the inode
 /// and its canonical absolute path.
@@ -297,6 +334,15 @@ pub fn resolve(
     cwd: &Arc<dyn Inode>,
     path: &str,
     follow_last: bool,
+) -> KResult<(Arc<dyn Inode>, String)> {
+    walk(cwd, path, follow_last, true)
+}
+
+fn walk(
+    cwd: &Arc<dyn Inode>,
+    path: &str,
+    follow_last: bool,
+    want_canon: bool,
 ) -> KResult<(Arc<dyn Inode>, String)> {
     if path.is_empty() {
         return Err(Errno::ENOENT);
@@ -313,7 +359,11 @@ pub fn resolve(
     let (mut cur, mut canon): (Arc<dyn Inode>, Vec<String>) = if path.starts_with('/') {
         (root(), Vec::new())
     } else {
-        let p = path_of(cwd);
+        let p = if want_canon {
+            path_of(cwd)
+        } else {
+            String::new()
+        };
         (
             cwd.clone(),
             p.split('/')
@@ -330,14 +380,14 @@ pub fn resolve(
         match part.as_str() {
             "." => continue,
             ".." => {
-                cur = cur.parent().unwrap_or_else(|| cur.clone());
+                cur = mount::up(&cur);
                 canon.pop();
                 continue;
             }
             p if p.len() > NAME_MAX => return Err(Errno::ENAMETOOLONG),
             _ => {}
         }
-        let next = cur.lookup(&part)?;
+        let next = mount::cross(cur.lookup(&part)?);
         let last = todo.is_empty();
         if next.file_type() == FileType::Symlink && (!last || follow_last || trailing_slash) {
             links += 1;
@@ -367,12 +417,12 @@ pub fn resolve(
 
 /// Resolves `path` from `cwd`, following every symbolic link.
 pub fn lookup(cwd: &Arc<dyn Inode>, path: &str) -> KResult<Arc<dyn Inode>> {
-    resolve(cwd, path, true).map(|(i, _)| i)
+    walk(cwd, path, true, false).map(|(i, _)| i)
 }
 
 /// Resolves `path` without following a symbolic link at the end.
 pub fn lookup_nofollow(cwd: &Arc<dyn Inode>, path: &str) -> KResult<Arc<dyn Inode>> {
-    resolve(cwd, path, false).map(|(i, _)| i)
+    walk(cwd, path, false, false).map(|(i, _)| i)
 }
 
 /// Resolves everything but the last component: (directory, last name).
@@ -432,13 +482,14 @@ pub fn normalize(base: &str, path: &str) -> String {
 pub fn is_within(dir: &Arc<dyn Inode>, ancestor: &Arc<dyn Inode>) -> bool {
     let mut cur = dir.clone();
     for _ in 0..4096 {
-        if cur.ino() == ancestor.ino() {
+        if same(&cur, ancestor) {
             return true;
         }
-        match cur.parent() {
-            Some(p) if p.ino() != cur.ino() => cur = p,
-            _ => return false,
+        let p = mount::up(&cur);
+        if same(&p, &cur) {
+            return false;
         }
+        cur = p;
     }
     false
 }

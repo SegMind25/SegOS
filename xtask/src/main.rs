@@ -75,7 +75,11 @@ fn main() -> ExitCode {
             .and_then(|()| image(&opts, true))
             .and_then(|img| test(&img))
             .and_then(|()| image(&opts, false))
-            .and_then(|img| shell_session(&img)),
+            .and_then(|img| {
+                shell_session(&img, &FIRST_BOOT)?;
+                shell_session(&img, &SECOND_BOOT)?;
+                fsck_root(&img)
+            }),
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
             Ok(())
@@ -209,17 +213,134 @@ fn read(p: &Path) -> Result<Vec<u8>, String> {
 
 fn image(opts: &Opts, ktest: bool) -> Result<PathBuf, String> {
     let (bootloader, kernel) = build_all(opts, ktest)?;
-    let initramfs = userland::initramfs(&userland::build()?)?;
-    let files = [
+    let u = userland::build()?;
+    let initramfs = userland::initramfs(&u)?;
+    let mut files = vec![
         ("EFI/BOOT/BOOTX64.EFI", read(&bootloader)?),
         ("boot/segkernel", read(&kernel)?),
         ("boot/initramfs", initramfs),
     ];
     let name = if ktest { "segos-test.img" } else { "segos.img" };
     let path = root().join("target").join(name);
-    let disk = disk_image(&files)?;
-    std::fs::write(&path, disk).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    if ktest {
+        let disk = disk_image(&files)?;
+        std::fs::write(&path, disk).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        return Ok(path);
+    }
+    // The normal image boots from its ext4 root partition.
+    files.push(("boot/cmdline", b"root=PARTLABEL=segos-root\n".to_vec()));
+    let stage = root().join("target/rootfs");
+    let bytes = userland::stage(&u, &stage)?;
+    let root_sectors = (bytes * 2 / MIB + 128).next_multiple_of(4) * MIB / gpt::SECTOR;
+    disk_with_root(&files, &path, &stage, root_sectors)?;
     Ok(path)
+}
+
+const MIB: u64 = 1 << 20;
+const ROOT_FIRST_LBA: u64 = ESP_FIRST_LBA + ESP_SECTORS;
+
+/// A GPT disk image file: the EFI system partition holding `files`, then
+/// an ext4 partition "segos-root" made by `mke2fs -d` from `rootfs`.
+fn disk_with_root(
+    files: &[(&str, Vec<u8>)],
+    path: &Path,
+    rootfs: &Path,
+    root_sectors: u64,
+) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
+    let sector = gpt::SECTOR;
+    let sectors = ROOT_FIRST_LBA + root_sectors + 2048;
+    let err = |e: std::io::Error| format!("{}: {e}", path.display());
+    let _ = std::fs::remove_file(path);
+    let f = std::fs::File::create(path).map_err(err)?;
+    f.set_len(sectors * sector).map_err(err)?;
+    let mut esp = vec![0u8; (ESP_SECTORS * sector) as usize];
+    let volume_id = u32::from_le_bytes(random_bytes());
+    fat::format(&mut esp, ESP_FIRST_LBA as u32, volume_id, files)?;
+    f.write_all_at(&esp, ESP_FIRST_LBA * sector).map_err(err)?;
+    let mut result = Ok(());
+    gpt::write_with(
+        sectors,
+        gpt::random_guid(random_bytes()),
+        &[
+            gpt::Partition {
+                type_guid: gpt::ESP_TYPE,
+                guid: gpt::random_guid(random_bytes()),
+                first_lba: ESP_FIRST_LBA,
+                last_lba: ESP_FIRST_LBA + ESP_SECTORS - 1,
+                name: "EFI System Partition",
+            },
+            gpt::Partition {
+                type_guid: gpt::LINUX_TYPE,
+                guid: gpt::random_guid(random_bytes()),
+                first_lba: ROOT_FIRST_LBA,
+                last_lba: ROOT_FIRST_LBA + root_sectors - 1,
+                name: "segos-root",
+            },
+        ],
+        &mut |off, b| {
+            if let Err(e) = f.write_all_at(b, off) {
+                result = Err(err(e));
+            }
+        },
+    )?;
+    result?;
+    drop(f);
+    status(
+        Command::new("mke2fs")
+            .args(["-q", "-F", "-t", "ext4", "-b", "4096", "-L", "segos-root"])
+            .arg("-E")
+            .arg(format!(
+                "offset={},lazy_itable_init=0,root_owner=0:0",
+                ROOT_FIRST_LBA * sector
+            ))
+            .arg("-d")
+            .arg(rootfs)
+            .arg(path)
+            .arg(format!("{}k", root_sectors * sector / 1024)),
+    )
+}
+
+/// Runs `e2fsck -fn` on the root partition of `img`: whatever SegOS wrote
+/// must be a consistent ext4 file system.
+fn fsck_root(img: &Path) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(img).map_err(|e| e.to_string())?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let start = ROOT_FIRST_LBA * gpt::SECTOR;
+    let size = len - start - 2048 * gpt::SECTOR;
+    let copy = root().join("target/rootfs-check.ext4");
+    let out = std::fs::File::create(&copy).map_err(|e| e.to_string())?;
+    out.set_len(size).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; 4 * MIB as usize];
+    let mut off = 0;
+    while off < size {
+        let n = (size - off).min(buf.len() as u64) as usize;
+        f.read_exact_at(&mut buf[..n], start + off)
+            .map_err(|e| e.to_string())?;
+        if buf[..n].iter().any(|&b| b != 0) {
+            out.write_all_at(&buf[..n], off)
+                .map_err(|e| e.to_string())?;
+        }
+        off += n as u64;
+    }
+    drop(out);
+    let o = Command::new("e2fsck")
+        .args(["-f", "-n"])
+        .arg(&copy)
+        .output()
+        .map_err(|e| format!("cannot run e2fsck: {e}"))?;
+    let _ = std::fs::remove_file(&copy);
+    if o.status.success() {
+        println!("xtask: e2fsck: the root file system SegOS wrote is clean");
+        Ok(())
+    } else {
+        Err(format!(
+            "e2fsck found errors in the root file system:\n{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        ))
+    }
 }
 
 /// A GPT disk with one EFI system partition holding `files`.
@@ -296,7 +417,50 @@ fn test(img: &Path) -> Result<(), String> {
 /// Boots the normal image, waits for BusyBox's prompt on the serial port,
 /// types commands as a user would and checks what they print, then powers
 /// the machine off from the shell.
-fn shell_session(img: &Path) -> Result<(), String> {
+/// (command, what its output must contain). Expected text never appears
+/// in the command itself, so the echo cannot satisfy the check.
+const FIRST_BOOT: [(&str, &str); 10] = [
+    ("echo SEGOS-$((6 * 7))-OK", "SEGOS-42-OK"),
+    (
+        "ls /tests | grep expected | wc -l | sed 's/^/COUNT=/'",
+        "COUNT=3",
+    ),
+    ("hello | tr a-z A-Z", "HELLO, WORLD!"),
+    ("cat /proc/self/comm | tr a-z A-Z", "CAT"),
+    (
+        "(sleep 0.2; echo late) & wait; echo JOBS-$?-DONE",
+        "JOBS-0-DONE",
+    ),
+    (
+        "cd /tmp && mkdir t && cd t && touch a b && ls | wc -l | sed 's/^/FILES=/'",
+        "FILES=2",
+    ),
+    // The root is the ext4 partition; /tmp a tmpfs on it.
+    (
+        "awk '$2==\"/\" || $2==\"/tmp\" {printf \"%s:%s \", $2, $3} END {print \"\"}' /proc/mounts | tr a-z A-Z",
+        "/:EXT4 /TMP:TMPFS",
+    ),
+    (
+        "mkdir -p /var/d/e && cd /var/d && seq 1 20000 > big && echo disk-ok > keep && ln -s keep l && ln keep h && cat l h | uniq | tr a-z A-Z",
+        "DISK-OK",
+    ),
+    (
+        "cd /var/d && wc -l < big | sed 's/^/LINES=/' && rm big && mv e f && rmdir f && ls | tr '\\n' ' ' | sed 's/^/LEFT=/'",
+        "LEFT=h keep l",
+    ),
+    (
+        "cd / && sync && df / | awk 'NR==2 {print ($2 > 0) ? \"DF-OK\" : \"DF-BAD\"}'",
+        "DF-OK",
+    ),
+];
+
+/// After a reboot: what the first boot wrote is still there.
+const SECOND_BOOT: [(&str, &str); 1] = [(
+    "cat /var/d/keep /var/d/h | tr a-z A-Z | tr '\\n' ' ' | sed 's/^/AGAIN=/'",
+    "AGAIN=DISK-OK DISK-OK",
+)];
+
+fn shell_session(img: &Path, steps: &[(&str, &str)]) -> Result<(), String> {
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
     let mut child = qemu(img)
@@ -351,26 +515,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
         return fail("no shell prompt within 120 s".into(), &mut child);
     };
     println!("xtask: shell session: prompt after boot");
-    // (command, what its output must contain). Expected text never appears
-    // in the command itself, so the echo cannot satisfy the check.
-    let steps: [(&str, &str); 6] = [
-        ("echo SEGOS-$((6 * 7))-OK", "SEGOS-42-OK"),
-        (
-            "ls /tests | grep expected | wc -l | sed 's/^/COUNT=/'",
-            "COUNT=3",
-        ),
-        ("hello | tr a-z A-Z", "HELLO, WORLD!"),
-        ("cat /proc/self/comm | tr a-z A-Z", "CAT"),
-        (
-            "(sleep 0.2; echo late) & wait; echo JOBS-$?-DONE",
-            "JOBS-0-DONE",
-        ),
-        (
-            "cd /tmp && mkdir t && cd t && touch a b && ls | wc -l | sed 's/^/FILES=/'",
-            "FILES=2",
-        ),
-    ];
-    for (cmd, want) in steps {
+    for &(cmd, want) in steps {
         let _ = stdin.write_all(format!("{cmd}\n").as_bytes());
         let _ = stdin.flush();
         let Some(end) = wait_for(want, at, 30) else {

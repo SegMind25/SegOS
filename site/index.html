@@ -153,7 +153,7 @@
         <div class="section-head">
           <p class="kicker">Status</p>
           <h2 id="status-title">Where it is right now</h2>
-          <p>Each phase ends with a demo that has to work in QEMU and in CI. Phases 0 to 3 have passed; Phase 4, real disks, is next.</p>
+          <p>Each phase ends with a demo that has to work in QEMU and in CI. Phases 0 to 4 have passed; Phase 5, glibc and dynamic linking, is next.</p>
         </div>
         <div class="grid">
           <div class="panel">
@@ -188,14 +188,23 @@
             </ul>
           </div>
           <div class="panel">
-            <h3>Phase 4 &middot; Real storage <span class="badge wip">Next</span></h3>
-            <ul class="checklist">
-              <li>PCI(e), MSI interrupts</li>
-              <li>virtio-blk, NVMe and AHCI (SATA) drivers</li>
-              <li>A block layer and page cache</li>
-              <li>GPT partitions, ext4, FAT32, mounts</li>
+            <h3>Phase 4 &middot; Real storage <span class="badge done">Done</span></h3>
+            <ul class="checklist done">
+              <li>Boots from an ext4 partition: <code>root=PARTLABEL=segos-root</code></li>
+              <li>PCI, virtio-blk, NVMe and AHCI (SATA) drivers; GPT partitions</li>
+              <li>ext4 read and write with checksums; <code>e2fsck</code> finds it clean</li>
+              <li>A page cache behind <code>read</code>, <code>write</code> and <code>mmap</code> (<code>MAP_SHARED</code> too)</li>
+              <li>Mounts: <code>/dev</code>, <code>/proc</code>, <code>/sys</code>, <code>/tmp</code>; <code>mount</code>, <code>df</code></li>
             </ul>
-            <p class="notice"><span>Done when SegOS boots from a disk with a full root file system.</span></p>
+          </div>
+          <div class="panel">
+            <h3>Phase 5 &middot; glibc <span class="badge wip">Next</span></h3>
+            <ul class="checklist">
+              <li>Dynamic linking: <code>ld-linux.so</code> and shared libraries</li>
+              <li>Threads: <code>clone</code>, TLS, <code>futex</code></li>
+              <li><code>epoll</code>, <code>eventfd</code>, <code>timerfd</code>, <code>signalfd</code></li>
+            </ul>
+            <p class="notice"><span>Done when Ubuntu's bash, coreutils and python3 run, and gcc compiles a program.</span></p>
           </div>
         </div>
         <p style="margin-top:1.5rem"><a href="/roadmap">All 11 phases, from bring-up to Steam &rarr;</a></p>

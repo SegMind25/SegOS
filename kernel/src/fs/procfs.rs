@@ -196,11 +196,16 @@ pub fn root(root: &Arc<dyn Inode>) -> Arc<dyn Inode> {
             (
                 "filesystems".into(),
                 file(INO_BASE | 9, me, || {
-                    "nodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\n".into()
+                    "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\n\text4\n\text3\n\text2\n".into()
                 })
             ),
             ("stat".into(), file(INO_BASE | 10, me, stat)),
-            ("cmdline".into(), file(INO_BASE | 11, me, || "\n".into())),
+            (
+                "cmdline".into(),
+                file(INO_BASE | 11, me, || {
+                    format!("{}\n", crate::CMDLINE.get().map_or("", |s| s.as_str()))
+                })
+            ),
         ];
         for p in proc::all() {
             let pid = p.pid;
@@ -240,7 +245,47 @@ fn loadavg() -> String {
 }
 
 fn mounts() -> String {
-    "tmpfs / tmpfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n".into()
+    super::mount::proc_mounts()
+}
+
+/// `/sys`: what programs commonly read (CPU lists, block devices).
+pub fn sysfs() -> Arc<dyn Inode> {
+    let sys = super::tmpfs::Dir::new_root(0o755);
+    let mk = |dir: &Arc<dyn Inode>, path: &str| -> Arc<dyn Inode> {
+        let mut d = dir.clone();
+        for p in path.split('/').filter(|p| !p.is_empty()) {
+            d = d
+                .lookup(p)
+                .or_else(|_| d.create(p, FileType::Directory, 0o755))
+                .unwrap();
+        }
+        d
+    };
+    let put = |dir: &Arc<dyn Inode>, name: &str, text: String| {
+        if let Ok(f) = dir.create(name, FileType::Regular, 0o444) {
+            let _ = f.write_at(0, text.as_bytes());
+        }
+    };
+    let n = crate::hal::percpu::count();
+    let cpus = if n > 1 {
+        format!("0-{}\n", n - 1)
+    } else {
+        "0\n".into()
+    };
+    let cpu = mk(&sys, "devices/system/cpu");
+    for f in ["online", "possible", "present"] {
+        put(&cpu, f, cpus.clone());
+    }
+    let block = mk(&sys, "block");
+    for (dev, rdev) in crate::block::all() {
+        let d = mk(&block, dev.name());
+        put(&d, "size", format!("{}\n", dev.sectors()));
+        put(&d, "dev", format!("{}:{}\n", rdev >> 8, rdev & 0xff));
+    }
+    mk(&sys, "kernel");
+    mk(&sys, "fs/cgroup");
+    mk(&sys, "class");
+    sys
 }
 
 fn version() -> String {
@@ -379,6 +424,11 @@ fn pid_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
         alloc::vec![
             ("stat".into(), file(ino_of(pid, 2), me, with(pid_stat))),
             ("status".into(), file(ino_of(pid, 3), me, with(pid_status))),
+            ("mounts".into(), file(ino_of(pid, 20), me, mounts)),
+            (
+                "mountinfo".into(),
+                file(ino_of(pid, 21), me, super::mount::proc_mountinfo)
+            ),
             (
                 "cmdline".into(),
                 file(

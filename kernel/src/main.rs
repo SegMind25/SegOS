@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod abi;
+mod block;
 #[macro_use]
 mod console;
 mod drivers;
@@ -37,6 +38,17 @@ use core::panic::PanicInfo;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The kernel command line (`\\boot\\cmdline` on the boot partition).
+pub static CMDLINE: sync::Once<alloc::string::String> = sync::Once::new();
+
+/// The value of `key=` on the command line.
+pub fn cmdline_arg(key: &str) -> Option<&'static str> {
+    CMDLINE
+        .get()?
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+}
+
 /// Entry point, jumped to by segboot (our UEFI bootloader) on the bootstrap
 /// CPU, interrupts off, on a boot stack. See the `bootinfo` crate.
 #[unsafe(no_mangle)]
@@ -54,6 +66,10 @@ extern "sysv64" fn kmain(boot: &'static BootInfo) -> ! {
     info!("cpu: GDT, TSS and IDT loaded");
 
     mm::init(boot.memory_map(), boot.hhdm_offset);
+    CMDLINE.call_once(|| boot.cmdline().into());
+    if !boot.cmdline().is_empty() {
+        info!("command line: {}", boot.cmdline());
+    }
     info!(
         "kernel: loaded at phys {:#x}, virt {:#x}",
         boot.kernel_phys_base, boot.kernel_virt_base
@@ -121,10 +137,17 @@ fn kernel_init(boot: &'static BootInfo) {
         mm::frame::free_count() * mm::PAGE_SIZE / (1024 * 1024)
     );
     load_initramfs(boot);
+    if let Some(spec) = cmdline_arg("root") {
+        match fs::boot::mount_root(spec) {
+            Ok(()) => info!("root: {spec} mounted on /"),
+            Err(e) => error!("root: cannot mount {spec} ({e:?}); staying on the initramfs"),
+        }
+    }
+    let init_path = cmdline_arg("init").unwrap_or("/init");
     let started = proc::console_stdio().and_then(|stdio| {
         proc::spawn(
-            "/init",
-            &["/init"],
+            init_path,
+            &[init_path],
             &[
                 "HOME=/root",
                 "TERM=linux",
@@ -137,11 +160,11 @@ fn kernel_init(boot: &'static BootInfo) {
     let init = match started {
         Ok(t) => t,
         Err(e) => {
-            error!("cannot start /init: {e:?}");
+            error!("cannot start {init_path}: {e:?}");
             return;
         }
     };
-    info!("started /init (pid 1)");
+    info!("started {init_path} (pid 1)");
     init.join();
     let status = init.user().unwrap().process.exit_status().unwrap_or(0);
     if status & 0x7f == 0 {

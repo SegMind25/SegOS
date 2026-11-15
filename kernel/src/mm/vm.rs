@@ -19,6 +19,7 @@ use super::paging::{self, flags};
 use super::{PAGE_SIZE, frame, phys_to_virt};
 use crate::abi::mman::{PROT_EXEC, PROT_READ, PROT_WRITE};
 use crate::abi::{Errno, KResult, Pod};
+use crate::fs::Inode;
 use crate::sync::Mutex;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -46,13 +47,34 @@ pub enum Kind {
     Anon,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct Vma {
     pub start: u64,
     pub end: u64,
     /// PROT_* bits.
     pub prot: u32,
     pub kind: Kind,
+    /// A file mapping: the file, and the file offset of `start`.
+    pub file: Option<Arc<dyn Inode>>,
+    pub off: u64,
+    /// MAP_SHARED: writes reach the file (or, anonymous, the other
+    /// processes sharing the pages after fork).
+    pub shared: bool,
+}
+
+impl core::fmt::Debug for Vma {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{:#x}-{:#x} {:?} prot {:#x}{}{}",
+            self.start,
+            self.end,
+            self.kind,
+            self.prot,
+            if self.file.is_some() { " file" } else { "" },
+            if self.shared { " shared" } else { "" }
+        )
+    }
 }
 
 impl Vma {
@@ -127,14 +149,28 @@ impl Regions {
     /// Splits the region containing `addr` (if any) so that a region
     /// starts exactly at `addr`.
     fn split_at(&mut self, addr: u64) {
-        let Some(v) = self.find(addr).copied() else {
+        let Some(v) = self.find(addr).cloned() else {
             return;
         };
         if v.start == addr {
             return;
         }
-        self.vmas.insert(v.start, Vma { end: addr, ..v });
-        self.vmas.insert(addr, Vma { start: addr, ..v });
+        let off = v.off + (addr - v.start);
+        self.vmas.insert(
+            v.start,
+            Vma {
+                end: addr,
+                ..v.clone()
+            },
+        );
+        self.vmas.insert(
+            addr,
+            Vma {
+                start: addr,
+                off,
+                ..v
+            },
+        );
     }
 
     /// Start addresses of the regions inside `[start, end)`, after splitting
@@ -193,6 +229,23 @@ impl AddressSpace {
     /// Adds a region. With `fixed`, whatever was there is unmapped first;
     /// otherwise the range must be free.
     pub fn map(&self, start: u64, len: u64, prot: u32, kind: Kind, fixed: bool) -> KResult<()> {
+        self.map_backed(start, len, prot, kind, fixed, None, 0, false)
+    }
+
+    /// [`AddressSpace::map`] with a backing file (at offset `off`) and
+    /// sharing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_backed(
+        &self,
+        start: u64,
+        len: u64,
+        prot: u32,
+        kind: Kind,
+        fixed: bool,
+        file: Option<Arc<dyn Inode>>,
+        off: u64,
+        shared: bool,
+    ) -> KResult<()> {
         let end = start.checked_add(len).ok_or(Errno::ENOMEM)?;
         if !start.is_multiple_of(PAGE_SIZE) || len == 0 || end > USER_END || start < PAGE_SIZE {
             return Err(Errno::EINVAL);
@@ -203,6 +256,7 @@ impl AddressSpace {
             if !fixed {
                 return Err(Errno::EEXIST);
             }
+            self.writeback(&r, start, end);
             for s in r.isolate(start, end) {
                 r.vmas.remove(&s);
             }
@@ -215,6 +269,9 @@ impl AddressSpace {
                 end,
                 prot,
                 kind,
+                file,
+                off,
+                shared,
             },
         );
         Ok(())
@@ -235,10 +292,36 @@ impl AddressSpace {
         }
         let end = page_up(start.saturating_add(len)).min(USER_END);
         let mut r = self.inner.lock();
+        self.writeback(&r, start, end);
         for s in r.isolate(start, end) {
             r.vmas.remove(&s);
         }
         self.unmap_pages(start, end);
+        Ok(())
+    }
+
+    /// Writes the pages of shared, writable file mappings in
+    /// `[start, end)` back to their files (munmap, msync, exit).
+    fn writeback(&self, r: &Regions, start: u64, end: u64) {
+        for v in r.vmas.values() {
+            if v.end <= start || v.start >= end || !v.shared || v.prot & PROT_WRITE == 0 {
+                continue;
+            }
+            let Some(f) = &v.file else { continue };
+            let mut a = v.start.max(start);
+            while a < v.end.min(end) {
+                if paging::user_entry(self.pml4, a).is_some() {
+                    let _ = f.write_page((v.off + a - v.start) / PAGE_SIZE);
+                }
+                a += PAGE_SIZE;
+            }
+        }
+    }
+
+    /// `msync`.
+    pub fn sync(&self, start: u64, len: u64) -> KResult<()> {
+        let r = self.inner.lock();
+        self.writeback(&r, start, start.saturating_add(len));
         Ok(())
     }
 
@@ -292,7 +375,7 @@ impl AddressSpace {
                 return old;
             }
             // Extend the heap region (or create it).
-            let prev = r.find(old_top - 1).copied();
+            let prev = r.find(old_top - 1).cloned();
             match prev {
                 Some(v) if v.kind == Kind::Heap && v.end == old_top => {
                     r.vmas.get_mut(&v.start).unwrap().end = new_top;
@@ -305,6 +388,9 @@ impl AddressSpace {
                             end: new_top,
                             prot: PROT_READ | PROT_WRITE,
                             kind: Kind::Heap,
+                            file: None,
+                            off: 0,
+                            shared: false,
                         },
                     );
                 }
@@ -341,8 +427,37 @@ impl AddressSpace {
             }
             return Ok(paging::entry_phys(e));
         }
-        let phys = frame::alloc_zeroed().ok_or(Errno::ENOMEM)?;
-        if paging::map_user(pml4, page, phys, vma.page_flags()).is_err() {
+        let mut pf = vma.page_flags();
+        let phys = match &vma.file {
+            None => frame::alloc_zeroed().ok_or(Errno::ENOMEM)?,
+            Some(f) => {
+                let idx = (vma.off + page - vma.start) / PAGE_SIZE;
+                let cached = f.page(idx)?;
+                if vma.shared {
+                    cached
+                } else if write {
+                    // A private copy right away.
+                    let new = frame::alloc_zeroed().ok_or_else(|| {
+                        frame::free(cached);
+                        Errno::ENOMEM
+                    })?;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            phys_to_virt(cached),
+                            phys_to_virt(new),
+                            PAGE_SIZE as usize,
+                        )
+                    };
+                    frame::free(cached);
+                    new
+                } else {
+                    // The cached page itself, until the first write.
+                    pf = (pf & !flags::WRITABLE) | flags::COW;
+                    cached
+                }
+            }
+        };
+        if paging::map_user(pml4, page, phys, pf).is_err() {
             frame::free(phys);
             return Err(Errno::ENOMEM);
         }
@@ -381,6 +496,24 @@ impl AddressSpace {
             }),
         });
         let result = paging::fork_user(self.pml4, pml4);
+        // Shared mappings stay shared: undo copy-on-write on their pages.
+        for v in r.vmas.values().filter(|v| v.shared) {
+            let mut a = v.start;
+            while a < v.end {
+                for t in [self.pml4, pml4] {
+                    if let Some(e) = paging::user_entry(t, a)
+                        && e & flags::COW != 0
+                    {
+                        paging::set_user_entry(
+                            t,
+                            a,
+                            (e & !flags::COW) | v.page_flags() | flags::PRESENT,
+                        );
+                    }
+                }
+                a += PAGE_SIZE;
+            }
+        }
         // Our writable pages just became read-only: drop stale TLB entries.
         if crate::hal::x86::read_cr3() & !0xfff == self.pml4 {
             unsafe { crate::hal::x86::write_cr3(self.pml4) };
@@ -503,12 +636,16 @@ impl AddressSpace {
 
     /// The regions, for diagnostics and tests.
     pub fn regions(&self) -> Vec<Vma> {
-        self.inner.lock().vmas.values().copied().collect()
+        self.inner.lock().vmas.values().cloned().collect()
     }
 }
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        {
+            let r = self.inner.lock();
+            self.writeback(&r, 0, USER_END);
+        }
         paging::free_user_pml4(self.pml4);
     }
 }

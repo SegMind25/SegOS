@@ -26,7 +26,7 @@
 
 /// "SEGBOOT\0" little-endian.
 pub const MAGIC: u64 = u64::from_le_bytes(*b"SEGBOOT\0");
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Virtual address of the direct map of physical memory.
 pub const HHDM_OFFSET: u64 = 0xffff_8000_0000_0000;
@@ -54,6 +54,10 @@ pub struct BootInfo {
     /// none.
     pub initramfs: u64,
     pub initramfs_len: u64,
+    /// `\boot\cmdline` (the kernel command line, ASCII) the same way; 0
+    /// if there was none.
+    pub cmdline: u64,
+    pub cmdline_len: u64,
 }
 
 // SAFETY: the kernel only reads the structure and the memory it points to.
@@ -73,6 +77,21 @@ impl BootInfo {
                 self.initramfs_len as usize,
             )
         }
+    }
+
+    /// The kernel command line ("" if none), trimmed.
+    pub fn cmdline(&self) -> &str {
+        if self.cmdline == 0 {
+            return "";
+        }
+        // SAFETY: as for the initramfs.
+        let b = unsafe {
+            core::slice::from_raw_parts(
+                (self.hhdm_offset + self.cmdline) as *const u8,
+                self.cmdline_len as usize,
+            )
+        };
+        core::str::from_utf8(b).unwrap_or("").trim()
     }
 
     pub fn memory_map(&self) -> &[MemoryRegion] {

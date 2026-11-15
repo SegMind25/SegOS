@@ -25,6 +25,8 @@ const KERNEL_PATH_STR: &str = "\\boot\\segkernel";
 static KERNEL_PATH: [u16; KERNEL_PATH_STR.len() + 1] = ucs2(KERNEL_PATH_STR);
 const INITRAMFS_PATH_STR: &str = "\\boot\\initramfs";
 static INITRAMFS_PATH: [u16; INITRAMFS_PATH_STR.len() + 1] = ucs2(INITRAMFS_PATH_STR);
+const CMDLINE_PATH_STR: &str = "\\boot\\cmdline";
+static CMDLINE_PATH: [u16; CMDLINE_PATH_STR.len() + 1] = ucs2(CMDLINE_PATH_STR);
 
 const STACK_SIZE: u64 = 64 * 1024;
 const GIB: u64 = 1 << 30;
@@ -140,6 +142,10 @@ const KERNEL_FILE: BootFile = BootFile {
 const INITRAMFS_FILE: BootFile = BootFile {
     path: &INITRAMFS_PATH,
     name: "\\boot\\initramfs",
+};
+const CMDLINE_FILE: BootFile = BootFile {
+    path: &CMDLINE_PATH,
+    name: "\\boot\\cmdline",
 };
 
 fn protocol<T>(
@@ -454,6 +460,7 @@ fn boot(image: efi::Handle, st: &efi::SystemTable) -> Result<core::convert::Infa
         }
         _ => Ok(None),
     };
+    let cmdline = read_file(bs, root, &CMDLINE_FILE).ok().flatten();
     // SAFETY: the root directory was opened above and is closed once.
     unsafe { ((*root).close)(root) };
     let file = file?.ok_or(Error::new(
@@ -583,6 +590,8 @@ fn boot(image: efi::Handle, st: &efi::SystemTable) -> Result<core::convert::Infa
             rsdp,
             initramfs: initramfs.as_ref().map_or(0, |f| f.data as u64),
             initramfs_len: initramfs.as_ref().map_or(0, |f| f.len as u64),
+            cmdline: cmdline.as_ref().map_or(0, |f| f.data as u64),
+            cmdline_len: cmdline.as_ref().map_or(0, |f| f.len as u64),
         })
     };
 

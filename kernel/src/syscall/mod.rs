@@ -185,6 +185,9 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         133 => fs::mknodat(ctx, AT_FDCWD, a[0], a[1] as u32),
         259 => fs::mknodat(ctx, fd, a[1], a[2] as u32),
         137 => fs::statfs(ctx, a[0], a[1], false),
+        165 => fs::mount(ctx, a[0], a[1], a[2], a[3]),
+        166 => fs::umount(ctx, a[0]),
+        26 => mem::msync(ctx, a[0], a[1]),
         138 => fs::statfs(ctx, a[0], a[1], true),
         140 | 141 => Ok(0), // getpriority, setpriority: everyone at nice 0
         157 => info::prctl(ctx, a),

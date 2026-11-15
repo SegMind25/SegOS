@@ -6,7 +6,6 @@ use crate::abi::{Errno, KResult};
 use crate::fs::FileType;
 use crate::mm::PAGE_SIZE;
 use crate::mm::vm::{Kind, MMAP_MIN, USER_END};
-use alloc::vec;
 
 const MAP_TYPE: u32 = 0x0f;
 const MAP_SHARED_VALIDATE: u32 = 0x03;
@@ -40,7 +39,7 @@ pub fn mmap(
         let f = ctx.process().files.lock().get(fd)?;
         match f.inode.file_type() {
             FileType::Regular => {}
-            FileType::Directory | FileType::Fifo | FileType::Symlink => {
+            FileType::Directory | FileType::Fifo | FileType::Symlink | FileType::BlockDevice => {
                 return Err(Errno::ENODEV);
             }
             // Device memory (/dev/zero is the common case): anonymous.
@@ -54,11 +53,12 @@ pub fn mmap(
         }
         (f.inode.file_type() == FileType::Regular).then_some(f)
     };
-    if flags & MAP_TYPE != MAP_PRIVATE && file.is_some() {
-        // Shared file mappings need the page cache (Phase 4): a private
-        // copy would silently lose writes.
+    let shared = flags & MAP_TYPE != MAP_PRIVATE;
+    if shared && prot & PROT_WRITE != 0 && file.as_ref().is_some_and(|f| !f.inode.shares_pages()) {
+        // Writes through a private copy would be lost.
         return Err(Errno::ENODEV);
     }
+    let backing = file.map(|f| f.inode.clone());
 
     let mm = ctx.mm();
     let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
@@ -75,32 +75,34 @@ pub fn mmap(
         let hint = addr & !(PAGE_SIZE - 1);
         if hint >= MMAP_MIN
             && hint.checked_add(len).is_some_and(|e| e <= USER_END)
-            && mm.map(hint, len, prot, Kind::Anon, false).is_ok()
+            && mm
+                .map_backed(
+                    hint,
+                    len,
+                    prot,
+                    Kind::Anon,
+                    false,
+                    backing.clone(),
+                    off,
+                    shared,
+                )
+                .is_ok()
         {
-            return fill(ctx, hint, len, file.as_deref(), off);
+            return Ok(hint);
         }
         mm.find_free(len)?
     };
     let replace = flags & MAP_FIXED_NOREPLACE == 0 && fixed;
-    mm.map(start, len, prot, Kind::Anon, replace)?;
-    fill(ctx, start, len, file.as_deref(), off)
+    mm.map_backed(start, len, prot, Kind::Anon, replace, backing, off, shared)?;
+    Ok(start)
 }
 
-/// Copies a file's contents into a fresh private mapping. (Read now, not
-/// on fault: tmpfs files are in memory already. Demand paging from the
-/// page cache comes with real disks.)
-fn fill(ctx: &Ctx, start: u64, len: u64, file: Option<&crate::fs::File>, off: u64) -> KResult<u64> {
-    let Some(f) = file else {
-        return Ok(start);
-    };
-    let size = f.inode.size();
-    if off < size {
-        let n = (size - off).min(len) as usize;
-        let mut buf = vec![0u8; n];
-        let got = f.inode.read_at(off, &mut buf)?;
-        ctx.mm().fill(start, &buf[..got])?;
+pub fn msync(ctx: &Ctx, addr: u64, len: u64) -> KResult<u64> {
+    if !addr.is_multiple_of(PAGE_SIZE) {
+        return Err(Errno::EINVAL);
     }
-    Ok(start)
+    ctx.mm().sync(addr, len)?;
+    Ok(0)
 }
 
 pub fn munmap(ctx: &Ctx, addr: u64, len: u64) -> KResult<u64> {

@@ -15,6 +15,14 @@ pub const ESP_TYPE: [u8; 16] = guid(
     [0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b],
 );
 
+/// Linux file system data type GUID 0FC63DAF-8483-4772-8E79-3D69D8477DE4.
+pub const LINUX_TYPE: [u8; 16] = guid(
+    0x0fc63daf,
+    0x8483,
+    0x4772,
+    [0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4],
+);
+
 /// A GUID in its on-disk (mixed-endian) byte order.
 const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
     let a = a.to_le_bytes();
@@ -71,6 +79,19 @@ pub const fn last_usable(sectors: u64) -> u64 {
 /// Writes the protective MBR and both GPTs into `disk` (the whole image).
 pub fn write(disk: &mut [u8], disk_guid: [u8; 16], parts: &[Partition]) -> Result<(), String> {
     let sectors = disk.len() as u64 / SECTOR;
+    write_with(sectors, disk_guid, parts, &mut |off, bytes| {
+        disk[off as usize..off as usize + bytes.len()].copy_from_slice(bytes)
+    })
+}
+
+/// Like [`write`], for a disk of `sectors` sectors: `put(byte offset,
+/// bytes)` stores each piece.
+pub fn write_with(
+    sectors: u64,
+    disk_guid: [u8; 16],
+    parts: &[Partition],
+    put: &mut dyn FnMut(u64, &[u8]),
+) -> Result<(), String> {
     let last = sectors - 1;
     if parts.len() > ENTRIES as usize {
         return Err("too many partitions".into());
@@ -85,7 +106,7 @@ pub fn write(disk: &mut [u8], disk_guid: [u8; 16], parts: &[Partition]) -> Resul
     }
 
     // Protective MBR: one partition of type 0xEE covering the disk.
-    let mbr = &mut disk[..SECTOR as usize];
+    let mut mbr = [0u8; SECTOR as usize];
     let e = &mut mbr[446..462];
     e[0] = 0x00; // not active
     e[1..4].copy_from_slice(&[0x00, 0x02, 0x00]); // CHS of LBA 1
@@ -95,6 +116,7 @@ pub fn write(disk: &mut [u8], disk_guid: [u8; 16], parts: &[Partition]) -> Resul
     e[12..16].copy_from_slice(&((sectors - 1).min(u32::MAX as u64) as u32).to_le_bytes());
     mbr[510] = 0x55;
     mbr[511] = 0xaa;
+    put(0, &mbr);
 
     // Partition entry array (identical copies before and after the data).
     let mut array = vec![0u8; (ENTRIES * ENTRY_SIZE) as usize];
@@ -130,12 +152,12 @@ pub fn write(disk: &mut [u8], disk_guid: [u8; 16], parts: &[Partition]) -> Resul
         h[16..20].copy_from_slice(&crc.to_le_bytes());
         h
     };
-    let at = |lba: u64| (lba * SECTOR) as usize;
+    let at = |lba: u64| lba * SECTOR;
     let backup_array = last - ARRAY_SECTORS;
-    disk[at(1)..at(1) + 92].copy_from_slice(&header(1, last, 2));
-    disk[at(2)..at(2) + array.len()].copy_from_slice(&array);
-    disk[at(backup_array)..at(backup_array) + array.len()].copy_from_slice(&array);
-    disk[at(last)..at(last) + 92].copy_from_slice(&header(last, 1, backup_array));
+    put(at(1), &header(1, last, 2));
+    put(at(2), &array);
+    put(at(backup_array), &array);
+    put(at(last), &header(last, 1, backup_array));
     Ok(())
 }
 

@@ -151,7 +151,9 @@ impl Inode for Dir {
             }),
             FileType::Directory => self.new_child(perm),
             FileType::Fifo => super::pipe::Fifo::create(perm),
-            FileType::CharDevice | FileType::Symlink => return Err(Errno::EPERM),
+            FileType::CharDevice | FileType::Symlink | FileType::BlockDevice => {
+                return Err(Errno::EPERM);
+            }
         };
         entries.insert(name.to_string(), inode.clone());
         drop(entries);

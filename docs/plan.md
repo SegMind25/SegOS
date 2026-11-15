@@ -251,22 +251,49 @@ which would have corrupted a glibc program's stack; and naming a process
 after its resolved executable instead of the path it was started by,
 which stops BusyBox (it checks for "exe") from naming its applets.
 
-## 10. Next concrete steps (Phase 4: real storage)
+## 10. Phase 4, as built
 
-The demo: SegOS boots from a disk with a full root file system (not only
-the initramfs), on QEMU's virtio and NVMe disks and on a real PC's SATA or
-NVMe drive.
+SegOS boots from a disk. `cargo xtask image` makes a GPT disk with the
+EFI system partition and an ext4 partition named `segos-root` (made by
+`mke2fs -d` from the same tree the initramfs holds); `\boot\cmdline`
+on the EFI partition says `root=PARTLABEL=segos-root`.
 
-1. **PCI(e)**: find the configuration space (ACPI MCFG, ECAM), enumerate
-   buses, read BARs, map them; MSI/MSI-X interrupts.
-2. **A block layer and page cache**: requests, a cache of file pages
-   shared by `read`/`write` and `mmap` (finally real `MAP_SHARED` file
-   mappings), write-back.
-3. **Drivers**: virtio-blk first (simplest, in QEMU), then NVMe, then
-   AHCI (SATA).
-4. **Partitions and file systems**: GPT; ext4 read-only, then read-write
-   (journal replay first); FAT32 for the EFI partition.
-5. **Mounts**: a mount table, `mount`/`umount`, `/proc/mounts` from it,
-   `pivot_root`/`switch_root` from the initramfs to the disk.
-6. **Tests**: file system tests recorded on Linux (on an ext4 image xtask
-   builds), and a CI boot from a disk image with a full BusyBox root.
+- **Boot protocol v3**: segboot also loads `\boot\cmdline`; the kernel
+  reads `root=` (`/dev/sda2`, `PARTLABEL=`, `LABEL=`) and `init=`.
+- **PCI**: configuration space through ports 0xCF8/0xCFC, BARs mapped
+  uncached into a kernel MMIO window. (MSI comes with networking.)
+- **Disk drivers** (polled): virtio-blk (modern virtio-pci, split
+  virtqueues), NVMe (admin and one I/O queue pair), AHCI (SATA, READ/WRITE
+  DMA EXT). Devices are `vda`, `nvme0n1`, `sda`; GPT and MBR partitions
+  become `sda1`, `nvme0n1p1`, ...; all appear in `/dev` as block devices
+  (`BLKGETSIZE64` works).
+- **ext4** (`kernel/src/fs/ext4.rs`): extents and old block maps, 64-bit,
+  flex_bg, htree directories (read linearly, made plain before a change),
+  fast and slow symlinks, metadata_csum (crc32c of superblock, group
+  descriptors, bitmaps, inodes, extent and directory blocks), uninitialised
+  groups. Writes in place without the journal (a file system needing
+  recovery mounts read-only). The test boots twice and then runs
+  `e2fsck -fn` on the image: what SegOS wrote must be clean.
+- **Page cache**: each ext4 inode caches its pages; `read`, `write` and
+  `mmap` share them. File mappings fault pages in on demand; private ones
+  copy on the first write, `MAP_SHARED` ones write back on `msync`,
+  `munmap` and exit. Shared anonymous memory stays shared across `fork`.
+- **Mounts**: a mount table crossed by path lookup (`..` too);
+  `mount(2)` for proc, sysfs, tmpfs, devtmpfs, ext2/3/4 and bind mounts,
+  `umount2`, `/proc/mounts` and `/proc/self/mountinfo`, `statfs` per file
+  system (`df`). A small `/sys` (CPU lists, block devices).
+
+## 11. Next concrete steps (Phase 5: glibc and dynamic linking)
+
+The demo: Ubuntu's own bash, coreutils and python3 run from the disk, and
+gcc compiles and runs a C program.
+
+1. **Dynamic linking**: `PT_INTERP` (load `ld-linux-x86-64.so.2`, pass
+   `AT_BASE`, `AT_PHDR`, `AT_ENTRY`), file-backed `mmap` (done), `mremap`.
+2. **Threads**: `clone` with `CLONE_VM | CLONE_THREAD | CLONE_SETTLS |
+   CLONE_CHILD_CLEARTID ...`, thread groups (tgid/tid), `futex` (wait,
+   wake, requeue, bitset), `set_robust_list`, `exit_group`, `tgkill`.
+3. **More system calls**: `statx`, `epoll`, `eventfd`, `timerfd`,
+   `signalfd`, `prlimit64`, `getrandom` flags, `/proc/self/maps`.
+4. **The userland**: Ubuntu packages (`apt-get download`) unpacked into
+   the root image; tests that run bash scripts, python3 and gcc.

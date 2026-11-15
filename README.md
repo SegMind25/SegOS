@@ -12,7 +12,11 @@ and `ls | grep | wc` works. Behind it: `fork` with copy-on-write,
 handlers, pipes, `poll`/`select`, symbolic links, `/proc`, and a terminal
 with keyboard and serial input, line editing and `^C`. The kernel answers
 140 Linux system call numbers, and three conformance tests print byte for
-byte what they print on Linux. Next is Phase 4: real disks.
+byte what they print on Linux. Since Phase 4 it **boots from a disk**: the
+root file system is an ext4 partition (made by `mke2fs`, read and written
+by SegOS, and still clean for `e2fsck` afterwards), on SATA, NVMe or virtio
+drives, with a page cache behind `read`, `write` and `mmap`. Next is
+Phase 5: glibc and dynamic linking.
 
 The operating system itself is all in this repository: the bootloader, the
 kernel and the build tool use no third-party crates, only Rust's `core`,
@@ -196,7 +200,7 @@ flowchart TB
     end
     subgraph L["Linux userland"]
         direction LR
-        P4["4 · Real disks<br/>NVMe, SATA, ext4"]:::next --> P5["5 · Full userland<br/>glibc: bash, python, gcc"] --> P6["6 · Networking<br/>TCP/IP: curl, ssh"]
+        P4["4 · Real disks<br/>NVMe, SATA, ext4"]:::done --> P5["5 · Full userland<br/>glibc: bash, python, gcc"]:::next --> P6["6 · Networking<br/>TCP/IP: curl, ssh"]
     end
     subgraph D["Desktop and games"]
         direction LR

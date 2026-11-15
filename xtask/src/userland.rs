@@ -265,9 +265,49 @@ fn add_tree(
 
 /// The initramfs (a newc cpio archive).
 pub fn initramfs(u: &Userland) -> Result<Vec<u8>, String> {
+    let (entries, dirs) = tree(u)?;
+    let dirs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
+    Ok(cpio::write(&entries, &dirs))
+}
+
+/// Writes the root file system tree (what the initramfs holds) into
+/// `dir`, for `mke2fs -d`. Returns its size in bytes.
+pub fn stage(u: &Userland, dir: &Path) -> Result<u64, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    if dir.exists() {
+        std::fs::remove_dir_all(dir).map_err(|e| err(dir, e))?;
+    }
+    std::fs::create_dir_all(dir).map_err(|e| err(dir, e))?;
+    let (entries, dirs) = tree(u)?;
+    for d in &dirs {
+        let p = dir.join(d);
+        std::fs::create_dir_all(&p).map_err(|e| err(&p, e))?;
+    }
+    let mut bytes = 0;
+    for e in &entries {
+        let p = dir.join(&e.path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| err(parent, e))?;
+        }
+        if e.mode & 0o170_000 == cpio::MODE_SYMLINK {
+            let target = String::from_utf8_lossy(&e.data).into_owned();
+            std::os::unix::fs::symlink(target, &p).map_err(|er| err(&p, er))?;
+        } else {
+            std::fs::write(&p, &e.data).map_err(|er| err(&p, er))?;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(e.mode & 0o7777))
+                .map_err(|er| err(&p, er))?;
+            bytes += e.data.len() as u64;
+        }
+    }
+    Ok(bytes)
+}
+
+/// Every file and directory of the root file system.
+fn tree(u: &Userland) -> Result<(Vec<cpio::Entry>, Vec<String>), String> {
     let mut entries = Vec::new();
     let mut dirs: Vec<String> = [
-        "dev", "proc", "tmp", "root", "home", "mnt", "var", "sbin", "usr/sbin",
+        "dev", "proc", "sys", "run", "tmp", "root", "home", "mnt", "var", "sbin", "usr/sbin",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -303,8 +343,7 @@ pub fn initramfs(u: &Userland) -> Result<Vec<u8>, String> {
             });
         }
     }
-    let dirs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
-    Ok(cpio::write(&entries, &dirs))
+    Ok((entries, dirs))
 }
 
 /// Runs every test on this machine, if it is x86-64 Linux, and checks it
