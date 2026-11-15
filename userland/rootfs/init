@@ -2,6 +2,15 @@
 # SegOS runs this as process 1: set up, then keep a shell on the console.
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=linux
 cd /root
+# What udev would have recorded for the devices SegOS has (libinput and
+# Wayland compositors read it), and the runtime directory Wayland uses.
+if [ -d /run ]; then
+	mkdir -p /run/udev/data /run/user/0
+	chmod 700 /run/user/0
+	printf 'I:1\nE:ID_INPUT=1\nE:ID_INPUT_KEY=1\nE:ID_INPUT_KEYBOARD=1\nE:ID_SEAT=seat0\nG:seat\nQ:seat\n' > /run/udev/data/c13:64
+	printf 'I:1\nE:ID_INPUT=1\nE:ID_INPUT_MOUSE=1\nE:ID_SEAT=seat0\nG:seat\nQ:seat\n' > /run/udev/data/c13:65
+	printf 'I:1\nE:ID_SEAT=seat0\nG:seat\nG:master-of-seat\nQ:seat\nQ:master-of-seat\n' > /run/udev/data/c226:0
+fi
 cat /etc/motd
 while true; do
 	/bin/sh -l

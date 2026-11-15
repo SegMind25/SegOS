@@ -42,6 +42,12 @@ const PACKAGES: &[&str] = &[
     "wget",
     "netcat-openbsd",
     "openssh-client",
+    // Phase 7: a Wayland compositor and what it reads.
+    "weston",
+    "libweston-13-0",
+    "xkb-data",
+    "fonts-dejavu-core",
+    "fontconfig-config",
     "ca-certificates",
     "netbase",
 ];
