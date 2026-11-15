@@ -44,6 +44,7 @@ ok   read(fd, &v, 8) == -1 && errno == EAGAIN
 ok   poll(&p, 1, 2000) == 1 && p.revents == POLLIN
 ok   rd64(fd) == 1
 ok   timerfd_settime(fd, TFD_TIMER_ABSTIME, &its, NULL) == 0
+ok   poll(&p, 1, 2000) == 1 && p.revents == POLLIN
 ok   rd64(fd) == 1
 ok   timerfd_create(12345, 0) == -1 && errno == EINVAL
 ok   timerfd_settime(0, 0, &its, NULL) == -1 && errno == EINVAL

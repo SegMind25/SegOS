@@ -203,6 +203,8 @@ static void timerfds(void)
 	/* a time in the past expires at once */
 	its.it_value.tv_sec -= 10;
 	CHECK(timerfd_settime(fd, TFD_TIMER_ABSTIME, &its, NULL) == 0);
+	/* (Linux expires it from a timer interrupt: wait for that.) */
+	CHECK(poll(&p, 1, 2000) == 1 && p.revents == POLLIN);
 	CHECK(rd64(fd) == 1);
 	close(fd);
 
