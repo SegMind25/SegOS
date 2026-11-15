@@ -126,6 +126,7 @@ fn kernel_init(boot: &'static BootInfo) {
     drivers::virtio_blk::init();
     drivers::nvme::init();
     drivers::ahci::init();
+    net::init();
     block::start_flusher();
     match fs::disk::mount_root() {
         Some(dev) => info!("root: {dev} (ext4)"),

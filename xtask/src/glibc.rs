@@ -41,6 +41,7 @@ const PACKAGES: &[&str] = &[
     "libcurl4t64",
     "wget",
     "netcat-openbsd",
+    "openssh-client",
     "ca-certificates",
     "netbase",
 ];

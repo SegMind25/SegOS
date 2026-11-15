@@ -21,6 +21,7 @@ pub mod elf;
 pub mod exec;
 pub mod faults;
 pub mod futex;
+pub mod itimer;
 pub mod signal;
 
 use crate::abi::{Errno, KResult};

@@ -348,3 +348,63 @@ pub fn getcpu(ctx: &Ctx, cpu: u64, node: u64) -> KResult<u64> {
     }
     Ok(0)
 }
+
+/// `struct itimerval` from user memory: (interval, value) in ns.
+fn read_itimerval(ctx: &Ctx, at: u64) -> KResult<(u64, u64)> {
+    let v: [i64; 4] = ctx.mm().read(at)?;
+    if v.iter().any(|&x| x < 0) || v[1] >= 1_000_000 || v[3] >= 1_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    let ns = |s: i64, us: i64| s as u64 * 1_000_000_000 + us as u64 * 1000;
+    Ok((ns(v[0], v[1]), ns(v[2], v[3])))
+}
+
+fn write_itimerval(ctx: &Ctx, at: u64, (left, interval): (u64, u64)) -> KResult<()> {
+    if at == 0 {
+        return Ok(());
+    }
+    let tv = |ns: u64| {
+        [
+            (ns / 1_000_000_000) as i64,
+            (ns % 1_000_000_000).div_ceil(1000) as i64,
+        ]
+    };
+    let (i, v) = (tv(interval), tv(left));
+    ctx.mm().write(at, &[i[0], i[1], v[0], v[1]])
+}
+
+pub fn setitimer(ctx: &Ctx, which: u32, new: u64, old: u64) -> KResult<u64> {
+    if which > 2 {
+        return Err(Errno::EINVAL);
+    }
+    let (interval, value) = if new == 0 {
+        (0, 0)
+    } else {
+        read_itimerval(ctx, new)?
+    };
+    if which != 0 {
+        // ITIMER_VIRTUAL and ITIMER_PROF: accepted, never fire.
+        return write_itimerval(ctx, old, (0, 0)).map(|()| 0);
+    }
+    let prev = crate::proc::itimer::set(ctx.process(), value, interval);
+    write_itimerval(ctx, old, prev)?;
+    Ok(0)
+}
+
+pub fn getitimer(ctx: &Ctx, which: u32, cur: u64) -> KResult<u64> {
+    if which > 2 {
+        return Err(Errno::EINVAL);
+    }
+    let v = if which == 0 {
+        crate::proc::itimer::get(ctx.process())
+    } else {
+        (0, 0)
+    };
+    write_itimerval(ctx, cur, v)?;
+    Ok(0)
+}
+
+pub fn alarm(ctx: &Ctx, secs: u64) -> KResult<u64> {
+    let (left, _) = crate::proc::itimer::set(ctx.process(), secs * 1_000_000_000, 0);
+    Ok(left.div_ceil(1_000_000_000))
+}

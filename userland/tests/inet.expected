@@ -1,0 +1,66 @@
+# tcp
+ok   s >= 0
+ok   bind(s, (struct sockaddr *)&a, sizeof a) == 0
+ok   port > 0
+ok   opt(s, SOL_SOCKET, SO_ACCEPTCONN) == 0
+ok   listen(s, 4) == 0
+ok   opt(s, SOL_SOCKET, SO_ACCEPTCONN) == 1
+ok   opt(s, SOL_SOCKET, SO_TYPE) == SOCK_STREAM
+ok   bind(other, (struct sockaddr *)&a, sizeof a) == -1 && errno == EADDRINUSE
+ok   port_of(c, 1) == -1 && errno == ENOTCONN
+ok   connect(c, (struct sockaddr *)&a, sizeof a) == 0
+ok   port_of(c, 1) == port
+ok   poll(&p, 1, 2000) == 1 && (p.revents & POLLIN)
+ok   x >= 0
+ok   plen == sizeof peer && peer.sin_family == AF_INET
+ok   peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK)
+ok   ntohs(peer.sin_port) == port_of(c, 0)
+ok   port_of(x, 0) == port
+ok   setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one) == 0
+ok   send(c, "hello", 5, 0) == 5
+ok   send(c, " world", 6, 0) == 6
+ok   poll(&p, 1, 2000) == 1
+ok   ioctl(x, FIONREAD, &n) == 0 && n == 11
+ok   recv(x, buf, 5, MSG_PEEK) == 5 && memcmp(buf, "hello", 5) == 0
+ok   recv(x, buf, sizeof buf, 0) == 11
+ok   recv(x, buf, sizeof buf, MSG_DONTWAIT) == -1 && errno == EAGAIN
+ok   WIFEXITED(st) && WEXITSTATUS(st) == 0
+ok   total == 16 * 65536 && sum == 0
+ok   read(c, buf, sizeof buf) == 0
+ok   shutdown(c, SHUT_WR) == 0
+ok   send(c, "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE
+ok   connect(c, (struct sockaddr *)&a, sizeof a) == 0
+ok   x >= 0
+ok   write(c, "question", 8) == 8
+ok   shutdown(c, SHUT_WR) == 0
+ok   read(x, buf, sizeof buf) == 8
+ok   read(x, buf, sizeof buf) == 0
+ok   write(x, "answer", 6) == 6
+ok   read(c, buf, sizeof buf) == 6 && memcmp(buf, "answer", 6) == 0
+ok   read(c, buf, sizeof buf) == 0
+ok   connect(c, (struct sockaddr *)&a, sizeof a) == 0 || errno == EINPROGRESS
+ok   poll(&p, 1, 2000) == 1 && (p.revents & POLLOUT)
+ok   opt(c, SOL_SOCKET, SO_ERROR) == 0
+ok   x >= 0
+ok   recv(c, buf, sizeof buf, 0) == -1 && errno == EAGAIN
+ok   connect(c, (struct sockaddr *)&a, sizeof a) == -1 && errno == ECONNREFUSED
+ok   socket(AF_INET, SOCK_STREAM, IPPROTO_UDP) == -1 && errno == EPROTONOSUPPORT
+# udp
+ok   u1 >= 0 && u2 >= 0
+ok   opt(u1, SOL_SOCKET, SO_TYPE) == SOCK_DGRAM
+ok   bind(u1, (struct sockaddr *)&a, sizeof a) == 0
+ok   sendto(u2, "ping", 4, 0, (struct sockaddr *)&a, sizeof a) == 4
+ok   port_of(u2, 0) > 0
+ok   recvfrom(u1, buf, sizeof buf, 0, (struct sockaddr *)&from, &flen) == 4
+ok   memcmp(buf, "ping", 4) == 0
+ok   ntohs(from.sin_port) == port_of(u2, 0)
+ok   from.sin_addr.s_addr == htonl(INADDR_LOOPBACK)
+ok   recv(u1, buf, sizeof buf, MSG_DONTWAIT) == -1 && errno == EAGAIN
+ok   connect(u2, (struct sockaddr *)&a, sizeof a) == 0
+ok   port_of(u2, 1) == port
+ok   send(u2, "abcdef", 6, 0) == 6
+ok   send(u2, "second", 6, 0) == 6
+ok   poll(&p, 1, 2000) == 1
+ok   recv(u1, buf, 3, 0) == 3 && memcmp(buf, "abc", 3) == 0
+ok   recv(u1, buf, sizeof buf, 0) == 6 && memcmp(buf, "second", 6) == 0
+all checks passed

@@ -27,16 +27,16 @@ const QUEUE_SIZE: u16 = 64;
 const MAX_PAGES: usize = 32;
 
 // Status bits.
-const ACKNOWLEDGE: u8 = 1;
-const DRIVER: u8 = 2;
-const DRIVER_OK: u8 = 4;
-const FEATURES_OK: u8 = 8;
-const FAILED: u8 = 128;
+pub(super) const ACKNOWLEDGE: u8 = 1;
+pub(super) const DRIVER: u8 = 2;
+pub(super) const DRIVER_OK: u8 = 4;
+pub(super) const FEATURES_OK: u8 = 8;
+pub(super) const FAILED: u8 = 128;
 
 // Feature bits.
 const F_RO: u64 = 1 << 5;
 const F_FLUSH: u64 = 1 << 9;
-const F_VERSION_1: u64 = 1 << 32;
+pub(super) const F_VERSION_1: u64 = 1 << 32;
 
 // Request types.
 const T_IN: u32 = 0;
@@ -52,11 +52,12 @@ const MAJOR: u32 = 254;
 static NEXT_DISK: AtomicU32 = AtomicU32::new(0);
 
 /// Common configuration structure offsets (virtio 1.2, 4.1.4.3).
-mod common {
+pub(super) mod common {
     pub const DEVICE_FEATURE_SELECT: usize = 0;
     pub const DEVICE_FEATURE: usize = 4;
     pub const DRIVER_FEATURE_SELECT: usize = 8;
     pub const DRIVER_FEATURE: usize = 12;
+    pub const MSIX_CONFIG: usize = 16;
     pub const DEVICE_STATUS: usize = 20;
     pub const QUEUE_SELECT: usize = 22;
     pub const QUEUE_SIZE: usize = 24;
@@ -69,28 +70,28 @@ mod common {
 }
 
 #[derive(Clone, Copy)]
-struct Mmio(u64);
+pub(super) struct Mmio(pub(super) u64);
 
 impl Mmio {
-    fn r8(self, off: usize) -> u8 {
+    pub(super) fn r8(self, off: usize) -> u8 {
         unsafe { read_volatile((self.0 + off as u64) as *const u8) }
     }
-    fn r16(self, off: usize) -> u16 {
+    pub(super) fn r16(self, off: usize) -> u16 {
         unsafe { read_volatile((self.0 + off as u64) as *const u16) }
     }
-    fn r32(self, off: usize) -> u32 {
+    pub(super) fn r32(self, off: usize) -> u32 {
         unsafe { read_volatile((self.0 + off as u64) as *const u32) }
     }
-    fn w8(self, off: usize, v: u8) {
+    pub(super) fn w8(self, off: usize, v: u8) {
         unsafe { write_volatile((self.0 + off as u64) as *mut u8, v) }
     }
-    fn w16(self, off: usize, v: u16) {
+    pub(super) fn w16(self, off: usize, v: u16) {
         unsafe { write_volatile((self.0 + off as u64) as *mut u16, v) }
     }
-    fn w32(self, off: usize, v: u32) {
+    pub(super) fn w32(self, off: usize, v: u32) {
         unsafe { write_volatile((self.0 + off as u64) as *mut u32, v) }
     }
-    fn w64(self, off: usize, v: u64) {
+    pub(super) fn w64(self, off: usize, v: u64) {
         self.w32(off, v as u32);
         self.w32(off + 4, (v >> 32) as u32);
     }
@@ -272,13 +273,13 @@ fn check(dev: &VirtioBlk, lba: u64, len: usize) -> KResult<()> {
 
 /// Where each configuration structure is: (BAR, offset, length), and the
 /// notify offset multiplier.
-struct Caps {
-    common: (u8, u32),
-    notify: (u8, u32, u32),
-    device: (u8, u32),
+pub(super) struct Caps {
+    pub(super) common: (u8, u32),
+    pub(super) notify: (u8, u32, u32),
+    pub(super) device: (u8, u32),
 }
 
-fn find_caps(d: &pci::Device) -> Option<Caps> {
+pub(super) fn find_caps(d: &pci::Device) -> Option<Caps> {
     let (mut common, mut notify, mut device) = (None, None, None);
     for off in d.capabilities(0x09) {
         let a = d.addr;
@@ -299,7 +300,7 @@ fn find_caps(d: &pci::Device) -> Option<Caps> {
     })
 }
 
-fn map_bar(d: &pci::Device, n: u8, cache: &mut Vec<(u8, u64)>) -> Option<u64> {
+pub(super) fn map_bar(d: &pci::Device, n: u8, cache: &mut Vec<(u8, u64)>) -> Option<u64> {
     if let Some(&(_, v)) = cache.iter().find(|(b, _)| *b == n) {
         return Some(v);
     }

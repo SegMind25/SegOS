@@ -1140,3 +1140,28 @@ pub fn umount2(ctx: &Ctx, target: u64, _flags: u64) -> KResult<u64> {
     crate::block::sync_all();
     Ok(0)
 }
+
+/// `close_range`: closes (or, with CLOSE_RANGE_CLOEXEC, marks
+/// close-on-exec) every descriptor from `first` to `last`.
+pub fn close_range(ctx: &Ctx, first: u32, last: u32, flags: u32) -> KResult<u64> {
+    const UNSHARE: u32 = 2;
+    const CLOEXEC: u32 = 4;
+    if flags & !(UNSHARE | CLOEXEC) != 0 || first > last {
+        return Err(Errno::EINVAL);
+    }
+    let mut files = ctx.process().files.lock();
+    let fds: alloc::vec::Vec<i32> = files
+        .list()
+        .into_iter()
+        .map(|(fd, _)| fd)
+        .filter(|&fd| fd as u32 >= first && fd as u32 <= last)
+        .collect();
+    for fd in fds {
+        if flags & CLOEXEC != 0 {
+            let _ = files.set_cloexec(fd, true);
+        } else {
+            let _ = files.close(fd);
+        }
+    }
+    Ok(0)
+}

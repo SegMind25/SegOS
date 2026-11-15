@@ -201,6 +201,29 @@ pub fn root(root: &Arc<dyn Inode>) -> Arc<dyn Inode> {
             ),
             ("stat".into(), file(INO_BASE | 10, me, stat)),
             ("cmdline".into(), file(INO_BASE | 11, me, || "\n".into())),
+            (
+                "net".into(),
+                GenDir::create(INO_BASE | 12, Arc::downgrade(me), |net| {
+                    alloc::vec![
+                        (
+                            "dev".into(),
+                            file(INO_BASE | 13, net, crate::net::iface::proc_dev)
+                        ),
+                        (
+                            "route".into(),
+                            file(INO_BASE | 14, net, crate::net::iface::proc_route)
+                        ),
+                        (
+                            "tcp".into(),
+                            file(INO_BASE | 15, net, crate::net::tcp::proc_tcp)
+                        ),
+                        (
+                            "pnp".into(),
+                            file(INO_BASE | 16, net, crate::net::iface::proc_pnp)
+                        ),
+                    ]
+                })
+            ),
         ];
         for p in proc::all() {
             let pid = p.pid;

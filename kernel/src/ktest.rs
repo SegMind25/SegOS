@@ -68,6 +68,7 @@ const TESTS: &[(&str, fn())] = &[
 
 pub fn run(boot: &'static BootInfo) -> ! {
     crate::load_initramfs(boot);
+    crate::net::init(); // loopback, for the socket tests
     kprintln!("running {} kernel tests", TESTS.len());
     for (name, test) in TESTS {
         crate::console::print(format_args!("test {name} ... "));

@@ -10,6 +10,7 @@ mod cpio;
 mod fat;
 mod glibc;
 mod gpt;
+mod nettest;
 mod userland;
 
 use std::collections::hash_map::RandomState;
@@ -260,6 +261,7 @@ fn root_disk(u: &userland::Userland) -> Result<PathBuf, String> {
     let tree = target.join("rootfs");
     userland::tree(u, &tree)?;
     let copied = glibc::add(&tree)?;
+    nettest::prepare(&tree)?;
     if copied > 0 {
         eprintln!("xtask: root disk: {copied} files of Ubuntu's glibc userland");
     }
@@ -304,7 +306,12 @@ fn qemu(img: &Path) -> Command {
         .args(["-serial", "stdio"])
         .args(["-bios", &ovmf])
         .arg("-drive")
-        .arg(format!("format=raw,file={}", img.display()));
+        .arg(format!("format=raw,file={}", img.display()))
+        // A virtio network card on QEMU's user network (NAT; DHCP; the
+        // build machine is 10.0.2.2).
+        // No option ROM: the firmware would try to boot from the network.
+        .args(["-netdev", "user,id=net0"])
+        .args(["-device", "virtio-net-pci,netdev=net0,romfile="]);
     let rootfs = root().join("target/rootfs.img");
     if rootfs.exists() {
         cmd.arg("-drive")
@@ -420,7 +427,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
         ("echo SEGOS-$((6 * 7))-OK", "SEGOS-42-OK"),
         (
             "ls /tests | grep expected | wc -l | sed 's/^/COUNT=/'",
-            "COUNT=7",
+            "COUNT=8",
         ),
         ("hello | tr a-z A-Z", "HELLO, WORLD!"),
         ("cat /proc/self/comm | tr a-z A-Z", "CAT"),
@@ -452,6 +459,46 @@ fn shell_session(img: &Path) -> Result<(), String> {
         steps.push((
             "python3 -c 'import threading as t, concurrent.futures as f; e = f.ThreadPoolExecutor(8); print(\"THREADS-\" + str(sum(e.map(lambda x: x * x, range(100)))))'",
             "THREADS-328350",
+        ));
+    }
+    // Phase 6: networking, against servers on the build machine.
+    let servers =
+        if rootfs.join("curl").exists() && rootfs.join("ssh").exists() && nettest::available() {
+            Some(nettest::start()?)
+        } else {
+            None
+        };
+    if let Some(s) = &servers {
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        steps.push((
+            "ip -4 addr show dev eth0 | grep -o 'inet [0-9.]*/[0-9]*' | tr a-z A-Z",
+            "INET 10.0.2.15/24",
+        ));
+        steps.push((
+            "ping -c 1 -W 5 10.0.2.2 | grep -c 'bytes from' | sed 's/^/PINGS=/'",
+            "PINGS=1",
+        ));
+        steps.push((
+            leak(format!(
+                "curl -sS --cacert /etc/segos-test/ca.pem https://segos-host:{}/hello.txt | tr a-z A-Z",
+                nettest::HTTPS_PORT
+            )),
+            "HTTPS OVER SEGOS TCP",
+        ));
+        steps.push((
+            leak(format!(
+                "curl -sS --cacert /etc/segos-test/ca.pem https://segos-host:{}/big.bin | md5sum",
+                nettest::HTTPS_PORT
+            )),
+            leak(s.big_md5.clone()),
+        ));
+        steps.push((
+            leak(format!(
+                "ssh -q -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p {} {}@10.0.2.2 'echo SSH-$((40+2))'",
+                nettest::SSH_PORT,
+                s.user
+            )),
+            "SSH-42",
         ));
     }
     if rootfs.join("gcc").exists() {

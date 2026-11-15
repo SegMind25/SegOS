@@ -177,6 +177,7 @@ impl Inode for SocketFile {
                 Ok(0)
             }
             FIONBIO => Ok(0), // the descriptor's flag is set by fcntl's path
+            0x8900..=0x89ff => crate::net::iface::ioctl(req, arg, mm),
             _ => Err(Errno::ENOTTY),
         }
     }

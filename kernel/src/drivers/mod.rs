@@ -7,6 +7,7 @@ pub mod nvme;
 pub mod pci;
 pub mod ps2kbd;
 pub mod virtio_blk;
+pub mod virtio_net;
 
 /// Interrupt vectors of the devices routed through the I/O APIC.
 pub const KEYBOARD_VECTOR: u8 = 0x21;

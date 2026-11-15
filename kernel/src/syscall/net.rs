@@ -372,3 +372,46 @@ fn passcred(s: &Arc<dyn Socket>) -> bool {
         .and_then(|v| v.first().copied())
         .is_some_and(|b| b != 0)
 }
+
+/// `sendmmsg`: `sendmsg` for each `struct mmsghdr` (64 bytes: the msghdr,
+/// then the byte count written back). Stops at the first error after at
+/// least one message went.
+pub fn sendmmsg(ctx: &Ctx, fd: i32, vec: u64, n: u32, flags: u32) -> KResult<u64> {
+    let mut done = 0u64;
+    for i in 0..n.min(1024) as u64 {
+        let at = vec + i * 64;
+        match sendmsg(ctx, fd, at, flags) {
+            Ok(len) => {
+                ctx.mm().write(at + 56, &(len as u32))?;
+                done += 1;
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done)
+}
+
+/// `recvmmsg` (the timeout is not supported; MSG_WAITFORONE is how C
+/// libraries use it): after the first message, the rest only if ready.
+pub fn recvmmsg(ctx: &Ctx, fd: i32, vec: u64, n: u32, flags: u32) -> KResult<u64> {
+    const MSG_WAITFORONE: u32 = 0x10000;
+    let mut done = 0u64;
+    for i in 0..n.min(1024) as u64 {
+        let at = vec + i * 64;
+        let f = if done > 0 && flags & MSG_WAITFORONE != 0 {
+            (flags & !MSG_WAITFORONE) | MSG_DONTWAIT
+        } else {
+            flags & !MSG_WAITFORONE
+        };
+        match recvmsg(ctx, fd, at, f) {
+            Ok(len) => {
+                ctx.mm().write(at + 56, &(len as u32))?;
+                done += 1;
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done)
+}

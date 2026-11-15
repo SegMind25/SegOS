@@ -41,6 +41,12 @@ pub fn is_ours(vector: u64) -> bool {
 }
 
 impl Irq {
+    /// Wakes the waiters as the interrupt would (software events).
+    pub fn notify(&self) {
+        self.count.fetch_add(1, Ordering::Release);
+        self.queue.wake_all();
+    }
+
     /// Sleeps until `done()` holds; re-checks every 10 ms and gives up
     /// (returns false) after `timeout_ms`.
     pub fn wait(&self, mut done: impl FnMut() -> bool, timeout_ms: u64) -> bool {
@@ -61,6 +67,12 @@ impl Irq {
             });
         }
     }
+}
+
+/// An interrupt no device raises: only [`Irq::notify`] wakes it.
+pub fn soft() -> Option<&'static Irq> {
+    let index = NEXT.fetch_add(1, Ordering::Relaxed);
+    IRQS.get(index)
 }
 
 /// Enables MSI-X entry `entry` of `dev` to send a fresh vector to this
