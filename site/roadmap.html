@@ -111,17 +111,17 @@
               <td data-label="Effort" class="effort">3&ndash;4 months</td>
               <td class="status"><span class="badge done">Done</span></td>
             </tr>
-            <tr>
+            <tr class="is-done">
               <th scope="row"><span class="num">6</span> Networking</th>
               <td data-label="What gets built">virtio-net, its own TCP/IP stack (IPv4, ICMP, UDP, TCP, DHCP), unix sockets incl. <code>SCM_RIGHTS</code>, netlink (route)</td>
               <td data-label="Done when"><code>curl https://&hellip;</code> and <code>ssh</code> work</td>
               <td data-label="Effort" class="effort">2&ndash;3 months</td>
               <td class="status"><span class="badge done">Done</span></td>
             </tr>
-            <tr>
+            <tr class="is-done">
               <th scope="row"><span class="num">7</span> Graphics and input</th>
-              <td data-label="What gets built">DRM/KMS on virtio-gpu (then simple-framebuffer, then AMD/Intel), evdev, xHCI + USB HID, <code>memfd</code>, dma-buf</td>
-              <td data-label="Done when">SegLinux&rsquo;s Rust compositor and shell run unchanged on SegOS</td>
+              <td data-label="What gets built">DRM/KMS on the firmware framebuffer (simpledrm), evdev keyboard and PS/2 mouse, <code>memfd</code>, <code>mremap</code>, udev-shaped <code>/sys</code></td>
+              <td data-label="Done when">A Wayland compositor (weston) and its desktop shell run unchanged on SegOS</td>
               <td data-label="Effort" class="effort">4&ndash;6 months</td>
               <td class="status"><span class="badge done">Done</span></td>
             </tr>
