@@ -26,6 +26,32 @@ ok   anon[0] == 42
 ok   priv[0] == 1
 ok   file[0] == 'C'
 ok   pread(fd, &c, 1, 0) == 1 && c == 'C'
+# mremap (a growing wl_shm pool)
+ok   fd >= 3
+ok   fallocate(fd, 0, 0, 4096) == 0
+ok   server != MAP_FAILED
+ok   fallocate(fd, 0, 0, 3 * 4096) == 0
+ok   fstat(fd, &st) == 0 && st.st_size == 3 * 4096
+ok   client != MAP_FAILED
+ok   grown != MAP_FAILED
+ok   grown[0] == 'A' && grown[2 * 4096 + 5] == 'B'
+ok   grown[2 * 4096 + 6] == 'C'
+ok   mremap(grown, 3 * 4096, 4096, 0) == grown
+ok   grown[0] == 'A'
+ok   p != MAP_FAILED
+ok   q != MAP_FAILED
+ok   q[100] == 42 && q[(1 << 20) - 1] == 0
+ok   munmap(q, 1 << 20) == 0
+# flock
+ok   flock(a, LOCK_EX | LOCK_NB) == 0
+ok   flock(b, LOCK_EX | LOCK_NB) == -1 && errno == EWOULDBLOCK
+ok   flock(b, LOCK_SH | LOCK_NB) == -1 && errno == EWOULDBLOCK
+ok   flock(b, LOCK_SH | LOCK_NB) == -1 && errno == EWOULDBLOCK
+ok   flock(b, LOCK_SH | LOCK_NB) == 0
+ok   flock(d, LOCK_SH | LOCK_NB) == 0
+ok   flock(d, LOCK_EX | LOCK_NB) == -1 && errno == EWOULDBLOCK
+ok   flock(b, LOCK_UN) == 0
+ok   flock(d, LOCK_EX | LOCK_NB) == 0
 # errors
 ok   mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) == MAP_FAILED && errno == EACCES
 ok   p != MAP_FAILED

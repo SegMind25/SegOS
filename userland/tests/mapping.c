@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -99,6 +100,66 @@ static void shared_fork(void)
 	munmap(priv, 4096);
 }
 
+static void remap(void)
+{
+	printf("# mremap (a growing wl_shm pool)\n");
+	int fd = memfd_create("pool", MFD_CLOEXEC);
+	CHECK(fd >= 3);
+	CHECK(fallocate(fd, 0, 0, 4096) == 0);
+	char *server = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+	CHECK(server != MAP_FAILED);
+	/* The client grows the pool and draws into the new part... */
+	CHECK(fallocate(fd, 0, 0, 3 * 4096) == 0);
+	struct stat st;
+	CHECK(fstat(fd, &st) == 0 && st.st_size == 3 * 4096);
+	char *client = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	CHECK(client != MAP_FAILED);
+	client[0] = 'A';
+	client[2 * 4096 + 5] = 'B';
+	/* ...and the server's grown mapping shows it. */
+	char *grown = mremap(server, 4096, 3 * 4096, MREMAP_MAYMOVE);
+	CHECK(grown != MAP_FAILED);
+	CHECK(grown[0] == 'A' && grown[2 * 4096 + 5] == 'B');
+	client[2 * 4096 + 6] = 'C';
+	CHECK(grown[2 * 4096 + 6] == 'C');
+	CHECK(mremap(grown, 3 * 4096, 4096, 0) == grown);
+	CHECK(grown[0] == 'A');
+	munmap(grown, 4096);
+	munmap(client, 3 * 4096);
+	close(fd);
+	/* Private anonymous memory keeps its contents when it moves. */
+	char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	CHECK(p != MAP_FAILED);
+	p[100] = 42;
+	char *q = mremap(p, 4096, 1 << 20, MREMAP_MAYMOVE);
+	CHECK(q != MAP_FAILED);
+	CHECK(q[100] == 42 && q[(1 << 20) - 1] == 0);
+	CHECK(munmap(q, 1 << 20) == 0);
+}
+
+static void locks(void)
+{
+	printf("# flock\n");
+	int a = open(name, O_RDWR);
+	int b = open(name, O_RDWR);
+	CHECK(flock(a, LOCK_EX | LOCK_NB) == 0);
+	CHECK(flock(b, LOCK_EX | LOCK_NB) == -1 && errno == EWOULDBLOCK);
+	CHECK(flock(b, LOCK_SH | LOCK_NB) == -1 && errno == EWOULDBLOCK);
+	/* The lock belongs to the open file, which a dup shares. */
+	int c = dup(a);
+	close(a);
+	CHECK(flock(b, LOCK_SH | LOCK_NB) == -1 && errno == EWOULDBLOCK);
+	close(c);
+	CHECK(flock(b, LOCK_SH | LOCK_NB) == 0);
+	int d = open(name, O_RDONLY);
+	CHECK(flock(d, LOCK_SH | LOCK_NB) == 0);
+	CHECK(flock(d, LOCK_EX | LOCK_NB) == -1 && errno == EWOULDBLOCK);
+	CHECK(flock(b, LOCK_UN) == 0);
+	CHECK(flock(d, LOCK_EX | LOCK_NB) == 0);
+	close(b);
+	close(d);
+}
+
 static void errors(void)
 {
 	printf("# errors\n");
@@ -121,6 +182,8 @@ int main(void)
 	CHECK(chdir("/tmp") == 0);
 	shared_file();
 	shared_fork();
+	remap();
+	locks();
 	errors();
 	printf("%s\n", failures ? "FAILED" : "PASSED");
 	return failures != 0;

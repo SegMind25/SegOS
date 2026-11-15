@@ -122,7 +122,7 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
             crate::task::yield_now();
             Ok(0)
         }
-        25 => mem::mremap(),
+        25 => mem::mremap(ctx, a[0], a[1], a[2], a[3] as u32),
         26 => {
             // msync: write back shared file mappings.
             crate::fs::pagecache::sync_all();
@@ -154,7 +154,9 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         72 => fs::fcntl(ctx, fd, a[1] as u32, a[2]),
         74 | 75 => fs::fsync(ctx, fd),
         76 => fs::truncate(ctx, a[0], a[1] as i64),
+        73 => fs::flock(ctx, fd, a[1] as u32),
         77 => fs::ftruncate(ctx, fd, a[1] as i64),
+        285 => fs::fallocate(ctx, fd, a[1] as u32, a[2] as i64, a[3] as i64),
         79 => fs::getcwd(ctx, a[0], a[1]),
         80 => fs::chdir(ctx, a[0]),
         81 => fs::fchdir(ctx, fd),

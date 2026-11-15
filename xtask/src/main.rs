@@ -342,8 +342,8 @@ fn qmp_socket() -> PathBuf {
     root().join("target/qmp.sock")
 }
 
-/// Asks QEMU over QMP to write what the screen shows to `file` (a PPM).
-fn screendump(file: &Path) -> Result<(), String> {
+/// Runs one QMP command (a JSON object) and waits for its answer.
+fn qmp(command: &str) -> Result<(), String> {
     use std::io::{BufRead, BufReader, Write};
     let err = |e: std::io::Error| format!("QMP: {e}");
     let sock = std::os::unix::net::UnixStream::connect(qmp_socket()).map_err(err)?;
@@ -370,19 +370,23 @@ fn screendump(file: &Path) -> Result<(), String> {
     w.write_all(b"{\"execute\":\"qmp_capabilities\"}\n")
         .map_err(err)?;
     answer(&mut r)?;
+    w.write_all(format!("{command}\n").as_bytes())
+        .map_err(err)?;
+    answer(&mut r)?;
+    Ok(())
+}
+
+/// Asks QEMU over QMP to write what the screen shows to `file` (a PPM).
+fn screendump(file: &Path) -> Result<(), String> {
     let _ = std::fs::remove_file(file);
     let path = file
         .display()
         .to_string()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
-    w.write_all(
-        format!("{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":\"{path}\"}}}}\n")
-            .as_bytes(),
-    )
-    .map_err(err)?;
-    answer(&mut r)?;
-    Ok(())
+    qmp(&format!(
+        "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":\"{path}\"}}}}"
+    ))
 }
 
 /// A binary PPM (P6, maxval 255): (width, height, RGB bytes).
@@ -444,6 +448,28 @@ fn screen(at: &[(f64, f64)]) -> Result<(usize, usize, Vec<&'static str>), String
         })
         .collect();
     Ok((w, h, colours))
+}
+
+/// A QMP screendump's (width, height), number of distinct colours, and
+/// the share of the screen the commonest colour covers.
+fn screen_colours() -> Result<(usize, usize, usize, f64), String> {
+    let file = root().join("target/screen.ppm");
+    screendump(&file)?;
+    let data = read(&file)?;
+    let (w, h, px) = parse_ppm(&data)?;
+    let mut counts = std::collections::HashMap::<[u8; 3], usize>::new();
+    for p in px.chunks_exact(3) {
+        *counts.entry([p[0], p[1], p[2]]).or_default() += 1;
+    }
+    let top = counts.values().copied().max().unwrap_or(0);
+    Ok((w, h, counts.len(), top as f64 / (w * h).max(1) as f64))
+}
+
+/// Presses and releases a key (a QEMU "qcode", e.g. "esc") over QMP.
+fn send_key(qcode: &str) -> Result<(), String> {
+    qmp(&format!(
+        "{{\"execute\":\"send-key\",\"arguments\":{{\"keys\":[{{\"type\":\"qcode\",\"data\":\"{qcode}\"}}]}}}}"
+    ))
 }
 
 fn run(img: &Path, opts: &Opts) -> Result<(), String> {
@@ -694,6 +720,107 @@ fn shell_session(img: &Path) -> Result<(), String> {
     }
     println!("xtask: shell session: `{cmd}` -> KILLED-42");
     check_screen("console", &["other", "other", "other"], &mut child)?;
+    // Phase 7 demo: Ubuntu's Wayland compositor on /dev/dri/card0 and
+    // evdev, and a client drawing into it: the screen must show the
+    // client's pattern, a key press (Esc) must reach the client, and the
+    // console must come back when weston ends.
+    if rootfs.join("weston").exists() {
+        // Types `cmd`; returns where `want` ends in the output after `from`.
+        let mut step =
+            |cmd: &str, want: &str, from: usize, secs: u64, child: &mut std::process::Child| {
+                send(cmd);
+                match wait_for(want, from, secs) {
+                    Some(end) => {
+                        println!("xtask: shell session: `{cmd}` -> {want}");
+                        Ok(end)
+                    }
+                    None => fail(format!("`{cmd}` did not print `{want}`"), child).map(|()| from),
+                }
+            };
+        at = step(
+            "XDG_RUNTIME_DIR=/run/user/0 LIBSEAT_BACKEND=noop weston --backend=drm --renderer=pixman --shell=kiosk --log=/tmp/weston.log & WESTON=$!; echo WESTON-$((1+1))",
+            "WESTON-2",
+            at,
+            30,
+            &mut child,
+        )?;
+        at = step(
+            "for i in $(seq 240); do W=$(ls /run/user/0 | grep -v lock); [ -n \"$W\" ] && break; sleep 0.5; done; echo SOCKET-$W",
+            "SOCKET-wayland-",
+            at,
+            150,
+            &mut child,
+        )?;
+        at = step(
+            "XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY=$W weston-simple-shm & echo CLIENT-$((1+2))",
+            "CLIENT-3",
+            at,
+            30,
+            &mut child,
+        )?;
+        // The client fills the screen (kiosk shell) with a many-coloured
+        // pattern; the console and an empty desktop have few colours.
+        let start = std::time::Instant::now();
+        loop {
+            match screen_colours() {
+                Ok((w, h, distinct, top)) if distinct >= 500 && top < 0.5 => {
+                    println!(
+                        "xtask: shell session: weston: the {w}x{h} screen shows the client ({distinct} colours, the commonest on {:.0}%)",
+                        top * 100.0
+                    );
+                    break;
+                }
+                Ok((w, h, distinct, top)) if start.elapsed() > Duration::from_secs(120) => {
+                    return fail(
+                        format!(
+                            "weston: the {w}x{h} screen has {distinct} colours, the commonest on {:.0}%: no client",
+                            top * 100.0
+                        ),
+                        &mut child,
+                    );
+                }
+                Ok(_) => std::thread::sleep(Duration::from_secs(1)),
+                Err(e) => return fail(format!("weston: screendump: {e}"), &mut child),
+            }
+        }
+        // Esc, through the PS/2 keyboard, evdev, libinput and weston:
+        // weston-simple-shm quits on it.
+        if let Err(e) = send_key("esc") {
+            return fail(format!("weston: send-key: {e}"), &mut child);
+        }
+        let Some(end) = wait_for("simple-shm exiting", at, 60) else {
+            return fail(
+                "weston: weston-simple-shm did not quit on Esc".into(),
+                &mut child,
+            );
+        };
+        at = end;
+        println!("xtask: shell session: weston: Esc -> simple-shm exiting");
+        step(
+            "kill $WESTON; wait; grep -c 'caught signal 15' /tmp/weston.log | sed 's/^/WESTON-SIGNALS=/'",
+            "WESTON-SIGNALS=1",
+            at,
+            60,
+            &mut child,
+        )?;
+        match screen_colours() {
+            Ok((w, h, distinct, top)) if distinct < 16 && top > 0.8 => {
+                println!(
+                    "xtask: shell session: weston ended: the {w}x{h} screen is the console again"
+                );
+            }
+            Ok((w, h, distinct, top)) => {
+                return fail(
+                    format!(
+                        "weston ended: the {w}x{h} screen has {distinct} colours, the commonest on {:.0}%: not the console",
+                        top * 100.0
+                    ),
+                    &mut child,
+                );
+            }
+            Err(e) => return fail(format!("weston ended: screendump: {e}"), &mut child),
+        }
+    }
     let _ = stdin.write_all(b"poweroff -f\n");
     let _ = stdin.flush();
     let start = std::time::Instant::now();

@@ -312,7 +312,7 @@ pub fn tree(u: &Userland, dest: &Path) -> Result<(), String> {
 fn contents(u: &Userland) -> Result<(Vec<cpio::Entry>, Vec<String>), String> {
     let mut entries = Vec::new();
     let mut dirs: Vec<String> = [
-        "dev", "proc", "sys", "tmp", "root", "home", "mnt", "var", "sbin", "usr/sbin",
+        "dev", "proc", "sys", "tmp", "run", "root", "home", "mnt", "var", "sbin", "usr/sbin",
     ]
     .iter()
     .map(|s| s.to_string())

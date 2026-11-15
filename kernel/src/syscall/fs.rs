@@ -225,8 +225,9 @@ pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResul
     };
     let ty = inode.file_type();
     let acc = flags & O_ACCMODE;
-    if ty == FileType::Symlink {
-        // O_NOFOLLOW on a symbolic link.
+    if ty == FileType::Symlink && flags & O_PATH == 0 {
+        // O_NOFOLLOW on a symbolic link (O_PATH opens the link itself, as
+        // systemd's path resolution in libudev does).
         return Err(Errno::ELOOP);
     }
     if flags & O_DIRECTORY != 0 && ty != FileType::Directory {
@@ -238,8 +239,13 @@ pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResul
     if flags & O_TRUNC != 0 && ty == FileType::Regular && acc != O_RDONLY {
         inode.truncate(0)?;
     }
-    inode.opened(flags)?;
-    let inode = inode.open_fifo(flags).unwrap_or(inode);
+    // O_PATH only names the file: a device or FIFO is not opened.
+    let inode = if flags & O_PATH != 0 {
+        inode
+    } else {
+        inode.opened(flags)?;
+        inode.open_fifo(flags).unwrap_or(inode)
+    };
     let status = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK | O_DIRECTORY | O_PATH);
     let f = File::new(inode, status);
     let fd = ctx
@@ -290,6 +296,7 @@ pub fn stat_path(ctx: &Ctx, dirfd: i32, path: u64, buf: u64, flags: u32) -> KRes
 /// the newer layout (coreutils and glibc's `stat` use it).
 pub fn statx(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, buf: u64) -> KResult<u64> {
     const STATX_BASIC_STATS: u32 = 0x7ff;
+    const STATX_MNT_ID: u32 = 0x1000;
     let p = ctx.mm().read_cstr(path, fs::PATH_MAX)?;
     let inode = if p.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
@@ -306,7 +313,7 @@ pub fn statx(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, buf: u64) -> KResult<
     let st = inode.stat();
     let mut b = [0u8; 256];
     let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
-    put(0, &STATX_BASIC_STATS.to_le_bytes());
+    put(0, &(STATX_BASIC_STATS | STATX_MNT_ID).to_le_bytes());
     put(4, &(st.st_blksize as u32).to_le_bytes());
     put(16, &(st.st_nlink as u32).to_le_bytes());
     put(20, &st.st_uid.to_le_bytes());
@@ -336,6 +343,10 @@ pub fn statx(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, buf: u64) -> KResult<
     put(132, &(rmin as u32).to_le_bytes());
     put(136, &(dmaj as u32).to_le_bytes());
     put(140, &(dmin as u32).to_le_bytes());
+    // stx_mnt_id: systemd's path resolution (libudev) compares it to tell
+    // "/" from a directory mounted on itself.
+    let mnt_id = fs::mount::mount_of_dev(st.st_dev).map_or(0, |m| m.id);
+    put(144, &mnt_id.to_le_bytes());
     ctx.mm().copy_to(buf, &b)?;
     Ok(0)
 }
@@ -485,6 +496,37 @@ pub fn ftruncate(ctx: &Ctx, fd: i32, len: i64) -> KResult<u64> {
         return Err(Errno::EINVAL);
     }
     f.inode.truncate(len as u64)?;
+    Ok(0)
+}
+
+pub fn flock(ctx: &Ctx, fd: i32, op: u32) -> KResult<u64> {
+    let f = file(ctx, fd)?;
+    fs::flock::flock(&f, op)?;
+    Ok(0)
+}
+
+/// `fallocate(fd, mode, offset, len)`: mode 0 only, which makes the file
+/// at least `offset + len` long (blocks are not reserved ahead).
+pub fn fallocate(ctx: &Ctx, fd: i32, mode: u32, offset: i64, len: i64) -> KResult<u64> {
+    let f = file(ctx, fd)?;
+    if offset < 0 || len <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    if !f.writable() {
+        return Err(Errno::EBADF);
+    }
+    match f.inode.file_type() {
+        FileType::Regular => {}
+        FileType::Directory => return Err(Errno::EISDIR),
+        _ => return Err(Errno::ENODEV),
+    }
+    if mode != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let end = offset.checked_add(len).ok_or(Errno::EFBIG)? as u64;
+    if end > f.inode.size() {
+        f.inode.truncate(end)?;
+    }
     Ok(0)
 }
 
@@ -664,7 +706,12 @@ pub fn readlinkat(ctx: &Ctx, dirfd: i32, path: u64, buf: u64, size: u64) -> KRes
     if size as i64 <= 0 {
         return Err(Errno::EINVAL);
     }
-    let inode = resolve(ctx, dirfd, &path, false)?;
+    let inode = if path.is_empty() && dirfd != AT_FDCWD {
+        // The link itself, opened with O_PATH | O_NOFOLLOW.
+        file(ctx, dirfd)?.inode.clone()
+    } else {
+        resolve(ctx, dirfd, &path, false)?
+    };
     let target = inode.readlink()?;
     let n = target.len().min(size as usize);
     ctx.mm().copy_to(buf, &target.as_bytes()[..n])?;
@@ -734,6 +781,7 @@ pub fn statfs(ctx: &Ctx, target: u64, buf: u64, by_fd: bool) -> KResult<u64> {
     const TMPFS_MAGIC: u64 = 0x0102_1994;
     const PROC_SUPER_MAGIC: u64 = 0x9fa0;
     const PIPEFS_MAGIC: u64 = 0x5049_5045;
+    const SYSFS_MAGIC: u64 = 0x6265_6572;
     let inode = if by_fd {
         file(ctx, target as i32)?.inode.clone()
     } else {
@@ -755,6 +803,10 @@ pub fn statfs(ctx: &Ctx, target: u64, buf: u64, by_fd: bool) -> KResult<u64> {
             )
         }
         (fs::DEV_PROC, None) => (PROC_SUPER_MAGIC, 4096, 0, 0, 0, 0, 0),
+        // libudev accepts device directories only on sysfs.
+        (dev, None) if fs::mount::mount_of_dev(dev).is_some_and(|m| m.fstype == "sysfs") => {
+            (SYSFS_MAGIC, 4096, 0, 0, 0, 0, 0)
+        }
         (fs::DEV_PIPEFS, None) => (PIPEFS_MAGIC, 4096, 0, 0, 0, 0, 0),
         _ => (
             TMPFS_MAGIC,

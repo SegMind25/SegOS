@@ -49,13 +49,16 @@ pub enum Kind {
     Shared,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct Vma {
     pub start: u64,
     pub end: u64,
     /// PROT_* bits.
     pub prot: u32,
     pub kind: Kind,
+    /// A shared file mapping's file, and the file offset at `start` (for
+    /// `mremap` to map more of it).
+    pub file: Option<(Arc<dyn crate::fs::Inode>, u64)>,
 }
 
 impl Vma {
@@ -130,14 +133,28 @@ impl Regions {
     /// Splits the region containing `addr` (if any) so that a region
     /// starts exactly at `addr`.
     fn split_at(&mut self, addr: u64) {
-        let Some(v) = self.find(addr).copied() else {
+        let Some(v) = self.find(addr).cloned() else {
             return;
         };
         if v.start == addr {
             return;
         }
-        self.vmas.insert(v.start, Vma { end: addr, ..v });
-        self.vmas.insert(addr, Vma { start: addr, ..v });
+        let file = v.file.clone().map(|(f, off)| (f, off + (addr - v.start)));
+        self.vmas.insert(
+            v.start,
+            Vma {
+                end: addr,
+                ..v.clone()
+            },
+        );
+        self.vmas.insert(
+            addr,
+            Vma {
+                start: addr,
+                file,
+                ..v
+            },
+        );
     }
 
     /// Start addresses of the regions inside `[start, end)`, after splitting
@@ -197,7 +214,7 @@ impl AddressSpace {
     /// page, marked shared. Each mapping takes its own frame reference.
     pub fn map_shared(&self, start: u64, frames: &[u64]) -> KResult<()> {
         let r = self.inner.lock();
-        let vma = *r.find(start).ok_or(Errno::EFAULT)?;
+        let vma = r.find(start).ok_or(Errno::EFAULT)?;
         let page_flags = vma.page_flags() | flags::SHARED;
         for (i, &phys) in frames.iter().enumerate() {
             let va = start + i as u64 * PAGE_SIZE;
@@ -235,6 +252,7 @@ impl AddressSpace {
                 end,
                 prot,
                 kind,
+                file: None,
             },
         );
         Ok(())
@@ -246,6 +264,94 @@ impl AddressSpace {
             .lock()
             .find_free(page_up(len), MMAP_END)
             .ok_or(Errno::ENOMEM)
+    }
+
+    /// Records the file a shared mapping at `start` (just made by `map`)
+    /// shows, from file offset `off`.
+    pub fn set_file(&self, start: u64, file: Arc<dyn crate::fs::Inode>, off: u64) {
+        if let Some(v) = self.inner.lock().vmas.get_mut(&start) {
+            v.file = Some((file, off));
+        }
+    }
+
+    /// `mremap` of the pages `[old, old + old_len)`, all in one region, to
+    /// `new_len` bytes: shrinks or grows in place, or (with `may_move`)
+    /// moves the pages to a free range. Returns the new address and, for
+    /// a grown shared file mapping, where the new part starts with the
+    /// file and file offset it should show (the caller maps those pages).
+    #[allow(clippy::type_complexity)]
+    pub fn remap(
+        &self,
+        old: u64,
+        old_len: u64,
+        new_len: u64,
+        may_move: bool,
+    ) -> KResult<(u64, Option<(u64, Arc<dyn crate::fs::Inode>, u64)>)> {
+        if !old.is_multiple_of(PAGE_SIZE) || new_len == 0 || old_len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let old_len = page_up(old_len);
+        let new_len = page_up(new_len);
+        let old_end = old.checked_add(old_len).ok_or(Errno::EFAULT)?;
+        if new_len > USER_END || old_end > USER_END {
+            return Err(Errno::ENOMEM);
+        }
+        if new_len <= old_len {
+            if new_len < old_len {
+                self.unmap(old + new_len, old_len - new_len)?;
+            }
+            return Ok((old, None));
+        }
+        let mut r = self.inner.lock();
+        let vma = r.find(old).cloned().ok_or(Errno::EFAULT)?;
+        if vma.end < old_end {
+            return Err(Errno::EFAULT);
+        }
+        let tail_file = |start: u64| {
+            vma.file
+                .clone()
+                .map(|(f, off)| (start + old_len, f, off + (old - vma.start) + old_len))
+        };
+        let new_end = old + new_len;
+        // In place, when the region ends here and the pages after are free.
+        if vma.end == old_end && new_end <= USER_END && !r.overlaps(old_end, new_end) {
+            r.vmas.get_mut(&vma.start).unwrap().end = new_end;
+            return Ok((old, tail_file(old)));
+        }
+        if !may_move {
+            return Err(Errno::ENOMEM);
+        }
+        let new = r.find_free(new_len, MMAP_END).ok_or(Errno::ENOMEM)?;
+        let tail = tail_file(new);
+        for s in r.isolate(old, old_end) {
+            r.vmas.remove(&s);
+        }
+        r.vmas.insert(
+            new,
+            Vma {
+                start: new,
+                end: new + new_len,
+                file: vma
+                    .file
+                    .clone()
+                    .map(|(f, off)| (f, off + (old - vma.start))),
+                ..vma
+            },
+        );
+        // The pages move with their frames (and copy-on-write state).
+        let mut a = 0;
+        while a < old_len {
+            if let Some(e) = paging::user_entry(self.pml4, old + a) {
+                paging::unmap_user(self.pml4, old + a);
+                let page_flags = e & !paging::entry_phys(e) & !flags::PRESENT;
+                if paging::map_user(self.pml4, new + a, paging::entry_phys(e), page_flags).is_err()
+                {
+                    frame::free(paging::entry_phys(e));
+                }
+            }
+            a += PAGE_SIZE;
+        }
+        Ok((new, tail))
     }
 
     /// `munmap`: removes every region (or part of one) in the range.
@@ -312,7 +418,7 @@ impl AddressSpace {
                 return old;
             }
             // Extend the heap region (or create it).
-            let prev = r.find(old_top - 1).copied();
+            let prev = r.find(old_top - 1).cloned();
             match prev {
                 Some(v) if v.kind == Kind::Heap && v.end == old_top => {
                     r.vmas.get_mut(&v.start).unwrap().end = new_top;
@@ -325,6 +431,7 @@ impl AddressSpace {
                             end: new_top,
                             prot: PROT_READ | PROT_WRITE,
                             kind: Kind::Heap,
+                            file: None,
                         },
                     );
                 }
@@ -523,7 +630,7 @@ impl AddressSpace {
 
     /// The regions, for diagnostics and tests.
     pub fn regions(&self) -> Vec<Vma> {
-        self.inner.lock().vmas.values().copied().collect()
+        self.inner.lock().vmas.values().cloned().collect()
     }
 }
 

@@ -17,6 +17,7 @@ pub mod disk;
 pub mod event;
 pub mod ext4;
 pub mod fat;
+pub mod flock;
 pub mod mount;
 pub mod pagecache;
 pub mod pipe;
@@ -381,7 +382,14 @@ pub fn resolve(
             "." => continue,
             ".." => {
                 let up = mount::cross_up(cur.clone());
-                cur = up.parent().unwrap_or(up);
+                // "/.." is "/": the file system mounted there, not what
+                // that mount covers.
+                let top = base_root();
+                cur = if up.dev() == top.dev() && up.ino() == top.ino() {
+                    root()
+                } else {
+                    up.parent().unwrap_or(up)
+                };
                 canon.pop();
                 continue;
             }
@@ -501,6 +509,16 @@ pub struct File {
     pub offset: Mutex<u64>,
     /// Access mode and status flags (O_APPEND, O_NONBLOCK, ...).
     pub flags: SpinLock<u32>,
+    /// Whether it has held a `flock` lock (to release on the last close).
+    pub locked: core::sync::atomic::AtomicBool,
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        if self.locked.load(Ordering::Relaxed) {
+            flock::release(self as *const File as usize);
+        }
+    }
 }
 
 impl File {
@@ -509,6 +527,7 @@ impl File {
             inode,
             offset: Mutex::new(0),
             flags: SpinLock::new(flags),
+            locked: core::sync::atomic::AtomicBool::new(false),
         })
     }
 

@@ -38,7 +38,7 @@ pub fn mount_fat(dev: Arc<dyn BlockDevice>) -> KResult<mount::Mounted> {
 
 /// Looks for a partition holding a root file system (ext4 with `/init`)
 /// and mounts it on "/", as Linux does with `root=`. Then mounts what the
-/// system needs on it: /dev, /proc, and tmpfs on /tmp and /root while disk
+/// system needs on it: /dev, /proc, /sys, tmpfs on /tmp and /run, and on /root while disk
 /// file systems are read-only. Returns the device used.
 pub fn mount_root() -> Option<alloc::string::String> {
     for dev in crate::block::all() {
@@ -67,6 +67,7 @@ pub fn mount_root() -> Option<alloc::string::String> {
             ("dev", "devtmpfs", super::dev_dir()),
             ("proc", "proc", super::procfs::root(&root)),
             ("tmp", "tmpfs", super::tmpfs::Dir::new_root(0o1777)),
+            ("run", "tmpfs", super::tmpfs::Dir::new_root(0o755)),
             ("sys", "sysfs", super::sysfs::create()),
         ];
         if read_only {

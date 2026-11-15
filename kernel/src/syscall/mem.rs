@@ -137,6 +137,7 @@ fn map_shared(
                 for i in 0..pages {
                     frames.push(cache.page(off / PAGE_SIZE + i)?);
                 }
+                mm.set_file(start, f.inode.clone(), off);
                 mm.map_shared(start, &frames)
             }
             None => {
@@ -204,7 +205,24 @@ pub fn mprotect(ctx: &Ctx, addr: u64, len: u64, prot: u32) -> KResult<u64> {
     Ok(0)
 }
 
-/// Not supported yet; C libraries fall back to allocate, copy, free.
-pub fn mremap() -> KResult<u64> {
-    Err(Errno::ENOMEM)
+/// `mremap(old, old_len, new_len, flags)`: shrinks, grows or (with
+/// MREMAP_MAYMOVE) moves a mapping. A grown shared file mapping shows more
+/// of the file (Wayland compositors grow clients' wl_shm pools this way).
+pub fn mremap(ctx: &Ctx, old: u64, old_len: u64, new_len: u64, flags: u32) -> KResult<u64> {
+    const MREMAP_MAYMOVE: u32 = 1;
+    if flags & !MREMAP_MAYMOVE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mm = ctx.mm();
+    let (addr, tail) = mm.remap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0)?;
+    if let Some((start, inode, off)) = tail {
+        let end = addr + new_len.next_multiple_of(PAGE_SIZE);
+        let cache = crate::fs::pagecache::get(&inode);
+        let mut frames = Vec::new();
+        for i in 0..(end - start) / PAGE_SIZE {
+            frames.push(cache.page(off / PAGE_SIZE + i)?);
+        }
+        mm.map_shared(start, &frames)?;
+    }
+    Ok(addr)
 }
