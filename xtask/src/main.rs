@@ -820,6 +820,50 @@ fn shell_session(img: &Path) -> Result<(), String> {
         };
         at = end;
         println!("xtask: shell session: weston: Esc -> simple-shm exiting");
+        // Phase 8 demo: Firefox in a window on weston (Wayland, software
+        // rendering), showing the test page: red, with a blue block below.
+        if firefox {
+            at = step(
+                &format!(
+                    "XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY=$W MOZ_ENABLE_WAYLAND=1 HOME=/root MOZ_CRASHREPORTER_DISABLE=1 firefox --kiosk file://{}/page.html > /tmp/ff-wayland.log 2>&1 & FF=$!; echo FIREFOX-$((2+2))",
+                    firefox::TEST_DIR
+                ),
+                "FIREFOX-4",
+                at,
+                30,
+                &mut child,
+            )?;
+            let points = [(0.25, 0.5), (0.5, 0.5), (0.75, 0.5), (0.5, 0.85)];
+            let want = ["red", "red", "red", "blue"];
+            let start = std::time::Instant::now();
+            loop {
+                match screen(&points) {
+                    Ok((w, h, got)) if got == want => {
+                        println!(
+                            "xtask: shell session: weston: Firefox shows the page on the {w}x{h} screen ({got:?})"
+                        );
+                        break;
+                    }
+                    Ok((w, h, got)) if start.elapsed() > Duration::from_secs(900) => {
+                        return fail(
+                            format!(
+                                "weston: the {w}x{h} screen is {got:?}, not Firefox's page {want:?}"
+                            ),
+                            &mut child,
+                        );
+                    }
+                    Ok(_) => std::thread::sleep(Duration::from_secs(2)),
+                    Err(e) => return fail(format!("weston: screendump: {e}"), &mut child),
+                }
+            }
+            at = step(
+                "kill $FF; wait $FF; echo FIREFOX-CLOSED-$((3+3))",
+                "FIREFOX-CLOSED-6",
+                at,
+                120,
+                &mut child,
+            )?;
+        }
         step(
             "kill $WESTON; wait; grep -c 'caught signal 15' /tmp/weston.log | sed 's/^/WESTON-SIGNALS=/'",
             "WESTON-SIGNALS=1",

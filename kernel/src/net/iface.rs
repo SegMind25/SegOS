@@ -294,7 +294,7 @@ fn flush_waiting(ip: u32, mac: [u8; 6]) {
 fn arp_tick(now: u64) {
     let mut retry = Vec::new();
     WAITING.lock().retain_mut(|p| {
-        if now - p.since < 1_000_000_000 {
+        if now.saturating_sub(p.since) < 1_000_000_000 {
             return true;
         }
         p.tries += 1;

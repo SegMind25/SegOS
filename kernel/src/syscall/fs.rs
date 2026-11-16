@@ -1193,12 +1193,25 @@ pub fn getdents64(ctx: &Ctx, fd: i32, buf: u64, count: u64) -> KResult<u64> {
         (".".into(), dir.ino(), 4),
         ("..".into(), dir.parent().map_or(dir.ino(), |p| p.ino()), 4),
     ];
-    for (name, inode) in dir.entries()? {
-        list.push((name, inode.ino(), inode.file_type().dirent_type()));
-    }
+    let mut names: Vec<(String, u64, u8)> = dir
+        .entries()?
+        .into_iter()
+        .map(|(name, inode)| (name, inode.ino(), inode.file_type().dirent_type()))
+        .collect();
+    names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    list.extend(names);
     let mut pos = f.offset.lock();
+    let mut cursor = f.dir_cursor.lock();
+    // Past "." and "..", resume after the last name returned, wherever
+    // it now is.
+    let mut i = match (&*cursor, *pos) {
+        (Some(last), p) if p > 2 => {
+            2 + list[2..].partition_point(|(n, _, _)| n.as_str() <= last.as_str())
+        }
+        _ => *pos as usize,
+    };
     let mut out = Vec::new();
-    let mut i = *pos as usize;
+    let mut last = None;
     while let Some((name, ino, t)) = list.get(i) {
         let reclen = (19 + name.len() + 1).next_multiple_of(8);
         if (out.len() + reclen) as u64 > count {
@@ -1210,13 +1223,19 @@ pub fn getdents64(ctx: &Ctx, fd: i32, buf: u64, count: u64) -> KResult<u64> {
         out.push(*t);
         out.extend_from_slice(name.as_bytes());
         out.resize(out.len() + reclen - 19 - name.len(), 0);
+        last = Some(name);
         i += 1;
     }
     if out.is_empty() && i < list.len() {
         return Err(Errno::EINVAL); // buffer too small for one entry
     }
     ctx.mm().copy_to(buf, &out)?;
-    *pos = i as u64;
+    if let Some(name) = last {
+        if i > 2 {
+            *cursor = Some(name.clone());
+        }
+        *pos = i as u64;
+    }
     Ok(out.len() as u64)
 }
 

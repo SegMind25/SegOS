@@ -202,6 +202,9 @@ pub struct UserThread {
     pub seccomp: SpinLock<Option<Arc<seccomp::Filter>>>,
     /// `PR_SET_NO_NEW_PRIVS` (inherited, never cleared).
     pub no_new_privs: AtomicBool,
+    /// The system call the thread is in (number + 1; 0: none) and its
+    /// first three arguments, for /proc/<pid>/task/<tid>/syscall.
+    pub syscall: [AtomicU64; 4],
 }
 
 unsafe impl Sync for UserThread {}
@@ -356,6 +359,7 @@ fn new_thread(process: Arc<Process>, mm: Arc<AddressSpace>) -> UserThread {
         seccomp_mode: AtomicU32::new(seccomp::MODE_DISABLED),
         seccomp: SpinLock::new(None),
         no_new_privs: AtomicBool::new(false),
+        syscall: [const { AtomicU64::new(0) }; 4],
     }
 }
 

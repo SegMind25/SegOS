@@ -93,7 +93,12 @@ pub fn monotonic_ns() -> u64 {
         return TICKS.load(Ordering::Relaxed) * (NS_PER_SEC / HZ);
     }
     let delta = crate::hal::x86::rdtsc().saturating_sub(TSC_BOOT.load(Ordering::Relaxed));
-    (delta as u128 * NS_PER_SEC as u128 / hz as u128) as u64
+    let ns = (delta as u128 * NS_PER_SEC as u128 / hz as u128) as u64;
+    // The CPUs' TSCs need not agree (QEMU without KVM, some machines):
+    // never go back from what any CPU has already returned.
+    static LATEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let prev = LATEST.fetch_max(ns, Ordering::Relaxed);
+    ns.max(prev)
 }
 
 /// Nanoseconds since 1970-01-01 UTC.

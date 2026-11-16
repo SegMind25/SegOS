@@ -577,6 +577,25 @@ fn thread_dir(pid: u32, tid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
                     .unwrap_or_default())
             ),
             (
+                "syscall".into(),
+                file(ino_of(tid, 14), me, move || {
+                    let Some(t) = crate::proc::find_thread(tid) else {
+                        return String::new();
+                    };
+                    let Some(u) = t.user() else {
+                        return String::new();
+                    };
+                    let v: Vec<u64> = u.syscall.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+                    // Linux: "running" in user mode, else the number and
+                    // arguments.
+                    if v[0] == 0 {
+                        "running\n".into()
+                    } else {
+                        format!("{} {:#x} {:#x} {:#x}\n", v[0] - 1, v[1], v[2], v[3])
+                    }
+                })
+            ),
+            (
                 "comm".into(),
                 file(ino_of(tid, 13), me, move || alive()
                     .map(|p| {
