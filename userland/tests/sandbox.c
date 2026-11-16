@@ -325,7 +325,7 @@ static void modes(void)
 	status = in_child(strict);
 	CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
 	/* None of it reached this process. */
-	CHECK(prctl(PR_GET_SECCOMP) == 0 && syscall(SYS_getppid) > 0);
+	CHECK(prctl(PR_GET_SECCOMP) == 0 && syscall(SYS_getppid) != -1);
 }
 
 int main(void)

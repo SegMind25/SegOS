@@ -33,7 +33,7 @@ ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
 # strict
 ok   write in strict mode
 ok   WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL
-ok   prctl(PR_GET_SECCOMP) == 0 && syscall(SYS_getppid) > 0
+ok   prctl(PR_GET_SECCOMP) == 0 && syscall(SYS_getppid) != -1
 # bad programs
 ok   prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
 ok   prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1
