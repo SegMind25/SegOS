@@ -54,10 +54,15 @@ extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
         let task = crate::proc::current();
         let mm = task.user().unwrap().mm();
         let ctx = Ctx { task, mm };
+        let t = ctx.thread();
+        for (slot, v) in t.syscall.iter().zip([nr + 1, a[0], a[1], a[2]]) {
+            slot.store(v, Ordering::Relaxed);
+        }
         let r = match filter(&ctx, frame, nr, a) {
             None => dispatch(&ctx, frame, nr, a),
             Some(r) => r,
         };
+        ctx.thread().syscall[0].store(0, Ordering::Relaxed);
         trace(&ctx, nr, a, &r);
         r
     };

@@ -528,6 +528,10 @@ pub struct File {
     /// The absolute path it was opened by, if known (for /proc/<pid>/fd
     /// and /proc/<pid>/maps: a regular file's inode knows no name).
     path: SpinLock<Option<Arc<str>>>,
+    /// `getdents64`: the name of the last entry returned (entries come in
+    /// name order, so a listing resumes correctly after entries before it
+    /// were removed, as `rm -r` and closing every fd in /proc/self/fd do).
+    pub dir_cursor: SpinLock<Option<String>>,
 }
 
 impl Drop for File {
@@ -546,6 +550,7 @@ impl File {
             flags: SpinLock::new(flags),
             locked: core::sync::atomic::AtomicBool::new(false),
             path: SpinLock::new(None),
+            dir_cursor: SpinLock::new(None),
         })
     }
 
