@@ -820,6 +820,56 @@ fn shell_session(img: &Path) -> Result<(), String> {
         };
         at = end;
         println!("xtask: shell session: weston: Esc -> simple-shm exiting");
+        // Phase 8 demo: Firefox as a Wayland client of weston, showing the
+        // test page (red on top, blue below) full screen.
+        if firefox {
+            at = step(
+                &format!(
+                    "XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY=$W MOZ_ENABLE_WAYLAND=1 HOME=/root MOZ_CRASHREPORTER_DISABLE=1 firefox --kiosk file://{}/page.html > /tmp/ffw.log 2>&1 & FF=$!; echo FIREFOX-$((2+2))",
+                    firefox::TEST_DIR
+                ),
+                "FIREFOX-4",
+                at,
+                30,
+                &mut child,
+            )?;
+            let start = std::time::Instant::now();
+            loop {
+                match screen(&[(0.5, 0.3), (0.5, 0.85)]) {
+                    Ok((w, h, got)) if got == ["red", "blue"] => {
+                        println!(
+                            "xtask: shell session: weston: Firefox shows the page on the {w}x{h} screen ({:.0} s)",
+                            start.elapsed().as_secs_f64()
+                        );
+                        break;
+                    }
+                    Ok((w, h, got)) if start.elapsed() > Duration::from_secs(900) => {
+                        let _ = step(
+                            "tail -20 /tmp/ffw.log; echo FFLOG-$((5+5))",
+                            "FFLOG-10",
+                            at,
+                            20,
+                            &mut child,
+                        );
+                        return fail(
+                            format!(
+                                "weston: the {w}x{h} screen is {got:?} (top, bottom), not Firefox's page"
+                            ),
+                            &mut child,
+                        );
+                    }
+                    Ok(_) => std::thread::sleep(Duration::from_secs(2)),
+                    Err(e) => return fail(format!("weston: screendump: {e}"), &mut child),
+                }
+            }
+            at = step(
+                "kill $FF; wait $FF; echo FIREFOX-ENDED-$((3+4))",
+                "FIREFOX-ENDED-7",
+                at,
+                60,
+                &mut child,
+            )?;
+        }
         step(
             "kill $WESTON; wait; grep -c 'caught signal 15' /tmp/weston.log | sed 's/^/WESTON-SIGNALS=/'",
             "WESTON-SIGNALS=1",
