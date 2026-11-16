@@ -682,9 +682,10 @@ fn shell_session(img: &Path) -> Result<(), String> {
     // Phase 7: a KMS program shows a red|blue frame (SETCRTC), then flips
     // to a green one (PAGE_FLIP); QEMU's screen is checked in both states,
     // and once more after it ends, when the console has the screen back.
-    let mut send = |cmd: &str| {
-        let _ = stdin.write_all(format!("{cmd}\n").as_bytes());
-        let _ = stdin.flush();
+    let send = |cmd: &str| {
+        let mut w = &stdin;
+        let _ = w.write_all(format!("{cmd}\n").as_bytes());
+        let _ = w.flush();
     };
     let check_screen = |what: &str, want: &[&str], child: &mut std::process::Child| {
         // The kernel copies to the screen at once; give QEMU's display a moment.
@@ -750,7 +751,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
     // console must come back when weston ends.
     if rootfs.join("weston").exists() {
         // Types `cmd`; returns where `want` ends in the output after `from`.
-        let mut step =
+        let step =
             |cmd: &str, want: &str, from: usize, secs: u64, child: &mut std::process::Child| {
                 send(cmd);
                 match wait_for(want, from, secs) {
@@ -820,6 +821,25 @@ fn shell_session(img: &Path) -> Result<(), String> {
         };
         at = end;
         println!("xtask: shell session: weston: Esc -> simple-shm exiting");
+        // weston (seat "noop") leaves the console's keyboard on, so the Esc
+        // reached BusyBox's shell too, which takes it with the next 15
+        // characters typed as an escape sequence when they come together
+        // (slow machines). Type a marker until the shell answers it.
+        let mut synced = false;
+        for _ in 0..5 {
+            send("echo SYNC-$((8*8))");
+            if let Some(end) = wait_for("SYNC-64", at, 20) {
+                at = end;
+                synced = true;
+                break;
+            }
+        }
+        if !synced {
+            return fail(
+                "weston: the shell did not answer after Esc".into(),
+                &mut child,
+            );
+        }
         // Phase 8 demo: Firefox as a Wayland client of weston, showing the
         // test page (red on top, blue below) full screen.
         if firefox {
