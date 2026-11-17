@@ -205,10 +205,15 @@ fn control(b: u8) -> u8 {
     }
 }
 
-/// Keyboard interrupt: reads the scan code, reports the key to evdev
-/// and types it on the console (unless a program has the keyboard).
+/// Keyboard interrupt: reads the scan code and handles it.
 pub fn irq() {
-    let code = unsafe { x86::inb(DATA) };
+    scancode(unsafe { x86::inb(DATA) });
+}
+
+/// A set-1 scan code byte (from the PS/2 keyboard, or translated from a
+/// USB keyboard): reports the key to evdev and types it on the console
+/// (unless a program has the keyboard).
+pub fn scancode(code: u8) {
     let mut out = [0u8; 8];
     let (n, ev) = {
         let mut k = KEYS.lock();

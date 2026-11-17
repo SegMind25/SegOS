@@ -335,6 +335,11 @@ fn qemu(img: &Path) -> Command {
             "-device",
             "hda-output,audiodev=snd0",
         ]);
+    // A USB controller with a keyboard and a mouse (the shell session
+    // types on the keyboard through QMP).
+    cmd.args(["-device", "qemu-xhci,id=xhci"])
+        .args(["-device", "usb-kbd,bus=xhci.0,id=ukbd"])
+        .args(["-device", "usb-mouse,bus=xhci.0,id=umouse"]);
     // A QMP socket, for screendumps of what SegOS shows.
     let qmp = qmp_socket();
     let _ = std::fs::remove_file(&qmp);
@@ -524,6 +529,44 @@ fn screen_colours() -> Result<(usize, usize, usize, f64), String> {
     }
     let top = counts.values().copied().max().unwrap_or(0);
     Ok((w, h, counts.len(), top as f64 / (w * h).max(1) as f64))
+}
+
+/// Types `text` on the USB keyboard (QEMU device `ukbd`), key by key.
+fn type_usb(text: &str) -> Result<(), String> {
+    for c in text.chars() {
+        let (key, shift) = match c {
+            'a'..='z' | '0'..='9' => (c.to_string(), false),
+            'A'..='Z' => (c.to_ascii_lowercase().to_string(), true),
+            ' ' => ("spc".into(), false),
+            '-' => ("minus".into(), false),
+            '\n' => ("ret".into(), false),
+            '$' => ("4".into(), true),
+            '(' => ("9".into(), true),
+            ')' => ("0".into(), true),
+            '*' => ("8".into(), true),
+            _ => return Err(format!("cannot type {c:?}")),
+        };
+        let ev = |k: &str, down: bool| {
+            format!(
+                "{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{k}\"}}}}}}"
+            )
+        };
+        let mut events = Vec::new();
+        if shift {
+            events.push(ev("shift", true));
+        }
+        events.push(ev(&key, true));
+        events.push(ev(&key, false));
+        if shift {
+            events.push(ev("shift", false));
+        }
+        qmp(&format!(
+            "{{\"execute\":\"input-send-event\",\"arguments\":{{\"device\":\"ukbd\",\"events\":[{}]}}}}",
+            events.join(",")
+        ))?;
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    Ok(())
 }
 
 /// Presses and releases a key (a QEMU "qcode", e.g. "esc") over QMP.
@@ -765,6 +808,36 @@ fn shell_session(img: &Path) -> Result<(), String> {
         let _ = w.write_all(format!("{cmd}\n").as_bytes());
         let _ = w.flush();
     };
+    // Phase 8: USB. A command typed on the USB keyboard (xHCI, HID boot
+    // protocol) reaches the shell; the USB mouse's motion reaches evdev.
+    if let Err(e) = type_usb("echo USB-$((6*7))\n") {
+        return fail(format!("usb: {e}"), &mut child);
+    }
+    let Some(end) = wait_for("USB-42", at, 60) else {
+        return fail(
+            "usb: the line typed on the USB keyboard did not run".into(),
+            &mut child,
+        );
+    };
+    at = end;
+    println!("xtask: shell session: USB keyboard: `echo USB-$((6*7))` -> USB-42");
+    send(
+        "(dd if=/dev/input/event1 bs=24 count=1 2>/dev/null | wc -c | sed 's/^/MOUSE-BYTES=/') & sleep 1; echo MOVE-$((3+3))",
+    );
+    let Some(end) = wait_for("MOVE-6", at, 30) else {
+        return fail("usb: the mouse reader did not start".into(), &mut child);
+    };
+    at = end;
+    if let Err(e) = qmp(
+        "{\"execute\":\"input-send-event\",\"arguments\":{\"device\":\"umouse\",\"events\":[{\"type\":\"rel\",\"data\":{\"axis\":\"x\",\"value\":20}}]}}",
+    ) {
+        return fail(format!("usb: {e}"), &mut child);
+    }
+    let Some(end) = wait_for("MOUSE-BYTES=24", at, 30) else {
+        return fail("usb: no evdev event from the USB mouse".into(), &mut child);
+    };
+    at = end;
+    println!("xtask: shell session: USB mouse: motion -> one evdev event (24 bytes)");
     let check_screen = |what: &str, want: &[&str], child: &mut std::process::Child| {
         // The kernel copies to the screen at once; give QEMU's display a moment.
         std::thread::sleep(Duration::from_millis(500));
