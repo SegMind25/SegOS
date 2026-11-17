@@ -75,8 +75,9 @@ pub struct Process {
     pub exe: SpinLock<String>,
     pub cmdline: SpinLock<Vec<String>>,
     pub files: Mutex<FdTable>,
-    pub cwd: SpinLock<Arc<dyn Inode>>,
-    pub umask: AtomicU32,
+    /// Root, working directory and umask (shared after CLONE_FS).
+    pub fs: SpinLock<Arc<FsState>>,
+    pub net_ns: SpinLock<Arc<ns::NetNs>>,
     pub sigactions: SpinLock<[SigAction; signal::NSIG]>,
     pub children: SpinLock<Vec<Arc<Process>>>,
     /// Bumped and woken whenever a child changes state.
@@ -319,6 +320,48 @@ pub fn initial_frame(rip: u64, rsp: u64) -> TrapFrame {
     }
 }
 
+/// What CLONE_FS shares: the root directory (`chroot`; None: the
+/// system's), the working directory and the umask.
+pub struct FsState {
+    pub root: SpinLock<Option<Arc<dyn Inode>>>,
+    pub cwd: SpinLock<Arc<dyn Inode>>,
+    pub umask: AtomicU32,
+}
+
+impl FsState {
+    fn new(cwd: Arc<dyn Inode>) -> Arc<FsState> {
+        Arc::new(FsState {
+            root: SpinLock::new(None),
+            cwd: SpinLock::new(cwd),
+            umask: AtomicU32::new(0o022),
+        })
+    }
+
+    /// A copy that is no longer shared.
+    pub fn copy(&self) -> Arc<FsState> {
+        Arc::new(FsState {
+            root: SpinLock::new(self.root.lock().clone()),
+            cwd: SpinLock::new(self.cwd.lock().clone()),
+            umask: AtomicU32::new(self.umask.load(Ordering::Relaxed)),
+        })
+    }
+}
+
+impl Process {
+    pub fn fs(&self) -> Arc<FsState> {
+        self.fs.lock().clone()
+    }
+
+    pub fn cwd(&self) -> Arc<dyn Inode> {
+        self.fs().cwd.lock().clone()
+    }
+
+    /// The root directory as this process sees it.
+    pub fn root(&self) -> Option<Arc<dyn Inode>> {
+        self.fs().root.lock().clone()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn new_process(
     pid: u32,
@@ -344,8 +387,8 @@ fn new_process(
         exe: SpinLock::new(String::new()),
         cmdline: SpinLock::new(Vec::new()),
         files: Mutex::new(files),
-        cwd: SpinLock::new(cwd),
-        umask: AtomicU32::new(0o022),
+        fs: SpinLock::new(FsState::new(cwd)),
+        net_ns: SpinLock::new(ns::NetNs::initial()),
         sigactions: SpinLock::new([SigAction::default(); signal::NSIG]),
         children: SpinLock::new(Vec::new()),
         child_events: AtomicU64::new(0),
@@ -475,8 +518,9 @@ pub mod clone_flags {
     pub const CLONE_CHILD_SETTID: u64 = 0x1000000;
     pub const CLONE_NEWUSER: u64 = 0x1000_0000;
     pub const CLONE_NEWPID: u64 = 0x2000_0000;
-    /// Mount, UTS, IPC, network and cgroup namespaces: not yet.
-    pub const UNSUPPORTED: u64 = 0x4e02_0000;
+    pub const CLONE_NEWNET: u64 = 0x4000_0000;
+    /// Mount, UTS, IPC and cgroup namespaces: not yet.
+    pub const UNSUPPORTED: u64 = 0x0e02_0000;
 }
 
 /// `fork`, `vfork` and `clone`. `frame` is the parent's saved user state;
@@ -548,7 +592,7 @@ pub fn clone(
         parent.pid
     };
     let files = parent.files.lock().clone();
-    let cwd = parent.cwd.lock().clone();
+    let cwd = parent.cwd();
     let mut child = new_process(
         pid,
         pid_ns,
@@ -564,7 +608,16 @@ pub fn clone(
     *child.name.get_mut() = parent.name.lock().clone();
     *child.exe.get_mut() = parent.exe.lock().clone();
     *child.cmdline.get_mut() = parent.cmdline.lock().clone();
-    child.umask = AtomicU32::new(parent.umask.load(Ordering::Relaxed));
+    *child.fs.get_mut() = if flags & CLONE_FS != 0 {
+        parent.fs()
+    } else {
+        parent.fs().copy()
+    };
+    *child.net_ns.get_mut() = if flags & CLONE_NEWNET != 0 {
+        ns::NetNs::new()
+    } else {
+        parent.net_ns.lock().clone()
+    };
     child.trace = AtomicU32::new(parent.trace.load(Ordering::Relaxed));
     *child.sigactions.get_mut() = *parent.sigactions.lock();
     child

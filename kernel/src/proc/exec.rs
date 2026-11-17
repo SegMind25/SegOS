@@ -153,7 +153,7 @@ pub fn execve(
     argv: Vec<String>,
     envp: Vec<String>,
 ) -> KResult<()> {
-    let cwd = t.process.cwd.lock().clone();
+    let cwd = t.process.cwd();
     let img = prepare(&cwd, path, argv, envp)?;
 
     // Point of no return.

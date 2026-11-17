@@ -198,7 +198,7 @@ pub fn inotify_add_watch(ctx: &Ctx, fd: i32, path: u64, mask: u32) -> KResult<u6
     let f = file(ctx, fd)?;
     let ino = object::<Inotify>(&f)?;
     let path = super::path_arg(ctx, path)?;
-    let cwd = ctx.process().cwd.lock().clone();
+    let cwd = ctx.process().cwd();
     let target = if mask & event::in_mask::IN_DONT_FOLLOW != 0 {
         fs::lookup_nofollow(&cwd, &path)?
     } else {

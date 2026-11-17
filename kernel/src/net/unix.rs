@@ -226,8 +226,16 @@ impl Inode for NameNode {
 fn cwd() -> Arc<dyn Inode> {
     crate::task::current()
         .user()
-        .map(|u| u.process.cwd.lock().clone())
+        .map(|u| u.process.cwd())
         .unwrap_or_else(fs::root)
+}
+
+/// Abstract names belong to a network namespace: the registry's key is
+/// the caller's namespace and the name.
+fn abstract_key(name: &[u8]) -> Vec<u8> {
+    let mut k = crate::proc::ns::current_net().ino.to_le_bytes().to_vec();
+    k.extend_from_slice(name);
+    k
 }
 
 /// The socket a name refers to.
@@ -235,7 +243,7 @@ fn lookup(name: &[u8]) -> KResult<Arc<UnixSocket>> {
     if name.first() == Some(&0) {
         return ABSTRACT
             .lock()
-            .get(name)
+            .get(&abstract_key(name))
             .and_then(Weak::upgrade)
             .ok_or(Errno::ECONNREFUSED);
     }
@@ -287,11 +295,12 @@ impl Socket for UnixSocket {
             return Err(Errno::EINVAL);
         }
         if name[0] == 0 {
+            let key = abstract_key(&name);
             let mut names = ABSTRACT.lock();
-            if names.get(&name).is_some_and(|w| w.strong_count() > 0) {
+            if names.get(&key).is_some_and(|w| w.strong_count() > 0) {
                 return Err(Errno::EADDRINUSE);
             }
-            names.insert(name.clone(), self.me.clone());
+            names.insert(key, self.me.clone());
         } else {
             let path = core::str::from_utf8(&name).map_err(|_| Errno::EINVAL)?;
             let (dir, file) = fs::lookup_parent(&cwd(), path)?;
@@ -683,7 +692,7 @@ impl Socket for UnixSocket {
         if let Some(name) = self.name.lock().as_ref()
             && name.first() == Some(&0)
         {
-            ABSTRACT.lock().remove(name);
+            ABSTRACT.lock().retain(|_, w| !Weak::ptr_eq(w, &self.me));
         }
         self.wait.wake_all();
     }

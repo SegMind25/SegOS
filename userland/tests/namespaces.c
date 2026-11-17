@@ -5,7 +5,10 @@
  * from outside; ids and file owners as a namespace sees them; pid 1, the
  * numbering of its children, the reaping of orphans and the signals init
  * ignores in a new PID namespace; and the end of the namespace with its
- * init. `cargo xtask test` runs it on Linux and on SegOS; both must print
+ * init; network namespaces (nothing reachable, abstract unix names of
+ * their own); chroot, and CLONE_FS sharing the root, working directory
+ * and umask (Chromium chroots its sandbox into a dead process's
+ * /proc/<pid>/fdinfo that way). `cargo xtask test` runs it on Linux and on SegOS; both must print
  * exactly namespaces.expected and exit with 0. It never prints an id, so
  * the output is the same whoever runs it.
  */
@@ -17,10 +20,15 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -323,12 +331,118 @@ static void pid_ns(void)
 	CHECK(fork() == -1 && errno == ENOMEM);
 }
 
+/* --- network namespaces ---------------------------------------------- */
+
+static const char abstract_name[] = "\0segos-namespaces-test";
+
+static int unix_socket_at(int (*op)(int, const struct sockaddr *, socklen_t))
+{
+	struct sockaddr_un a = {.sun_family = AF_UNIX};
+	memcpy(a.sun_path, abstract_name, sizeof abstract_name - 1);
+	int s = socket(AF_UNIX, SOCK_STREAM, 0);
+	socklen_t len = offsetof(struct sockaddr_un, sun_path) + sizeof abstract_name - 1;
+	if (op(s, (struct sockaddr *)&a, len) != 0) {
+		int e = errno;
+		close(s);
+		errno = e;
+		return -1;
+	}
+	return s;
+}
+
+static void net_ns(void)
+{
+	char before[64], after[64];
+	struct sockaddr_in lo = {.sin_family = AF_INET, .sin_port = htons(9)};
+	struct sockaddr_in any = {.sin_family = AF_INET};
+	socklen_t len = sizeof any;
+	lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	ns_link("net", before, sizeof before);
+	CHECK(unshare(CLONE_NEWUSER | CLONE_NEWNET) == 0);
+	ns_link("net", after, sizeof after);
+	CHECK(strncmp(after, "net:[", 5) == 0 && strcmp(before, after) != 0);
+	/* Only a loopback interface, down: nothing to reach or bind. */
+	int t = socket(AF_INET, SOCK_STREAM, 0);
+	CHECK(t >= 0 && connect(t, (struct sockaddr *)&lo, sizeof lo) == -1 && errno == ENETUNREACH);
+	close(t);
+	int u = socket(AF_INET, SOCK_DGRAM, 0);
+	CHECK(u >= 0 && sendto(u, "x", 1, 0, (struct sockaddr *)&lo, sizeof lo) == -1 &&
+	      errno == ENETUNREACH);
+	close(u);
+	u = socket(AF_INET, SOCK_DGRAM, 0);
+	CHECK(bind(u, (struct sockaddr *)&lo, sizeof lo) == 0 &&
+	      getsockname(u, (struct sockaddr *)&any, &len) == 0 && any.sin_port == htons(9));
+	close(u);
+	/* The parent's abstract name is not here; this namespace can have
+	 * its own. */
+	CHECK(unix_socket_at(connect) == -1 && errno == ECONNREFUSED);
+	int mine = unix_socket_at(bind);
+	CHECK(mine >= 0 && listen(mine, 1) == 0);
+	int c = unix_socket_at(connect);
+	CHECK(c >= 0);
+	close(c);
+	close(mine);
+}
+
+static void net(void)
+{
+	int s = unix_socket_at(bind);
+	CHECK(s >= 0 && listen(s, 1) == 0);
+	int status = in_child(net_ns);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	close(s);
+}
+
+/* --- chroot and CLONE_FS --------------------------------------------- */
+
+static char dir[] = "/tmp/nsXXXXXX";
+
+/* fork() that shares the filesystem state with the parent. */
+static pid_t fork_fs(void)
+{
+	fflush(stdout);
+	return syscall(SYS_clone, CLONE_FS | SIGCHLD, 0, 0, 0, 0);
+}
+
+static void chroot_fs(void)
+{
+	char cwd[64], sub[80];
+	struct stat a, b;
+	int status;
+	CHECK(unshare(CLONE_NEWUSER) == 0);
+	/* A child sharing our filesystem state moves our working directory
+	 * and sets our umask. */
+	pid_t pid = fork_fs();
+	if (pid == 0)
+		_exit(chdir(dir) == 0 && umask(077) == 022 ? 0 : 1);
+	CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	CHECK(getcwd(cwd, sizeof cwd) && strcmp(cwd, dir) == 0 && umask(022) == 077);
+	/* chroot: "/" is the directory, and ".." stops there. */
+	snprintf(sub, sizeof sub, "%s/sub", dir);
+	CHECK(mkdir(sub, 0755) == 0 && chroot(dir) == 0 && chdir("/") == 0);
+	CHECK(stat("/sub", &a) == 0 && stat("/../sub", &b) == 0 && a.st_ino == b.st_ino);
+	CHECK(stat("/f", &a) == 0 && stat("/tmp", &b) == -1 && errno == ENOENT);
+	CHECK(rmdir("/sub") == 0);
+}
+
+/* Chromium's way into an empty root: a CLONE_FS child chroots into its
+ * own /proc/self/fdinfo, which is empty once it is gone. */
+static void chromium_chroot(void)
+{
+	int status;
+	CHECK(unshare(CLONE_NEWUSER) == 0);
+	pid_t pid = fork_fs();
+	if (pid == 0)
+		_exit(chroot("/proc/self/fdinfo/") == 0 && chdir("/") == 0 ? 0 : 1);
+	CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	CHECK(open("/etc/passwd", O_RDONLY) == -1 && errno == ESRCH);
+}
+
 int main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	outer_uid = getuid();
 	outer_gid = getgid();
-	char dir[] = "/tmp/nsXXXXXX";
 	if (!mkdtemp(dir))
 		return 2;
 	snprintf(file, sizeof file, "%s/f", dir);
@@ -346,6 +460,13 @@ int main(void)
 	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	section("pid namespace");
 	status = in_child(pid_ns);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	section("network namespace");
+	net();
+	section("chroot and CLONE_FS");
+	status = in_child(chroot_fs);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	status = in_child(chromium_chroot);
 	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	unlink(file);
 	rmdir(dir);

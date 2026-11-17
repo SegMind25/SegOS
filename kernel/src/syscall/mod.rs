@@ -258,8 +258,10 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         260 => info::check_owner(ctx, a[2], a[3]),
         95 => Ok(ctx
             .process()
+            .fs()
             .umask
             .swap(a[0] as u32 & 0o777, Ordering::Relaxed) as u64),
+        161 => fs::chroot(ctx, a[0]),
         96 => info::gettimeofday(ctx, a[0]),
         97 => info::getrlimit(ctx, a[0] as u32, a[1]),
         98 => info::getrusage(ctx, a[1]),

@@ -291,6 +291,50 @@ impl UserNs {
     }
 }
 
+/// A network namespace. A new one has only a loopback interface, down:
+/// AF_INET sockets in it reach nothing; abstract AF_UNIX names are its
+/// own.
+pub struct NetNs {
+    pub ino: u64,
+    initial: bool,
+}
+
+static INIT_NET: SpinLock<Option<Arc<NetNs>>> = SpinLock::new(None);
+
+impl NetNs {
+    pub fn initial() -> Arc<NetNs> {
+        INIT_NET
+            .lock()
+            .get_or_insert_with(|| {
+                Arc::new(NetNs {
+                    ino: new_ino(),
+                    initial: true,
+                })
+            })
+            .clone()
+    }
+
+    pub fn new() -> Arc<NetNs> {
+        Arc::new(NetNs {
+            ino: new_ino(),
+            initial: false,
+        })
+    }
+
+    pub fn is_initial(&self) -> bool {
+        self.initial
+    }
+}
+
+/// The network namespace of the calling process (the initial one for
+/// the kernel's own work).
+pub fn current_net() -> Arc<NetNs> {
+    crate::task::current()
+        .user()
+        .map(|u| u.process.net_ns.lock().clone())
+        .unwrap_or_else(NetNs::initial)
+}
+
 /// Whether `a..a+n` and `b..b+m` share an id.
 fn ranges_meet(a: u32, n: u32, b: u32, m: u32) -> bool {
     (a as u64) < b as u64 + m as u64 && (b as u64) < a as u64 + n as u64

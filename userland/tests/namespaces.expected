@@ -66,4 +66,28 @@ ok   waitpid(init, &status, 0) == init && WIFEXITED(status) && WEXITSTATUS(statu
 ok   poll(&pfd, 1, 20000) == 1 && read(held[0], &c, 1) == 0
 ok   fork() == -1 && errno == ENOMEM
 ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
+# network namespace
+ok   s >= 0 && listen(s, 1) == 0
+ok   unshare(CLONE_NEWUSER | CLONE_NEWNET) == 0
+ok   strncmp(after, "net:[", 5) == 0 && strcmp(before, after) != 0
+ok   t >= 0 && connect(t, (struct sockaddr *)&lo, sizeof lo) == -1 && errno == ENETUNREACH
+ok   u >= 0 && sendto(u, "x", 1, 0, (struct sockaddr *)&lo, sizeof lo) == -1 && errno == ENETUNREACH
+ok   bind(u, (struct sockaddr *)&lo, sizeof lo) == 0 && getsockname(u, (struct sockaddr *)&any, &len) == 0 && any.sin_port == htons(9)
+ok   unix_socket_at(connect) == -1 && errno == ECONNREFUSED
+ok   mine >= 0 && listen(mine, 1) == 0
+ok   c >= 0
+ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
+# chroot and CLONE_FS
+ok   unshare(CLONE_NEWUSER) == 0
+ok   waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0
+ok   getcwd(cwd, sizeof cwd) && strcmp(cwd, dir) == 0 && umask(022) == 077
+ok   mkdir(sub, 0755) == 0 && chroot(dir) == 0 && chdir("/") == 0
+ok   stat("/sub", &a) == 0 && stat("/../sub", &b) == 0 && a.st_ino == b.st_ino
+ok   stat("/f", &a) == 0 && stat("/tmp", &b) == -1 && errno == ENOENT
+ok   rmdir("/sub") == 0
+ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
+ok   unshare(CLONE_NEWUSER) == 0
+ok   waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0
+ok   open("/etc/passwd", O_RDONLY) == -1 && errno == ESRCH
+ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
 PASSED

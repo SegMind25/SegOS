@@ -141,6 +141,11 @@ pub fn current() -> Arc<Task> {
     })
 }
 
+/// The running task, if the scheduler runs on this CPU yet.
+pub fn try_current() -> Option<Arc<Task>> {
+    x86::without_interrupts(|| unsafe { (*this_cpu().current.get()).clone() })
+}
+
 /// Puts a blocked or new task on the run queue.
 pub(crate) fn make_ready(task: Arc<Task>) {
     RUN_QUEUE.lock().push_back(task);

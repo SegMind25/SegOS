@@ -41,7 +41,7 @@ pub fn execve(ctx: &Ctx, frame: &mut TrapFrame, path: u64, argv: u64, envp: u64)
     if ctx.process().thread_count() > 1 {
         // The other threads go first, unless the program obviously cannot
         // be run (a failed execve must leave the process as it was).
-        let cwd = ctx.process().cwd.lock().clone();
+        let cwd = ctx.process().cwd();
         let inode = crate::fs::lookup(&cwd, &path)?;
         if inode.file_type() != crate::fs::FileType::Regular || inode.perm() & 0o111 == 0 {
             return Err(Errno::EACCES);
@@ -278,14 +278,16 @@ pub fn sigaltstack(ctx: &Ctx, frame: &TrapFrame, new: u64, old: u64) -> KResult<
 }
 
 /// `unshare(flags)`: a new user namespace for the caller, or a new PID
-/// namespace for its children; CLONE_FILES, CLONE_FS and CLONE_SYSVSEM
-/// change nothing (nothing is shared between processes); CLONE_THREAD,
+/// namespace for its children, a new network namespace; CLONE_FS stops
+/// sharing the filesystem state; CLONE_FILES and CLONE_SYSVSEM change
+/// nothing (descriptor tables are never shared); CLONE_THREAD,
 /// CLONE_SIGHAND and CLONE_VM only for a single-threaded caller.
 pub fn unshare(ctx: &Ctx, flags: u64) -> KResult<u64> {
     use proc::clone_flags::*;
     use proc::ns::{PidNs, UserNs};
     let known = CLONE_NEWUSER
         | CLONE_NEWPID
+        | CLONE_NEWNET
         | CLONE_FILES
         | CLONE_FS
         | CLONE_SYSVSEM
@@ -320,6 +322,13 @@ pub fn unshare(ctx: &Ctx, flags: u64) -> KResult<u64> {
     };
     if let Some(u) = user {
         *p.user_ns.lock() = u;
+    }
+    if flags & CLONE_FS != 0 {
+        let own = p.fs().copy();
+        *p.fs.lock() = own;
+    }
+    if flags & CLONE_NEWNET != 0 {
+        *p.net_ns.lock() = proc::ns::NetNs::new();
     }
     if let Some(n) = pid {
         *p.child_pid_ns.lock() = n;

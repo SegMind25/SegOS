@@ -61,6 +61,9 @@ fn new_fd(ctx: &Ctx, s: Arc<dyn Socket>, flags: u32) -> KResult<u64> {
 fn create(domain: u32, ty: u32, protocol: u32) -> KResult<Arc<dyn Socket>> {
     match domain as u16 {
         AF_UNIX => crate::net::unix::new_socket(ty),
+        AF_INET if !crate::proc::ns::current_net().is_initial() => {
+            crate::net::isolated::new(ty, protocol)
+        }
         AF_INET => crate::net::inet_socket(ty, protocol),
         AF_NETLINK => crate::net::netlink_socket(ty, protocol),
         AF_INET6 => Err(Errno::EAFNOSUPPORT),

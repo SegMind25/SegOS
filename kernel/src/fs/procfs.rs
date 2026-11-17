@@ -168,6 +168,10 @@ fn ns_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
                 }
                 Ok(format!("pid:[{}]", ns.ino))
             }),
+            entry("net", 0x27, |p| Ok(format!(
+                "net:[{}]",
+                p.net_ns.lock().ino
+            ))),
             entry("user", 0x26, |p| Ok(format!(
                 "user:[{}]",
                 p.user_ns.lock().ino
@@ -521,7 +525,7 @@ fn pid_status(p: &Process) -> String {
          Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t{}\n\
          NoNewPrivs:\t{nnp}\nSeccomp:\t{seccomp}\n",
         p.name.lock().as_str(),
-        p.umask.load(Ordering::Relaxed),
+        p.fs().umask.load(Ordering::Relaxed),
         p.ppid.load(Ordering::Relaxed),
         p.thread_count().max(1),
         pid = p.pid,
@@ -626,9 +630,7 @@ fn pid_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
             ),
             (
                 "cwd".into(),
-                link(ino_of(pid, 7), move || Ok(path_of(
-                    &process(pid)?.cwd.lock().clone()
-                )))
+                link(ino_of(pid, 7), move || Ok(path_of(&process(pid)?.cwd())))
             ),
             ("fd".into(), fd_dir(pid, me)),
             ("task".into(), task_dir(pid, me)),
@@ -646,6 +648,7 @@ fn pid_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
                 setgroups_file(pid, ino_of(pid, 0x22), me)
             ),
             ("ns".into(), ns_dir(pid, me)),
+            ("fdinfo".into(), fdinfo_dir(pid, me)),
         ]
     })
 }
@@ -712,6 +715,76 @@ fn thread_dir(pid: u32, tid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
                     .unwrap_or_default())
             ),
         ]
+    })
+}
+
+/// `/proc/<pid>/fdinfo`: a file per descriptor. Once the process is
+/// gone, every lookup in it fails with ESRCH (Chromium chroots its
+/// sandbox into a dead process's fdinfo for an empty root).
+struct FdInfoDir {
+    pid: u32,
+    parent: Weak<dyn Inode>,
+    me: Weak<FdInfoDir>,
+}
+
+impl FdInfoDir {
+    fn listing(&self) -> KResult<Entries> {
+        let p = process(self.pid)?;
+        if p.exit_status().is_some() {
+            return Err(Errno::ESRCH);
+        }
+        let me: Arc<dyn Inode> = self.me.upgrade().ok_or(Errno::ESRCH)?;
+        let fds = p.files.lock().list();
+        Ok(fds
+            .into_iter()
+            .map(|(fd, f)| {
+                let flags = *f.flags.lock();
+                let pos = *f.offset.lock();
+                let text = format!("pos:\t{pos}\nflags:\t0{flags:o}\nmnt_id:\t0\n");
+                (
+                    fd.to_string(),
+                    file(ino_of(self.pid, 0x8000 + fd as u64), &me, move || {
+                        text.clone()
+                    }),
+                )
+            })
+            .collect())
+    }
+}
+
+impl Inode for FdInfoDir {
+    fn file_type(&self) -> FileType {
+        FileType::Directory
+    }
+    fn ino(&self) -> u64 {
+        ino_of(self.pid, 0x28)
+    }
+    fn dev(&self) -> u64 {
+        super::DEV_PROC
+    }
+    fn perm(&self) -> u32 {
+        0o500
+    }
+    fn parent(&self) -> Option<Arc<dyn Inode>> {
+        self.parent.upgrade()
+    }
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
+        self.listing()?
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, i)| i)
+            .ok_or(Errno::ENOENT)
+    }
+    fn entries(&self) -> KResult<Vec<(String, Arc<dyn Inode>)>> {
+        self.listing()
+    }
+}
+
+fn fdinfo_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
+    Arc::new_cyclic(|me| FdInfoDir {
+        pid,
+        parent: Arc::downgrade(parent),
+        me: me.clone(),
     })
 }
 

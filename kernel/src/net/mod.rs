@@ -9,6 +9,7 @@ pub mod dhcp;
 pub mod iface;
 pub mod inet;
 pub mod ip;
+pub mod isolated;
 pub mod netlink;
 pub mod socket;
 pub mod tcp;

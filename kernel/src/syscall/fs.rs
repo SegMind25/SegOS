@@ -211,7 +211,7 @@ pub fn lseek(ctx: &Ctx, fd: i32, off: i64, whence: u32) -> KResult<u64> {
 }
 
 fn cwd(ctx: &Ctx) -> Arc<dyn Inode> {
-    ctx.process().cwd.lock().clone()
+    ctx.process().cwd()
 }
 
 /// The directory a `*at` call's relative path starts from.
@@ -262,7 +262,7 @@ fn resolve_parent(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<(Arc<dyn Inode>,
 }
 
 fn umask(ctx: &Ctx) -> u32 {
-    ctx.process().umask.load(Ordering::Relaxed)
+    ctx.process().fs().umask.load(Ordering::Relaxed)
 }
 
 pub fn openat(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, mode: u32) -> KResult<u64> {
@@ -371,6 +371,18 @@ fn stat_of(ctx: &Ctx, inode: &Arc<dyn Inode>) -> crate::abi::Stat {
     st.st_uid = ns.view(Ids::Uid, st.st_uid);
     st.st_gid = ns.view(Ids::Gid, st.st_gid);
     st
+}
+
+/// `chroot(path)`: the directory becomes the caller's "/" (shared with
+/// the processes it shares its filesystem state with).
+pub fn chroot(ctx: &Ctx, path: u64) -> KResult<u64> {
+    let p = path_arg(ctx, path)?;
+    let dir = resolve(ctx, AT_FDCWD, &p, true)?;
+    if dir.file_type() != FileType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+    *ctx.process().fs().root.lock() = Some(dir);
+    Ok(0)
 }
 
 pub fn fstat(ctx: &Ctx, fd: i32, buf: u64) -> KResult<u64> {
@@ -670,7 +682,7 @@ fn set_cwd(ctx: &Ctx, inode: Arc<dyn Inode>) -> KResult<u64> {
     if inode.file_type() != FileType::Directory {
         return Err(Errno::ENOTDIR);
     }
-    *ctx.process().cwd.lock() = inode;
+    *ctx.process().fs().cwd.lock() = inode;
     Ok(0)
 }
 

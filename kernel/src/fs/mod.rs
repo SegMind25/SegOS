@@ -285,10 +285,23 @@ pub trait Inode: Send + Sync {
 
 static ROOT: Once<Arc<dyn Inode>> = Once::new();
 
-/// The root directory. Created (empty, with `/dev` and `/proc`) on first
-/// use.
+/// The root directory: the calling process's (`chroot`), or the
+/// system's, created (empty, with `/dev` and `/proc`) on first use.
 pub fn root() -> Arc<dyn Inode> {
+    if let Some(r) =
+        crate::task::try_current().and_then(|t| t.user().and_then(|u| u.process.root()))
+    {
+        return r;
+    }
+    system_root()
+}
+
+fn system_root() -> Arc<dyn Inode> {
     mount::cross_down(base_root())
+}
+
+fn same(a: &Arc<dyn Inode>, b: &Arc<dyn Inode>) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino()
 }
 
 /// The kernel's `/dev` directory (for devtmpfs mounts).
@@ -386,12 +399,18 @@ pub fn resolve(
         match part.as_str() {
             "." => continue,
             ".." => {
+                // "/.." is "/" (the process's own, after chroot).
+                let me = root();
+                if same(&cur, &me) {
+                    canon.pop();
+                    continue;
+                }
                 let up = mount::cross_up(cur.clone());
-                // "/.." is "/": the file system mounted there, not what
-                // that mount covers.
+                // At the system's "/": the file system mounted there, not
+                // what that mount covers.
                 let top = base_root();
-                cur = if up.dev() == top.dev() && up.ino() == top.ino() {
-                    root()
+                cur = if same(&up, &top) {
+                    system_root()
                 } else {
                     up.parent().unwrap_or(up)
                 };

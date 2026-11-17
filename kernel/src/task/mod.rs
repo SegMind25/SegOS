@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use wait::WaitQueue;
 
 #[allow(unused_imports)]
-pub use sched::{current, exit, schedule as yield_now, spawn};
+pub use sched::{current, exit, schedule as yield_now, spawn, try_current};
 pub use wait::kick;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
