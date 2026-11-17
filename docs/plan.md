@@ -400,7 +400,7 @@ The demo: Firefox and Chromium run on the Wayland desktop.
    over shared memory; atomic KMS.
 2. **What browsers need**: seccomp-BPF, `inotify`, user and PID
    namespaces, `/dev/shm`, fontconfig and a D-Bus session bus (all done,
-   below); mount and network namespaces.
+   below), network namespaces, `chroot` and CLONE_FS; mount namespaces.
 
    *Done so far.* Firefox renders a page headless (a screenshot), and
    the shell session has a step that runs it on weston (it runs where
@@ -417,11 +417,17 @@ The demo: Firefox and Chromium run on the Wayland desktop.
    kill/tkill/tgkill, process groups and sessions, SIGCHLD and the
    `set_tid_address`/`CLONE_*SETTID` values are translated.
    `userland/tests/namespaces.c` prints the same on Linux, as root or
-   not, and on SegOS. Not yet: mount, UTS, IPC, network and cgroup
+   not, and on SegOS. Not yet: mount, UTS, IPC and cgroup
    namespaces (EINVAL), `setns`, `/proc` mounted per PID namespace,
    capabilities (everything is root). **`/dev/shm`**, **fontconfig**
    and **D-Bus**: the shell session creates POSIX shared memory from
    Python, `fc-match` finds DejaVu Sans, and `dbus-run-session` starts
-   Ubuntu's `dbus-daemon`, which answers `dbus-send`.
+   Ubuntu's `dbus-daemon`, which answers `dbus-send`. **Network
+   namespaces** (CLONE_NEWNET): AF_INET there reaches nothing
+   (ENETUNREACH), abstract AF_UNIX names are the namespace's own.
+   **`chroot`** and **CLONE_FS** (root, working directory and umask
+   shared), and `/proc/<pid>/fdinfo`, whose lookups fail with ESRCH once
+   the process is gone: Chromium's way to chroot its sandbox into an
+   empty directory, which `tests/namespaces` repeats.
 3. **Sound**: virtio-snd or Intel HDA behind an ALSA interface.
 4. **USB**: xHCI with HID keyboards and mice, for real PCs.
