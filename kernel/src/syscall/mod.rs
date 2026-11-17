@@ -16,6 +16,7 @@ use crate::abi::{AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, Errno, KResult};
 use crate::hal::idt::TrapFrame;
 use crate::hal::x86;
 use crate::mm::vm::AddressSpace;
+use crate::proc::ns::Ids;
 use crate::proc::{Process, UserThread};
 use crate::task::Task;
 use alloc::sync::Arc;
@@ -218,7 +219,7 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         36 => info::getitimer(ctx, a[0] as u32, a[1]),
         37 => info::alarm(ctx, a[0]),
         38 => info::setitimer(ctx, a[0] as u32, a[1], a[2]),
-        39 => Ok(ctx.process().pid as u64),
+        39 => Ok(ctx.process().ns_pid as u64),
         40 => fs::sendfile(ctx, fd, a[1] as i32, a[2], a[3]),
         56 => process::clone(ctx, frame, a[0], a[1], a[2], a[3], a[4]),
         57 => process::clone(ctx, frame, crate::proc::signo::SIGCHLD as u64, 0, 0, 0, 0),
@@ -251,7 +252,10 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         89 => fs::readlinkat(ctx, AT_FDCWD, a[0], a[1], a[2]),
         90 => fs::fchmodat(ctx, AT_FDCWD, a[0], a[1] as u32),
         91 => fs::fchmod(ctx, fd, a[1] as u32),
-        92 | 93 | 94 | 260 => Ok(0), // chown family: everything is root's
+        // chown, fchown, lchown, fchownat: everything is root's; the ids
+        // must be mapped in the caller's user namespace.
+        92..=94 => info::check_owner(ctx, a[1], a[2]),
+        260 => info::check_owner(ctx, a[2], a[3]),
         95 => Ok(ctx
             .process()
             .umask
@@ -261,16 +265,25 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         98 => info::getrusage(ctx, a[1]),
         99 => info::sysinfo(ctx, a[0]),
         100 => info::times(ctx, a[0]),
-        102 | 104 | 107 | 108 => Ok(0), // getuid, getgid, geteuid, getegid: root
+        // getuid, geteuid, getgid, getegid: root, as the caller's user
+        // namespace sees it.
+        102 | 107 => Ok(ctx.process().user_ns.lock().view(Ids::Uid, 0) as u64),
+        104 | 108 => Ok(ctx.process().user_ns.lock().view(Ids::Gid, 0) as u64),
         // setuid, setgid, setreuid, setregid, setresuid, setresgid,
-        // setfsuid, setfsgid, setgroups: everything runs as root.
-        105 | 106 | 113 | 114 | 116 | 117 | 119 | 122 | 123 => Ok(0),
+        // setfsuid, setfsgid, setgroups: everything runs as root; an id
+        // must be mapped in the caller's user namespace.
+        105 | 106 | 113 | 114 | 117 | 119 | 122 | 123 => info::set_ids(ctx, nr, a),
+        116 => info::setgroups(ctx, a[0], a[1]),
         109 => process::setpgid(ctx, a[0] as u32, a[1] as u32),
-        110 => Ok(ctx.process().ppid.load(Ordering::Relaxed) as u64),
-        111 => Ok(ctx.process().pgid() as u64),
+        110 => {
+            let p = ctx.process();
+            Ok(p.pid_ns.nr(p.ppid.load(Ordering::Relaxed)) as u64)
+        }
+        111 => Ok(ctx.process().pid_ns.nr(ctx.process().pgid()) as u64),
         112 => process::setsid(ctx),
         115 => info::getgroups(ctx, a[0], a[1]),
-        118 | 120 => info::getres_ids(ctx, a),
+        118 => info::getres_ids(ctx, a, Ids::Uid),
+        120 => info::getres_ids(ctx, a, Ids::Gid),
         121 => process::getpgid(ctx, a[0] as u32),
         124 => process::getsid(ctx, a[0] as u32),
         127 => process::rt_sigpending(ctx, a[0], a[1]),
@@ -317,7 +330,7 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
             Ok(0)
         }
         169 => info::reboot(a[0] as u32, a[1] as u32, a[2] as u32),
-        186 => Ok(ctx.thread().tid as u64),
+        186 => Ok(ctx.thread().ns_tid as u64),
         201 => info::time(ctx, a[0]),
         202 => process::futex(ctx, a),
         204 => info::sched_getaffinity(ctx, a[1], a[2]),
@@ -337,7 +350,7 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         217 => fs::getdents64(ctx, fd, a[1], a[2]),
         218 => {
             ctx.thread().clear_child_tid.store(a[0], Ordering::Relaxed);
-            Ok(ctx.thread().tid as u64)
+            Ok(ctx.thread().ns_tid as u64)
         }
         228 => info::clock_gettime(ctx, a[0] as u32, a[1]),
         229 => info::clock_getres(ctx, a[0] as u32, a[1]),
@@ -356,6 +369,7 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         436 => fs::close_range(ctx, a[0] as u32, a[1] as u32, a[2] as u32),
         270 => fs::select(ctx, a[0] as i32, [a[1], a[2], a[3]], a[4], Some(a[5])),
         271 => fs::ppoll(ctx, a[0], a[1], a[2], a[3]),
+        272 => process::unshare(ctx, a[0]),
         273 => process::set_robust_list(ctx, a[0], a[1]),
         274 => process::get_robust_list(ctx, a[0] as u32, a[1], a[2]),
         // Event descriptors.

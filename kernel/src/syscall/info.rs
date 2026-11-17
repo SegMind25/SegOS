@@ -189,7 +189,7 @@ pub fn getrlimit(ctx: &Ctx, resource: u32, out: u64) -> KResult<u64> {
 }
 
 pub fn prlimit64(ctx: &Ctx, pid: u32, resource: u32, _new: u64, old: u64) -> KResult<u64> {
-    if pid != 0 && crate::proc::lookup(pid).is_none() {
+    if pid != 0 && crate::proc::lookup_in(ctx.process(), pid).is_none() {
         return Err(Errno::ESRCH);
     }
     let l = rlimit(resource)?;
@@ -208,9 +208,69 @@ pub fn getrusage(ctx: &Ctx, out: u64) -> KResult<u64> {
 }
 
 /// getresuid / getresgid: everything runs as root.
-pub fn getres_ids(ctx: &Ctx, a: [u64; 6]) -> KResult<u64> {
+/// The setuid family (`nr` says which): accepted when every id given
+/// (-1: unchanged) is mapped in the caller's user namespace. `setfsuid`
+/// and `setfsgid` return the old id and never fail.
+pub fn set_ids(ctx: &Ctx, nr: u64, a: [u64; 6]) -> KResult<u64> {
+    use crate::proc::ns::Ids;
+    let ns = ctx.process().user_ns.lock().clone();
+    let (which, n) = match nr {
+        105 => (Ids::Uid, 1),
+        106 => (Ids::Gid, 1),
+        113 => (Ids::Uid, 2),
+        114 => (Ids::Gid, 2),
+        117 => (Ids::Uid, 3),
+        119 => (Ids::Gid, 3),
+        122 => return Ok(ns.view(Ids::Uid, 0) as u64),
+        _ => return Ok(ns.view(Ids::Gid, 0) as u64),
+    };
+    for &id in &a[..n] {
+        let id = id as u32;
+        if (n == 1 || id != u32::MAX) && ns.to_kernel(which, id).is_none() {
+            return Err(Errno::EINVAL);
+        }
+    }
+    Ok(0)
+}
+
+/// `setgroups(size, list)`: refused in a user namespace whose gid map
+/// is not written or whose `setgroups` file says "deny".
+pub fn setgroups(ctx: &Ctx, size: u64, list: u64) -> KResult<u64> {
+    use crate::proc::ns::Ids;
+    let ns = ctx.process().user_ns.lock().clone();
+    if !ns.may_setgroups() {
+        return Err(Errno::EPERM);
+    }
+    if size > 65536 {
+        return Err(Errno::EINVAL);
+    }
+    for i in 0..size {
+        let gid: u32 = ctx.mm().read(list + i * 4)?;
+        if ns.to_kernel(Ids::Gid, gid).is_none() {
+            return Err(Errno::EINVAL);
+        }
+    }
+    Ok(0)
+}
+
+/// The chown family: nothing changes owner (everything is root's), but
+/// ids (-1: unchanged) must be mapped in the caller's user namespace.
+pub fn check_owner(ctx: &Ctx, uid: u64, gid: u64) -> KResult<u64> {
+    use crate::proc::ns::Ids;
+    let ns = ctx.process().user_ns.lock().clone();
+    for (which, id) in [(Ids::Uid, uid as u32), (Ids::Gid, gid as u32)] {
+        if id != u32::MAX && ns.to_kernel(which, id).is_none() {
+            return Err(Errno::EINVAL);
+        }
+    }
+    Ok(0)
+}
+
+/// `getresuid`, `getresgid`: root, as the caller's user namespace sees it.
+pub fn getres_ids(ctx: &Ctx, a: [u64; 6], which: crate::proc::ns::Ids) -> KResult<u64> {
+    let id = ctx.process().user_ns.lock().view(which, 0);
     for &p in &a[..3] {
-        ctx.mm().write(p, &0u32)?;
+        ctx.mm().write(p, &id)?;
     }
     Ok(0)
 }
@@ -457,8 +517,7 @@ fn sched_target(ctx: &Ctx, tid: u32) -> KResult<alloc::sync::Arc<crate::task::Ta
     if tid == 0 {
         return Ok(crate::task::current());
     }
-    let _ = ctx;
-    crate::proc::find_thread(tid).ok_or(Errno::ESRCH)
+    crate::proc::find_thread_in(ctx.process(), tid).ok_or(Errno::ESRCH)
 }
 
 fn sched_state(t: &crate::task::Task) -> (u32, u32) {

@@ -5,7 +5,7 @@ segboot, finds its disks (virtio, NVMe, SATA; interrupt-driven), mounts a
 read-write ext4 root from disk, and runs **unmodified, dynamically linked
 Linux programs**: Ubuntu's bash, GNU coreutils, Python 3.13 (threads
 included) and gcc, which compiles a C program on SegOS that then runs.
-Threads, futexes, epoll, eventfd, timerfd and signalfd are in. Six
+Threads, futexes, epoll, eventfd, timerfd and signalfd are in. Ten
 conformance tests print byte for byte what they print on Linux; 26 kernel
 tests pass in QEMU on 4 CPUs (debug and release); CI types commands into
 the shell, bash, python3 and gcc over the serial port. No third-party
@@ -398,7 +398,27 @@ The demo: Firefox and Chromium run on the Wayland desktop.
 
 1. **GPU**: virtio-gpu with 3D (virgl) or a Mesa software path (llvmpipe)
    over shared memory; atomic KMS.
-2. **What browsers need**: seccomp-BPF, user and PID namespaces (the
-   Chromium sandbox), `inotify`, `/dev/shm`, fontconfig, D-Bus.
+2. **What browsers need**: seccomp-BPF (done), `inotify` (done), user
+   and PID namespaces (done, below), mount and network namespaces,
+   `/dev/shm`, fontconfig, D-Bus.
+
+   *Done so far.* Firefox renders a page headless (a screenshot), and
+   the shell session has a step that runs it on weston (it runs where
+   Firefox can be downloaded). **User and PID namespaces**
+   (`proc/ns.rs`): `clone` and `unshare` with CLONE_NEWUSER and
+   CLONE_NEWPID; `/proc/<pid>/uid_map`, `gid_map` and `setgroups`, with
+   Linux's rules for who may write what, from inside or from the parent;
+   ids, file owners, `chown` and the setuid family as the namespace sees
+   them (65534 when unmapped); `/proc/<pid>/ns/{user,pid,pid_for_children}`.
+   A PID namespace numbers its processes and threads from 1; its init
+   reaps its orphans, ignores default-action signals (but SIGKILL and
+   SIGSTOP from above), and takes the namespace with it when it exits
+   (then `fork` there is ENOMEM). getpid, getppid, gettid, wait,
+   kill/tkill/tgkill, process groups and sessions, SIGCHLD and the
+   `set_tid_address`/`CLONE_*SETTID` values are translated.
+   `userland/tests/namespaces.c` prints the same on Linux, as root or
+   not, and on SegOS. Not yet: mount, UTS, IPC, network and cgroup
+   namespaces (EINVAL), `setns`, `/proc` mounted per PID namespace,
+   capabilities (everything is root).
 3. **Sound**: virtio-snd or Intel HDA behind an ALSA interface.
 4. **USB**: xHCI with HID keyboards and mice, for real PCs.

@@ -7,6 +7,7 @@
 
 use super::{FileType, Inode, path_of};
 use crate::abi::{Errno, KResult};
+use crate::proc::ns::{Ids, UserNs};
 use crate::proc::{self, Process, RunState};
 use alloc::boxed::Box;
 use alloc::format;
@@ -62,6 +63,117 @@ impl Inode for GenFile {
     fn truncate(&self, _len: u64) -> KResult<()> {
         Err(Errno::EACCES)
     }
+}
+
+type Writer = Box<dyn Fn(u64, &[u8]) -> KResult<usize> + Send + Sync>;
+
+/// A file whose contents `gen` produces and whose writes `write` takes
+/// (`uid_map`, `gid_map`, `setgroups`).
+struct RwFile {
+    ino: u64,
+    generate: Gen,
+    write: Writer,
+    parent: Weak<dyn Inode>,
+}
+
+impl Inode for RwFile {
+    fn file_type(&self) -> FileType {
+        FileType::Regular
+    }
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn dev(&self) -> u64 {
+        super::DEV_PROC
+    }
+    fn perm(&self) -> u32 {
+        0o644
+    }
+    fn parent(&self) -> Option<Arc<dyn Inode>> {
+        self.parent.upgrade()
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> KResult<usize> {
+        let data = (self.generate)();
+        let off = (off as usize).min(data.len());
+        let n = buf.len().min(data.len() - off);
+        buf[..n].copy_from_slice(&data[off..off + n]);
+        Ok(n)
+    }
+    fn write_at(&self, off: u64, data: &[u8]) -> KResult<usize> {
+        (self.write)(off, data)
+    }
+    fn truncate(&self, _len: u64) -> KResult<()> {
+        Ok(())
+    }
+}
+
+/// The user namespace of the process making the call.
+fn caller_user_ns() -> KResult<Arc<UserNs>> {
+    crate::task::current()
+        .user()
+        .map(|u| u.process.user_ns.lock().clone())
+        .ok_or(Errno::EPERM)
+}
+
+/// `/proc/<pid>/uid_map` or `gid_map`.
+fn id_map(pid: u32, which: Ids, ino: u64, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
+    Arc::new(RwFile {
+        ino,
+        generate: Box::new(move || {
+            let (Ok(p), Ok(reader)) = (process(pid), caller_user_ns()) else {
+                return Vec::new();
+            };
+            let ns = p.user_ns.lock().clone();
+            ns.show_map(which, &reader).into_bytes()
+        }),
+        write: Box::new(move |off, data| {
+            let ns = process(pid)?.user_ns.lock().clone();
+            ns.write_map(which, off, data, &caller_user_ns()?)
+        }),
+        parent: Arc::downgrade(parent),
+    })
+}
+
+/// `/proc/<pid>/setgroups`.
+fn setgroups_file(pid: u32, ino: u64, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
+    Arc::new(RwFile {
+        ino,
+        generate: Box::new(move || {
+            process(pid)
+                .map(|p| p.user_ns.lock().show_setgroups().into_bytes())
+                .unwrap_or_default()
+        }),
+        write: Box::new(move |off, data| {
+            let ns = process(pid)?.user_ns.lock().clone();
+            ns.write_setgroups(off, data, &caller_user_ns()?)
+        }),
+        parent: Arc::downgrade(parent),
+    })
+}
+
+/// `/proc/<pid>/ns`: links naming the process's namespaces.
+fn ns_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
+    GenDir::create(ino_of(pid, 0x23), Arc::downgrade(parent), move |_| {
+        let entry = |name: &str, item: u64, f: fn(&Process) -> KResult<String>| {
+            let l = link(ino_of(pid, item), move || f(&*process(pid)?));
+            (String::from(name), l)
+        };
+        alloc::vec![
+            entry("pid", 0x24, |p| Ok(format!("pid:[{}]", p.pid_ns.ino))),
+            // Unreadable until the namespace's init exists.
+            entry("pid_for_children", 0x25, |p| {
+                let ns = p.child_pid_ns.lock().clone();
+                if ns.reaper() == 0 {
+                    return Err(Errno::ENOENT);
+                }
+                Ok(format!("pid:[{}]", ns.ino))
+            }),
+            entry("user", 0x26, |p| Ok(format!(
+                "user:[{}]",
+                p.user_ns.lock().ino
+            ))),
+        ]
+    })
 }
 
 /// A symbolic link whose target `target` computes.
@@ -521,6 +633,19 @@ fn pid_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
             ("fd".into(), fd_dir(pid, me)),
             ("task".into(), task_dir(pid, me)),
             ("maps".into(), file(ino_of(pid, 0x10), me, with(pid_maps))),
+            (
+                "uid_map".into(),
+                id_map(pid, Ids::Uid, ino_of(pid, 0x20), me)
+            ),
+            (
+                "gid_map".into(),
+                id_map(pid, Ids::Gid, ino_of(pid, 0x21), me)
+            ),
+            (
+                "setgroups".into(),
+                setgroups_file(pid, ino_of(pid, 0x22), me)
+            ),
+            ("ns".into(), ns_dir(pid, me)),
         ]
     })
 }

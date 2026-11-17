@@ -111,6 +111,17 @@ fn ignored(sig: i32, act: &SigAction) -> bool {
 }
 
 /// What `siginfo_t` says about a signal (128 bytes in user memory).
+/// Whether `p` is the init of a PID namespace below the initial one.
+pub fn is_ns_init(p: &Process) -> bool {
+    p.pid_ns.level > 0 && p.pid_ns.reaper() == p.pid
+}
+
+/// `p`'s pid as its parent's PID namespace numbers it.
+fn seen_by_parent(p: &Process) -> u32 {
+    super::lookup(p.ppid.load(core::sync::atomic::Ordering::Relaxed))
+        .map_or(p.pid, |q| q.pid_ns.nr(p.pid))
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct SigInfo {
     /// si_errno (SIGSYS from seccomp: the filter's data).
@@ -176,7 +187,7 @@ impl SigInfo {
         Self {
             errno: 0,
             code,
-            a: p.pid as u64,
+            a: seen_by_parent(p) as u64,
             b: value as u64,
         }
     }
@@ -185,7 +196,7 @@ impl SigInfo {
         Self {
             errno: 0,
             code: Self::CLD_STOPPED,
-            a: p.pid as u64,
+            a: seen_by_parent(p) as u64,
             b: sig as u64,
         }
     }
@@ -641,6 +652,10 @@ pub fn on_return_to_user(frame: &mut TrapFrame, syscall: Option<u64>) {
                 } else if sig == SIGSTOP {
                     Action::Stop(u.process.clone(), sig)
                 } else if act.handler == SIG_IGN {
+                    Action::Again
+                } else if act.handler == SIG_DFL && is_ns_init(&u.process) {
+                    // The init of a PID namespace takes only signals it
+                    // handles (SIGKILL and SIGSTOP came from above).
                     Action::Again
                 } else if act.handler == SIG_DFL {
                     match default_action(sig) {

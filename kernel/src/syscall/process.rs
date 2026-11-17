@@ -123,29 +123,32 @@ pub fn kill(ctx: &Ctx, a: [u64; 6], nr: u64) -> KResult<u64> {
         if tid <= 0 || tgid.is_some_and(|g| g <= 0) || !(0..=signal::NSIG as i32).contains(&sig) {
             return Err(Errno::EINVAL);
         }
-        let t = proc::find_thread(tid as u32).ok_or(Errno::ESRCH)?;
+        let t = proc::find_thread_in(me, tid as u32).ok_or(Errno::ESRCH)?;
+        let target = t.user().ok_or(Errno::ESRCH)?.process.clone();
         if let Some(g) = tgid
-            && t.user().is_none_or(|u| u.process.pid != g as u32)
+            && me.pid_ns.kid(g as u32) != Some(target.pid)
         {
             return Err(Errno::ESRCH);
         }
-        if sig != 0 {
-            signal::send_thread(&t, sig, SigInfo::tkill(me.pid));
+        if sig != 0 && !ns_init_ignores(&target, me, sig) {
+            let info = SigInfo::tkill(target.pid_ns.nr(me.pid));
+            signal::send_thread(&t, sig, info);
         }
         return Ok(0);
     }
-    let (target, sig, info) = (a[0] as i32, a[1] as i32, SigInfo::user(me.pid));
+    let (target, sig) = (a[0] as i32, a[1] as i32);
+    let info = SigInfo::user(me.ns_pid);
     if !(0..=signal::NSIG as i32).contains(&sig) {
         return Err(Errno::EINVAL);
     }
     let send = |p: &Arc<proc::Process>| {
-        if sig != 0 {
-            signal::send(p, sig, info);
+        if sig != 0 && !ns_init_ignores(p, me, sig) {
+            signal::send(p, sig, SigInfo::user(p.pid_ns.nr(me.pid)));
         }
     };
     match target {
         t if t > 0 => {
-            let p = proc::lookup(t as u32).ok_or(Errno::ESRCH)?;
+            let p = proc::lookup_in(me, t as u32).ok_or(Errno::ESRCH)?;
             send(&p);
         }
         0 => {
@@ -154,14 +157,17 @@ pub fn kill(ctx: &Ctx, a: [u64; 6], nr: u64) -> KResult<u64> {
             }
         }
         -1 => {
-            let all: alloc::vec::Vec<_> = proc::all().into_iter().filter(|p| p.pid != 1).collect();
+            let all: alloc::vec::Vec<_> = proc::all()
+                .into_iter()
+                .filter(|p| me.pid_ns.nr(p.pid) > 1)
+                .collect();
             if all.is_empty() {
                 return Err(Errno::ESRCH);
             }
             all.iter().for_each(send);
         }
         t => {
-            let pg = t.unsigned_abs();
+            let pg = me.pid_ns.kid(t.unsigned_abs()).ok_or(Errno::ESRCH)?;
             if sig == 0 {
                 if !proc::all().iter().any(|p| p.pgid() == pg) {
                     return Err(Errno::ESRCH);
@@ -271,27 +277,105 @@ pub fn sigaltstack(ctx: &Ctx, frame: &TrapFrame, new: u64, old: u64) -> KResult<
     Ok(0)
 }
 
+/// `unshare(flags)`: a new user namespace for the caller, or a new PID
+/// namespace for its children; CLONE_FILES, CLONE_FS and CLONE_SYSVSEM
+/// change nothing (nothing is shared between processes); CLONE_THREAD,
+/// CLONE_SIGHAND and CLONE_VM only for a single-threaded caller.
+pub fn unshare(ctx: &Ctx, flags: u64) -> KResult<u64> {
+    use proc::clone_flags::*;
+    use proc::ns::{PidNs, UserNs};
+    let known = CLONE_NEWUSER
+        | CLONE_NEWPID
+        | CLONE_FILES
+        | CLONE_FS
+        | CLONE_SYSVSEM
+        | CLONE_THREAD
+        | CLONE_SIGHAND
+        | CLONE_VM;
+    if flags & !known != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let p = ctx.process();
+    let mut flags = flags;
+    if flags & CLONE_NEWUSER != 0 {
+        flags |= CLONE_THREAD | CLONE_FS;
+    }
+    if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && p.thread_count() > 1 {
+        return Err(Errno::EINVAL);
+    }
+    let user = if flags & CLONE_NEWUSER != 0 {
+        Some(UserNs::new(&p.user_ns.lock())?)
+    } else {
+        None
+    };
+    let pid = if flags & CLONE_NEWPID != 0 {
+        // Once only: until then children go to the caller's own namespace.
+        let base = p.child_pid_ns.lock().clone();
+        if !Arc::ptr_eq(&base, &p.pid_ns) {
+            return Err(Errno::EINVAL);
+        }
+        Some(PidNs::new(&base)?)
+    } else {
+        None
+    };
+    if let Some(u) = user {
+        *p.user_ns.lock() = u;
+    }
+    if let Some(n) = pid {
+        *p.child_pid_ns.lock() = n;
+    }
+    Ok(0)
+}
+
+/// Signals with the default action do not reach the init of a PID
+/// namespace, except SIGKILL and SIGSTOP from a namespace above it.
+fn ns_init_ignores(target: &proc::Process, sender: &proc::Process, sig: i32) -> bool {
+    let ns = &target.pid_ns;
+    if !signal::is_ns_init(target) {
+        return false;
+    }
+    if target.sigactions.lock()[sig as usize - 1].handler != signal::SIG_DFL {
+        return false;
+    }
+    let from_above = !Arc::ptr_eq(&sender.pid_ns, ns) && sender.pid_ns.contains(ns);
+    !(from_above && (sig == signo::SIGKILL || sig == signo::SIGSTOP))
+}
+
 pub fn setpgid(ctx: &Ctx, pid: u32, pgid: u32) -> KResult<u64> {
-    proc::setpgid(ctx.process(), pid, pgid)?;
+    let me = ctx.process();
+    let pid = match pid {
+        0 => 0,
+        n => me.pid_ns.kid(n).ok_or(Errno::ESRCH)?,
+    };
+    let pgid = match pgid {
+        0 => 0,
+        n => me.pid_ns.kid(n).ok_or(Errno::EPERM)?,
+    };
+    proc::setpgid(me, pid, pgid)?;
     Ok(0)
 }
 
 pub fn getpgid(ctx: &Ctx, pid: u32) -> KResult<u64> {
-    if pid == 0 {
-        return Ok(ctx.process().pgid() as u64);
-    }
-    Ok(proc::lookup(pid).ok_or(Errno::ESRCH)?.pgid() as u64)
+    let me = ctx.process();
+    let p = match pid {
+        0 => me.clone(),
+        n => proc::lookup_in(me, n).ok_or(Errno::ESRCH)?,
+    };
+    Ok(me.pid_ns.nr(p.pgid()) as u64)
 }
 
 pub fn setsid(ctx: &Ctx) -> KResult<u64> {
-    proc::setsid(ctx.process()).map(|s| s as u64)
+    let me = ctx.process();
+    proc::setsid(me).map(|s| me.pid_ns.nr(s) as u64)
 }
 
 pub fn getsid(ctx: &Ctx, pid: u32) -> KResult<u64> {
-    if pid == 0 {
-        return Ok(ctx.process().sid() as u64);
-    }
-    Ok(proc::lookup(pid).ok_or(Errno::ESRCH)?.sid() as u64)
+    let me = ctx.process();
+    let p = match pid {
+        0 => me.clone(),
+        n => proc::lookup_in(me, n).ok_or(Errno::ESRCH)?,
+    };
+    Ok(me.pid_ns.nr(p.sid()) as u64)
 }
 
 pub fn arch_prctl(ctx: &Ctx, code: u32, addr: u64) -> KResult<u64> {
@@ -348,7 +432,7 @@ pub fn get_robust_list(ctx: &Ctx, tid: u32, head: u64, len: u64) -> KResult<u64>
     let t = if tid == 0 {
         crate::task::current()
     } else {
-        proc::find_thread(tid).ok_or(Errno::ESRCH)?
+        proc::find_thread_in(ctx.process(), tid).ok_or(Errno::ESRCH)?
     };
     let u = t.user().ok_or(Errno::ESRCH)?;
     ctx.mm()
@@ -488,7 +572,7 @@ pub fn set_filter(ctx: &Ctx, prog: u64, tsync: bool, log: bool, esrch: bool) -> 
                 return if esrch {
                     Err(Errno::ESRCH)
                 } else {
-                    Ok(u.tid as u64)
+                    Ok(u.ns_tid as u64)
                 };
             }
         }

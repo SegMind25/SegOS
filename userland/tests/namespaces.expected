@@ -1,0 +1,68 @@
+# initial namespaces
+ok   read_file("/proc/self/uid_map") > 0 && is_map(0, 0, 4294967295u)
+ok   read_file("/proc/self/gid_map") > 0 && is_map(0, 0, 4294967295u)
+ok   read_file("/proc/self/setgroups") > 0 && strcmp(buf, "allow\n") == 0
+ok   write_file("/proc/self/uid_map", "0 0 1") == -1 && errno == EPERM
+ok   syscall(SYS_clone, CLONE_NEWUSER | CLONE_FS | SIGCHLD, 0, 0, 0, 0) == -1 && errno == EINVAL
+ok   syscall(SYS_clone, CLONE_NEWPID | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM, 0, 0, 0, 0) == -1 && errno == EINVAL
+# user namespace
+ok   unshare(CLONE_NEWUSER) == 0
+ok   strncmp(after, "user:[", 6) == 0 && strcmp(before, after) != 0
+ok   getuid() == 65534 && geteuid() == 65534 && getgid() == 65534
+ok   file_uid() == 65534
+ok   read_file("/proc/self/uid_map") == 0
+ok   read_file("/proc/self/setgroups") > 0 && strcmp(buf, "allow\n") == 0
+ok   write_file("/proc/self/gid_map", line) == -1 && errno == EPERM
+ok   write_file("/proc/self/setgroups", "deny") == 0
+ok   write_file("/proc/self/gid_map", line) == 0
+ok   write_file("/proc/self/setgroups", "allow") == -1 && errno == EPERM
+ok   write_file("/proc/self/uid_map", line) == -1 && errno == EPERM
+ok   write_file("/proc/self/uid_map", "0 0 x") == -1 && errno == EINVAL
+ok   write_file("/proc/self/uid_map", line) == 0
+ok   write_file("/proc/self/uid_map", line) == -1 && errno == EPERM
+ok   getuid() == 0 && geteuid() == 0 && getgid() == 0 && getegid() == 0
+ok   file_uid() == 0
+ok   read_file("/proc/self/uid_map") > 0 && is_map(0, outer_uid, 1)
+ok   read_file("/proc/self/gid_map") > 0 && is_map(0, outer_gid, 1)
+ok   read_file("/proc/self/setgroups") > 0 && strcmp(buf, "deny\n") == 0
+ok   setgroups(0, NULL) == -1 && errno == EPERM
+ok   setuid(0) == 0 && setgid(0) == 0 && setresuid(-1, 0, -1) == 0
+ok   setuid(1) == -1 && errno == EINVAL
+ok   chown(file, 0, 0) == 0
+ok   chown(file, 7, -1) == -1 && errno == EINVAL
+ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
+# mapped from outside
+ok   read(ready[0], &c, 1) == 1
+ok   write_file(path, line) == 0
+ok   read_file(path) > 0 && is_map(5, outer_uid, 1)
+ok   write(go[1], "g", 1) == 1
+ok   waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0
+# threads
+ok   pthread_create(&t, NULL, waiter, NULL) == 0
+ok   unshare(CLONE_NEWUSER) == -1 && errno == EINVAL
+ok   write(thread_go[1], "x", 1) == 1 && pthread_join(t, NULL) == 0
+ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
+# pid namespace
+ok   unshare(CLONE_NEWUSER | CLONE_NEWPID) == 0
+ok   getpid() == me && strcmp(before, after) == 0
+ok   readlink("/proc/self/ns/pid_for_children", kids, sizeof kids) == -1 && errno == ENOENT
+ok   unshare(CLONE_NEWPID) == -1 && errno == EINVAL
+ok   pthread_create(&t, NULL, waiter, NULL) != 0
+ok   strcmp(kids, theirs) == 0 && strcmp(kids, after) != 0
+ok   init > 1 && kill(init, SIGUSR2) == 0
+ok   getpid() == 1 && getppid() == 0 && syscall(SYS_gettid) == 1
+ok   strncmp(link, "pid:[", 5) == 0 && strcmp(link, kids) == 0
+ok   getpgid(0) == 0 && getsid(0) == 0
+ok   setsid() == 1 && getpgid(0) == 1 && getsid(0) == 1
+ok   kill(1, SIGTERM) == 0 && raise(SIGUSR1) == 0
+ok   kill(1, 0) == 0 && kill(-1, 0) == -1 && errno == ESRCH
+ok   c == 2 && waitpid(c, &status, 0) == 2 && WIFEXITED(status) && WEXITSTATUS(status) == 0
+ok   mid == 3 && waitpid(mid, &status, 0) == 3 && WIFEXITED(status)
+ok   write(p[1], "x", 1) == 1
+ok   waitpid(-1, &status, 0) == 4 && WIFEXITED(status) && WEXITSTATUS(status) == 0
+ok   sleeper == 5 && kill(5, 0) == 0
+ok   waitpid(init, &status, 0) == init && WIFEXITED(status) && WEXITSTATUS(status) == 0
+ok   poll(&pfd, 1, 20000) == 1 && read(held[0], &c, 1) == 0
+ok   fork() == -1 && errno == ENOMEM
+ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
+PASSED

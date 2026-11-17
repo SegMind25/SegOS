@@ -363,8 +363,18 @@ pub fn close(ctx: &Ctx, fd: i32) -> KResult<u64> {
     Ok(0)
 }
 
+/// `inode`'s stat, its owner as the caller's user namespace sees it.
+fn stat_of(ctx: &Ctx, inode: &Arc<dyn Inode>) -> crate::abi::Stat {
+    use crate::proc::ns::Ids;
+    let mut st = inode.stat();
+    let ns = ctx.process().user_ns.lock().clone();
+    st.st_uid = ns.view(Ids::Uid, st.st_uid);
+    st.st_gid = ns.view(Ids::Gid, st.st_gid);
+    st
+}
+
 pub fn fstat(ctx: &Ctx, fd: i32, buf: u64) -> KResult<u64> {
-    let st = file(ctx, fd)?.inode.stat();
+    let st = stat_of(ctx, &file(ctx, fd)?.inode);
     ctx.mm().write(buf, &st)?;
     Ok(0)
 }
@@ -383,7 +393,7 @@ pub fn stat_path(ctx: &Ctx, dirfd: i32, path: u64, buf: u64, flags: u32) -> KRes
     } else {
         resolve(ctx, dirfd, &p, flags & AT_SYMLINK_NOFOLLOW == 0)?
     };
-    ctx.mm().write(buf, &inode.stat())?;
+    ctx.mm().write(buf, &stat_of(ctx, &inode))?;
     Ok(0)
 }
 
@@ -405,7 +415,7 @@ pub fn statx(ctx: &Ctx, dirfd: i32, path: u64, flags: u32, buf: u64) -> KResult<
     } else {
         resolve(ctx, dirfd, &p, flags & AT_SYMLINK_NOFOLLOW == 0)?
     };
-    let st = inode.stat();
+    let st = stat_of(ctx, &inode);
     let mut b = [0u8; 256];
     let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
     put(0, &(STATX_BASIC_STATS | STATX_MNT_ID).to_le_bytes());
