@@ -13,7 +13,7 @@ jobs:
       # musl-gcc, exactly as a Linux user would build them. (xtask also
       # fetches Ubuntu's busybox-static with apt-get download.)
       - name: Install QEMU, OVMF and musl
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf musl-tools e2fsprogs openssh-client openssh-server weston xkb-data fonts-dejavu-core libgtk-3-0t64 libasound2t64 libx11-xcb1 adwaita-icon-theme librsvg2-common shared-mime-info gsettings-desktop-schemas xz-utils && sudo mkdir -p /run/sshd
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf musl-tools e2fsprogs openssh-client openssh-server weston xkb-data fonts-dejavu-core libgtk-3-0t64 libasound2t64 libx11-xcb1 adwaita-icon-theme librsvg2-common shared-mime-info gsettings-desktop-schemas xz-utils fontconfig dbus-daemon dbus-bin && sudo mkdir -p /run/sshd
       # tests/namespaces creates user namespaces as the runner's user;
       # Ubuntu 24.04 lets AppArmor refuse that by default.
       - name: Allow unprivileged user namespaces

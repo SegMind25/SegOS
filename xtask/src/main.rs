@@ -654,6 +654,22 @@ fn shell_session(img: &Path) -> Result<(), String> {
             "GCC-42",
         ));
     }
+    // Phase 8: POSIX shared memory in /dev/shm, fontconfig, and a D-Bus
+    // session bus answering a call.
+    if rootfs.join("dbus-daemon").exists() {
+        steps.push((
+            "python3 -c \"from multiprocessing import shared_memory as s; m=s.SharedMemory(create=True,size=4096); m.buf[0]=42; n=s.SharedMemory(m.name); print('SHM-'+str(n.buf[0])); n.close(); m.close(); m.unlink()\"",
+            "SHM-42",
+        ));
+        steps.push((
+            "fc-match -f 'FONT-%{family}-%{fontformat}\\n' sans",
+            "FONT-DejaVu Sans-TrueType",
+        ));
+        steps.push((
+            "dbus-run-session -- dbus-send --session --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.ListNames 2>&1 | grep -c '\"org.freedesktop.DBus\"' | sed 's/^/DBUS-NAMES=/'",
+            "DBUS-NAMES=1",
+        ));
+    }
     // Phase 8: Firefox, headless, renders a page to a PNG; Ubuntu's
     // python3 reads the colours back (see pngcheck.py). Slow without KVM.
     let firefox = root()

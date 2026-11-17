@@ -49,6 +49,8 @@ pub fn populate(dir: &Arc<dyn Inode>) {
     {
         let _ = dri.insert("card0", crate::drm::node());
     }
+    // POSIX shared memory (`shm_open`) and browsers' shared buffers.
+    let _ = dir.create("shm", FileType::Directory, 0o1777);
     if let Ok(input) = dir.create("input", FileType::Directory, 0o755) {
         for (name, node) in crate::input::nodes() {
             let _ = input.insert(&name, node);

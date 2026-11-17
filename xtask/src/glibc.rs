@@ -62,6 +62,11 @@ const PACKAGES: &[&str] = &[
     "shared-mime-info",
     "hicolor-icon-theme",
     "adwaita-icon-theme",
+    // Phase 8: fonts and the session bus browsers expect.
+    "fontconfig",
+    "dbus-daemon",
+    "dbus-bin",
+    "dbus-session-bus-common",
 ];
 
 /// Files no package lists (generated at install time) but programs need.
