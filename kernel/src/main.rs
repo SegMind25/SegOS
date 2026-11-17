@@ -30,6 +30,7 @@ mod mm;
 mod net;
 mod proc;
 mod random;
+mod sound;
 mod sync;
 mod syscall;
 mod task;
@@ -129,6 +130,8 @@ fn kernel_init(boot: &'static BootInfo) {
     drivers::virtio_blk::init();
     drivers::nvme::init();
     drivers::ahci::init();
+    drivers::hda::init();
+    sound::populate(&fs::dev_dir());
     net::init();
     block::start_flusher();
     match fs::disk::mount_root() {

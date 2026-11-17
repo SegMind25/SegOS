@@ -320,6 +320,21 @@ fn qemu(img: &Path) -> Command {
         // No option ROM: the firmware would try to boot from the network.
         .args(["-netdev", "user,id=net0"])
         .args(["-device", "virtio-net-pci,netdev=net0,romfile="]);
+    // An HD Audio card whose output QEMU records (the shell session
+    // checks what `aplay` played).
+    let wav = root().join("target/audio.wav");
+    let _ = std::fs::remove_file(&wav);
+    cmd.arg("-audiodev")
+        .arg(format!(
+            "wav,id=snd0,path={},out.frequency=48000,out.channels=2,out.format=s16",
+            wav.display()
+        ))
+        .args([
+            "-device",
+            "ich9-intel-hda",
+            "-device",
+            "hda-output,audiodev=snd0",
+        ]);
     // A QMP socket, for screendumps of what SegOS shows.
     let qmp = qmp_socket();
     let _ = std::fs::remove_file(&qmp);
@@ -437,6 +452,44 @@ fn parse_ppm(data: &[u8]) -> Result<(usize, usize, &[u8]), String> {
 
 /// A QMP screendump: (width, height) and the colour at each of `at`
 /// (x and y as fractions of the size).
+/// The shell session played one second of a 440 Hz tone: QEMU's
+/// recording must hold it (about 48000 loud frames whose zero crossings
+/// give 440 Hz).
+fn check_tone() -> Result<(), String> {
+    let data = read(&root().join("target/audio.wav"))?;
+    let Some(at) = data.windows(4).position(|w| w == b"data") else {
+        return Err("audio.wav: no data chunk".into());
+    };
+    let samples: Vec<i16> = data[at + 8..]
+        .chunks_exact(4)
+        .map(|f| i16::from_le_bytes([f[0], f[1]]))
+        .collect();
+    let loud: Vec<usize> = (0..samples.len())
+        .filter(|&i| samples[i].unsigned_abs() > 2000)
+        .collect();
+    let (Some(&first), Some(&last)) = (loud.first(), loud.last()) else {
+        return Err(format!(
+            "audio.wav: {} frames, all silent: the tone did not play",
+            samples.len()
+        ));
+    };
+    let tone = &samples[first..=last];
+    let crossings = tone.windows(2).filter(|w| (w[0] < 0) != (w[1] < 0)).count();
+    let secs = tone.len() as f64 / 48000.0;
+    let hz = crossings as f64 / 2.0 / secs;
+    println!(
+        "xtask: sound: QEMU recorded {:.2} s of tone at {hz:.0} Hz ({} frames in all)",
+        secs,
+        samples.len()
+    );
+    if !(0.9..=1.1).contains(&secs) || !(430.0..=450.0).contains(&hz) {
+        return Err(format!(
+            "sound: expected 1 s of 440 Hz, recorded {secs:.2} s at {hz:.0} Hz"
+        ));
+    }
+    Ok(())
+}
+
 fn screen(at: &[(f64, f64)]) -> Result<(usize, usize, Vec<&'static str>), String> {
     let file = root().join("target/screen.ppm");
     screendump(&file)?;
@@ -668,6 +721,15 @@ fn shell_session(img: &Path) -> Result<(), String> {
         steps.push((
             "dbus-run-session -- dbus-send --session --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.ListNames 2>&1 | grep -c '\"org.freedesktop.DBus\"' | sed 's/^/DBUS-NAMES=/'",
             "DBUS-NAMES=1",
+        ));
+    }
+    // Phase 8: sound. A 440 Hz tone, one second, through ALSA's hw
+    // device (libasound, the HD Audio driver); QEMU records it.
+    let played_tone = rootfs.join("aplay").exists();
+    if played_tone {
+        steps.push((
+            "python3 -c \"import wave,struct,math; w=wave.open('/tmp/tone.wav','wb'); w.setnchannels(2); w.setsampwidth(2); w.setframerate(48000); w.writeframes(b''.join(struct.pack('<hh',v,v) for v in (int(12000*math.sin(2*math.pi*440*i/48000)) for i in range(48000)))); w.close()\" && aplay -q -D hw:0,0 /tmp/tone.wav; echo APLAY-$?",
+            "APLAY-0",
         ));
     }
     // Phase 8: Firefox, headless, renders a page to a PNG; Ubuntu's
@@ -938,6 +1000,9 @@ fn shell_session(img: &Path) -> Result<(), String> {
         if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
             if s.success() {
                 println!("xtask: shell session: `poweroff -f` turned the machine off");
+                if played_tone {
+                    return check_tone();
+                }
                 return Ok(());
             }
             return fail(format!("QEMU ended with {s} after poweroff"), &mut child);

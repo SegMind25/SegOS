@@ -26,7 +26,7 @@ errnos! {
     EADDRINUSE = 98, EADDRNOTAVAIL = 99, ENETDOWN = 100, ENETUNREACH = 101,
     ECONNABORTED = 103, ECONNRESET = 104, ENOBUFS = 105, EISCONN = 106, ENOTCONN = 107,
     ECONNREFUSED = 111, EHOSTUNREACH = 113, EALREADY = 114, EINPROGRESS = 115, EOPNOTSUPP = 95,
-    ENODATA = 61, ELIBBAD = 80, EAFNOSUPPORT = 97, ETIMEDOUT = 110,
+    ENODATA = 61, EBADFD = 77, ELIBBAD = 80, EAFNOSUPPORT = 97, ETIMEDOUT = 110,
     // Kernel-internal: never seen by programs. A blocking call interrupted
     // by a signal; turned into a restart or EINTR on the way out.
     ERESTARTSYS = 512,

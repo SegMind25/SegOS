@@ -170,6 +170,11 @@ pub trait Inode: Send + Sync {
     fn ioctl(&self, _req: u32, _arg: u64, _mm: &AddressSpace) -> KResult<u64> {
         Err(Errno::ENOTTY)
     }
+    /// [`Inode::ioctl`] for devices whose ioctls block unless the file is
+    /// O_NONBLOCK (ALSA's PCM transfers).
+    fn ioctl_nb(&self, req: u32, arg: u64, mm: &AddressSpace, _nonblock: bool) -> KResult<u64> {
+        self.ioctl(req, arg, mm)
+    }
     /// Which of POLLIN/POLLOUT/POLLHUP/POLLERR hold now.
     fn poll(&self) -> u16 {
         poll::POLLIN | poll::POLLOUT

@@ -498,7 +498,10 @@ pub fn ioctl(ctx: &Ctx, fd: i32, req: u32, arg: u64) -> KResult<u64> {
             }
             Ok(0)
         }
-        _ => f.inode.ioctl(req, arg, ctx.mm()),
+        _ => {
+            let nonblock = *f.flags.lock() & O_NONBLOCK != 0;
+            f.inode.ioctl_nb(req, arg, ctx.mm(), nonblock)
+        }
     }
 }
 

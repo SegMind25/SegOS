@@ -2,6 +2,7 @@
 //! gets to the rest of the kernel (input to the terminal, for now).
 
 pub mod ahci;
+pub mod hda;
 pub mod msi;
 pub mod nvme;
 pub mod pci;

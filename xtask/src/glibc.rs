@@ -67,6 +67,9 @@ const PACKAGES: &[&str] = &[
     "dbus-daemon",
     "dbus-bin",
     "dbus-session-bus-common",
+    // Phase 8: sound (libasound comes with Firefox's libraries).
+    "alsa-utils",
+    "libasound2-data",
 ];
 
 /// Files no package lists (generated at install time) but programs need.
