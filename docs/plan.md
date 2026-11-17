@@ -429,5 +429,14 @@ The demo: Firefox and Chromium run on the Wayland desktop.
    shared), and `/proc/<pid>/fdinfo`, whose lookups fail with ESRCH once
    the process is gone: Chromium's way to chroot its sandbox into an
    empty directory, which `tests/namespaces` repeats.
-3. **Sound**: virtio-snd or Intel HDA behind an ALSA interface.
+3. **Sound** (done): an Intel HD Audio driver (`drivers/hda.rs`:
+   CORB/RIRB, codecs set up for playback, one output stream with a
+   buffer descriptor list) behind Linux's ALSA interface (`sound.rs`:
+   `/dev/snd/controlC0` and `pcmC0D0p`; hw_params refinement,
+   sw_params, prepare/start/drain/drop, WRITEI_FRAMES, status, SYNC_PTR,
+   poll). Ubuntu's `aplay` plays through libasound unchanged; QEMU
+   records the card's output and `cargo xtask test` measures the 440 Hz
+   tone in it. Not yet: capture, mmap transfers, mixer controls,
+   interrupts (the position is followed by a kernel thread), dmix (no
+   SysV shared memory).
 4. **USB**: xHCI with HID keyboards and mice, for real PCs.

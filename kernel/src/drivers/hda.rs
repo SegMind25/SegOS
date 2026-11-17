@@ -29,6 +29,7 @@ const RIRBUBASE: u64 = 0x54;
 const RIRBWP: u64 = 0x58;
 const RINTCNT: u64 = 0x5a;
 const RIRBCTL: u64 = 0x5c;
+const RIRBSTS: u64 = 0x5d;
 const RIRBSIZE: u64 = 0x5e;
 
 // Stream descriptor registers (from the descriptor's base).
@@ -109,6 +110,9 @@ impl Hda {
     /// Sends a verb to a codec and returns its response.
     fn verb(&mut self, cad: u32, nid: u32, verb: u32) -> Option<u32> {
         let cmd = cad << 28 | nid << 20 | verb;
+        // Acknowledge earlier responses: the controller stops after
+        // RINTCNT of them until RIRBSTS is cleared.
+        self.w8(RIRBSTS, 0x05);
         self.corb_wp = (self.corb_wp + 1) % 256;
         unsafe {
             write_volatile(
@@ -350,7 +354,7 @@ fn init_controller(d: &pci::Device) -> Option<Hda> {
     wait_for(|| unsafe { read_volatile((mmio + CORBRP) as *const u16) } & 1 << 15 == 0);
     h.w16(CORBWP, 0);
     h.w16(RIRBWP, 1 << 15);
-    h.w16(RINTCNT, 1);
+    h.w16(RINTCNT, 0xff);
     h.w8(CORBCTL, 1 << 1);
     h.w8(RIRBCTL, 1 << 1);
     let codecs = h.r16(STATESTS);
