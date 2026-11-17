@@ -220,6 +220,8 @@ pub fn add(tree: &Path, extra: &[String]) -> Result<usize, String> {
         .iter()
         .filter(|f| std::fs::read_link(f).is_ok_and(|t| t.is_absolute()))
         .filter_map(|f| std::fs::canonicalize(f).ok())
+        // Masked systemd units point at /dev/null.
+        .filter(|p| !p.starts_with("/dev"))
         .map(|p| p.display().to_string())
         .collect();
     // ...and the whole package each comes from (python3 may resolve to
