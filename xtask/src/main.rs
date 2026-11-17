@@ -310,7 +310,9 @@ fn root_disk(u: &userland::Userland) -> Result<PathBuf, String> {
 fn qemu(img: &Path) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     let ovmf = std::env::var("OVMF").unwrap_or_else(|_| "/usr/share/ovmf/OVMF.fd".into());
-    cmd.args(["-M", "q35", "-m", "2G", "-smp", "4", "-no-reboot"])
+    // No PS/2 controller (as on most new PCs): keys and the mouse come
+    // through USB.
+    cmd.args(["-M", "q35,i8042=off", "-m", "2G", "-smp", "4", "-no-reboot"])
         .args(["-serial", "stdio"])
         .args(["-bios", &ovmf])
         .arg("-drive")
@@ -531,7 +533,7 @@ fn screen_colours() -> Result<(usize, usize, usize, f64), String> {
     Ok((w, h, counts.len(), top as f64 / (w * h).max(1) as f64))
 }
 
-/// Types `text` on the USB keyboard (QEMU device `ukbd`), key by key.
+/// Types `text` on the keyboard (the machine's only one is USB), key by key.
 fn type_usb(text: &str) -> Result<(), String> {
     for c in text.chars() {
         let (key, shift) = match c {
@@ -546,23 +548,14 @@ fn type_usb(text: &str) -> Result<(), String> {
             '*' => ("8".into(), true),
             _ => return Err(format!("cannot type {c:?}")),
         };
-        let ev = |k: &str, down: bool| {
-            format!(
-                "{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{k}\"}}}}}}"
-            )
+        let q = |k: &str| format!("{{\"type\":\"qcode\",\"data\":\"{k}\"}}");
+        let keys = if shift {
+            format!("{},{}", q("shift"), q(&key))
+        } else {
+            q(&key)
         };
-        let mut events = Vec::new();
-        if shift {
-            events.push(ev("shift", true));
-        }
-        events.push(ev(&key, true));
-        events.push(ev(&key, false));
-        if shift {
-            events.push(ev("shift", false));
-        }
         qmp(&format!(
-            "{{\"execute\":\"input-send-event\",\"arguments\":{{\"device\":\"ukbd\",\"events\":[{}]}}}}",
-            events.join(",")
+            "{{\"execute\":\"send-key\",\"arguments\":{{\"keys\":[{keys}]}}}}"
         ))?;
         std::thread::sleep(Duration::from_millis(60));
     }
@@ -829,7 +822,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
     };
     at = end;
     if let Err(e) = qmp(
-        "{\"execute\":\"input-send-event\",\"arguments\":{\"device\":\"umouse\",\"events\":[{\"type\":\"rel\",\"data\":{\"axis\":\"x\",\"value\":20}}]}}",
+        "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"rel\",\"data\":{\"axis\":\"x\",\"value\":20}}]}}",
     ) {
         return fail(format!("usb: {e}"), &mut child);
     }
