@@ -50,6 +50,7 @@ ok   unshare(CLONE_NEWPID) == -1 && errno == EINVAL
 ok   pthread_create(&t, NULL, waiter, NULL) != 0
 ok   strcmp(kids, theirs) == 0 && strcmp(kids, after) != 0
 ok   init > 1 && kill(init, SIGUSR2) == 0
+ok   write(start[1], "s", 1) == 1
 ok   getpid() == 1 && getppid() == 0 && syscall(SYS_gettid) == 1
 ok   strncmp(link, "pid:[", 5) == 0 && strcmp(link, kids) == 0
 ok   getpgid(0) == 0 && getsid(0) == 0

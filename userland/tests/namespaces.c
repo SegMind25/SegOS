@@ -216,13 +216,16 @@ static void threaded(void)
 
 /* --- PID namespaces -------------------------------------------------- */
 
-/* The init's last child keeps this pipe's write end open. */
-static int held[2];
+/* The init's last child keeps this pipe's write end open; init starts
+ * printing when a byte arrives on `start` (after the parent's lines). */
+static int held[2], start[2];
 
 static void ns_init(void)
 {
 	char link[64], kids[64];
 	int status;
+	if (read(start[0], link, 1) != 1)
+		return;
 	CHECK(getpid() == 1 && getppid() == 0 && syscall(SYS_gettid) == 1);
 	ns_link("pid", link, sizeof link);
 	ns_link("pid_for_children", kids, sizeof kids);
@@ -292,7 +295,7 @@ static void pid_ns(void)
 	CHECK(unshare(CLONE_NEWPID) == -1 && errno == EINVAL);
 	/* Threads must stay in their process's PID namespace. */
 	CHECK(pthread_create(&t, NULL, waiter, NULL) != 0);
-	if (pipe(held))
+	if (pipe(held) || pipe(start))
 		return;
 	fflush(stdout);
 	pid_t init = fork();
@@ -310,6 +313,7 @@ static void pid_ns(void)
 	/* From outside too, default-action signals other than SIGKILL and
 	 * SIGSTOP do not reach it. */
 	CHECK(init > 1 && kill(init, SIGUSR2) == 0);
+	CHECK(write(start[1], "s", 1) == 1);
 	CHECK(waitpid(init, &status, 0) == init && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	/* The rest of the namespace went with its init. */
 	struct pollfd pfd = {held[0], POLLIN, 0};
