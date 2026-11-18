@@ -76,6 +76,10 @@ struct drm_mode_map_dumb {
 	uint64_t offset;
 };
 
+struct drm_mode_destroy_dumb {
+	uint32_t handle;
+};
+
 struct drm_mode_fb_cmd2 {
 	uint32_t fb_id, width, height, pixel_format, flags;
 	uint32_t handles[4], pitches[4], offsets[4];
@@ -118,6 +122,24 @@ struct drm_mode_get_plane_res {
 	uint32_t count_planes;
 };
 
+struct drm_mode_get_plane {
+	uint32_t plane_id, crtc_id, fb_id, possible_crtcs, gamma_size, count_formats;
+	uint64_t format_ptr;
+};
+
+struct drm_mode_cursor {
+	uint32_t flags, crtc_id;
+	int32_t x, y;
+	uint32_t width, height, handle;
+};
+
+struct drm_mode_cursor2 {
+	uint32_t flags, crtc_id;
+	int32_t x, y;
+	uint32_t width, height, handle;
+	int32_t hot_x, hot_y;
+};
+
 struct drm_mode_atomic {
 	uint32_t flags, count_objs;
 	uint64_t objs_ptr, count_props_ptr, props_ptr, prop_values_ptr;
@@ -150,11 +172,15 @@ struct drm_mode_destroy_blob {
 #define DRM_IOCTL_MODE_PAGE_FLIP D(0xb0, drm_mode_crtc_page_flip)
 #define DRM_IOCTL_MODE_CREATE_DUMB D(0xb2, drm_mode_create_dumb)
 #define DRM_IOCTL_MODE_MAP_DUMB D(0xb3, drm_mode_map_dumb)
+#define DRM_IOCTL_MODE_DESTROY_DUMB D(0xb4, drm_mode_destroy_dumb)
 #define DRM_IOCTL_MODE_ADDFB2 D(0xb8, drm_mode_fb_cmd2)
 #define DRM_IOCTL_MODE_OBJ_GETPROPERTIES D(0xb9, drm_mode_obj_get_properties)
 #define DRM_IOCTL_MODE_GETPROPBLOB D(0xac, drm_mode_get_blob)
 #define DRM_IOCTL_MODE_GETPROPERTY D(0xaa, drm_mode_get_property)
 #define DRM_IOCTL_MODE_GETPLANERESOURCES D(0xb5, drm_mode_get_plane_res)
+#define DRM_IOCTL_MODE_GETPLANE D(0xb6, drm_mode_get_plane)
+#define DRM_IOCTL_MODE_CURSOR D(0xa3, drm_mode_cursor)
+#define DRM_IOCTL_MODE_CURSOR2 D(0xbb, drm_mode_cursor2)
 #define DRM_IOCTL_MODE_ATOMIC D(0xbc, drm_mode_atomic)
 #define DRM_IOCTL_MODE_CREATEPROPBLOB D(0xbd, drm_mode_create_blob)
 #define DRM_IOCTL_MODE_DESTROYPROPBLOB D(0xbe, drm_mode_destroy_blob)
@@ -172,6 +198,9 @@ struct drm_mode_destroy_blob {
 #define DRM_MODE_PROP_ATOMIC 0x80000000
 #define DRM_MODE_ATOMIC_TEST_ONLY 0x0100
 #define DRM_MODE_ATOMIC_ALLOW_MODESET 0x0400
+#define DRM_MODE_CURSOR_BO 0x01
+#define DRM_MODE_CURSOR_MOVE 0x02
+#define DRM_FORMAT_ARGB8888 0x34325241 /* 'AR24' */
 
 #define EVIOCGVERSION _IOR('E', 0x01, int)
 #define EVIOCGNAME(len) _IOC(_IOC_READ, 'E', 0x06, len)
@@ -315,8 +344,8 @@ static uint32_t find_prop(uint32_t obj_type, uint32_t obj_id, const char *name,
 	return 0;
 }
 
-static void atomic_kms(uint32_t crtc, uint32_t conn, uint32_t fb,
-		       const struct drm_mode_modeinfo *mode)
+static uint32_t atomic_kms(uint32_t crtc, uint32_t conn, uint32_t fb,
+			   const struct drm_mode_modeinfo *mode)
 {
 	struct drm_set_client_cap cap = {
 	    .capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES,
@@ -329,11 +358,21 @@ static void atomic_kms(uint32_t crtc, uint32_t conn, uint32_t fb,
 	struct drm_mode_get_plane_res pres = {0};
 	io(DRM_IOCTL_MODE_GETPLANERESOURCES, &pres,
 	   "GETPLANERESOURCES (counts)");
-	check(pres.count_planes == 1, "no primary plane");
+	check(pres.count_planes == 2, "expected primary and cursor planes");
 	uint32_t planes[4] = {0};
 	pres.plane_id_ptr = (uintptr_t)planes;
 	io(DRM_IOCTL_MODE_GETPLANERESOURCES, &pres, "GETPLANERESOURCES");
-	uint32_t plane = planes[0];
+	uint64_t type;
+	uint32_t plane = 0, cursor = 0;
+	for (uint32_t i = 0; i < pres.count_planes; i++) {
+		find_prop(DRM_MODE_OBJECT_PLANE, planes[i], "type", &type);
+		struct drm_mode_get_plane gp = {.plane_id = planes[i]};
+		io(DRM_IOCTL_MODE_GETPLANE, &gp, "GETPLANE");
+		check(gp.count_formats >= 1, "GETPLANE: no formats");
+		if (type == 1) plane = planes[i];
+		if (type == 2) cursor = planes[i];
+	}
+	check(plane && cursor, "primary or cursor plane missing");
 
 	uint64_t active = 2;
 	uint32_t p_active =
@@ -403,6 +442,63 @@ static void atomic_kms(uint32_t crtc, uint32_t conn, uint32_t fb,
 	struct drm_mode_destroy_blob del = {.blob_id = blob.blob_id};
 	io(DRM_IOCTL_MODE_DESTROYPROPBLOB, &del, "DESTROYPROPBLOB");
 	printf("drm: atomic KMS: properties, blob, TEST_ONLY and COMMIT ok\n");
+	return cursor;
+}
+
+/* Sets an opaque red cursor over the middle of the screen, waits for the
+ * harness to check it, then moves and hides it. */
+static void test_cursor(uint32_t crtc, uint32_t cursor_plane, uint32_t w,
+			uint32_t h, int pause)
+{
+	struct drm_mode_create_dumb c = {.width = 64, .height = 64, .bpp = 32};
+	io(DRM_IOCTL_MODE_CREATE_DUMB, &c, "CREATE_DUMB (cursor)");
+	struct drm_mode_map_dumb m = {.handle = c.handle};
+	io(DRM_IOCTL_MODE_MAP_DUMB, &m, "MAP_DUMB (cursor)");
+	uint32_t *px = mmap(0, c.size, PROT_READ | PROT_WRITE, MAP_SHARED, card,
+			    (off_t)m.offset);
+	check(px != MAP_FAILED, "mmap cursor dumb buffer");
+	for (unsigned i = 0; i < c.size / 4; i++)
+		px[i] = 0xffff0000; /* ARGB: opaque red */
+	munmap(px, c.size);
+
+	struct drm_mode_cursor2 cur = {
+	    .flags = DRM_MODE_CURSOR_BO,
+	    .crtc_id = crtc,
+	    .x = (int32_t)(w / 2) - 32,
+	    .y = (int32_t)(h / 2) - 32,
+	    .width = 64,
+	    .height = 64,
+	    .handle = c.handle,
+	    .hot_x = 32,
+	    .hot_y = 32,
+	};
+	io(DRM_IOCTL_MODE_CURSOR2, &cur, "CURSOR2 (set)");
+	struct drm_mode_get_plane gp = {.plane_id = cursor_plane};
+	io(DRM_IOCTL_MODE_GETPLANE, &gp, "GETPLANE (cursor)");
+	check(gp.fb_id != 0, "cursor plane not showing an image");
+
+	if (pause) {
+		sigset_t none;
+		sigemptyset(&none);
+		printf("DRMTEST-CURSOR\n");
+		go = 0;
+		while (!go)
+			sigsuspend(&none);
+	}
+
+	cur.flags = DRM_MODE_CURSOR_MOVE;
+	cur.x = 0;
+	cur.y = 0;
+	io(DRM_IOCTL_MODE_CURSOR2, &cur, "CURSOR2 (move)");
+	cur.flags = DRM_MODE_CURSOR_BO;
+	cur.handle = 0;
+	io(DRM_IOCTL_MODE_CURSOR2, &cur, "CURSOR2 (hide)");
+	io(DRM_IOCTL_MODE_GETPLANE, &gp, "GETPLANE (cursor hidden)");
+	check(gp.fb_id == 0, "cursor plane still showing after hide");
+
+	struct drm_mode_destroy_dumb d = {.handle = c.handle};
+	io(DRM_IOCTL_MODE_DESTROY_DUMB, &d, "DESTROY_DUMB (cursor)");
+	printf("drm: hardware cursor: set, move and hide ok\n");
 }
 
 int main(int argc, char **argv)
@@ -513,7 +609,8 @@ int main(int argc, char **argv)
 	check(ev.length == 32 && ev.user_data == 0x5e605e60,
 	      "flip event length or user_data wrong");
 
-	atomic_kms(crtc, conn.connector_id, b.fb, &mode);
+	uint32_t cursor = atomic_kms(crtc, conn.connector_id, b.fb, &mode);
+	test_cursor(crtc, cursor, w, h, pause_first);
 	printf("DRMTEST-OK %ux%u\n", w, h);
 	for (;;)
 		pause();

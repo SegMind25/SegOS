@@ -28,6 +28,7 @@ const CRTC: u32 = 0x20;
 const ENCODER: u32 = 0x21;
 const CONNECTOR: u32 = 0x22;
 const PLANE: u32 = 0x23;
+const CURSOR_PLANE: u32 = 0x24;
 const PROP_TYPE: u32 = 0x30;
 const PROP_DPMS: u32 = 0x31;
 // Atomic properties (DRM_MODE_PROP_* flags in get_property).
@@ -55,6 +56,9 @@ const ATOMIC_TEST_ONLY: u32 = 0x100;
 const ATOMIC_NONBLOCK: u32 = 0x200;
 const ATOMIC_ALLOW_MODESET: u32 = 0x400;
 const PAGE_FLIP_EVENT: u32 = 0x01;
+// DRM_MODE_CURSOR_* flags.
+const CURSOR_BO: u32 = 0x01;
+const CURSOR_MOVE: u32 = 0x02;
 const OBJ_CRTC: u32 = 0xcccc_cccc;
 const OBJ_CONNECTOR: u32 = 0xc0c0_c0c0;
 const OBJ_PLANE: u32 = 0xeeee_eeee;
@@ -104,6 +108,31 @@ struct Fb {
 /// What the screen shows: (file id, framebuffer).
 static SCANOUT: SpinLock<Option<(u64, Arc<Fb>)>> = SpinLock::new(None);
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
+
+/// The cursor overlays the scanout. It is blended onto the screen in
+/// software (the firmware framebuffer has no cursor plane of its own), so
+/// a compositor moving a pointer sees it without re-uploading the picture.
+struct CursorState {
+    file: u64,
+    image: Option<Arc<Buffer>>,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    hot_x: i32,
+    hot_y: i32,
+}
+
+static CURSOR: SpinLock<CursorState> = SpinLock::new(CursorState {
+    file: 0,
+    image: None,
+    width: 0,
+    height: 0,
+    x: 0,
+    y: 0,
+    hot_x: 0,
+    hot_y: 0,
+});
 
 pub fn init(fb: &bootinfo::Framebuffer) {
     if fb.address == 0 || fb.bpp != 32 {
@@ -158,12 +187,111 @@ fn show(fb: &Fb) {
     }
 }
 
+/// Reads one byte at `off` from a dumb buffer (walking its page array).
+fn buf_byte(buf: &Buffer, off: usize) -> Option<u8> {
+    let page = off / PAGE_SIZE as usize;
+    let in_page = off % PAGE_SIZE as usize;
+    let phys = *buf.frames.get(page)?;
+    Some(unsafe { *phys_to_virt(phys).add(in_page) })
+}
+
+/// Alpha-blends a single source byte over a destination byte.
+#[inline]
+fn blend_byte(dst: *mut u8, src: u8, alpha: u8) {
+    unsafe {
+        let (d, s, a) = (*dst as u32, src as u32, alpha as u32);
+        *dst = ((s * a + d * (255 - a)) / 255) as u8;
+    }
+}
+
+/// Blends the cursor image (ARGB8888) over whatever is on screen now.
+/// Called with SCANOUT held (so the picture underneath cannot change).
+fn blend_cursor() {
+    let Some(s) = SCREEN.get() else { return };
+    let cur = CURSOR.lock();
+    let Some(image) = cur.image.as_ref() else {
+        return;
+    };
+    let (cw, ch) = (cur.width as i32, cur.height as i32);
+    if cw == 0 || ch == 0 {
+        return;
+    }
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let (sx, sy) = (cur.x + cx, cur.y + cy);
+            if sx < 0 || sy < 0 || sx >= s.width as i32 || sy >= s.height as i32 {
+                continue;
+            }
+            let off = cy as usize * image.pitch as usize + cx as usize * 4;
+            let (Some(b), Some(g), Some(r), Some(a)) = (
+                buf_byte(image, off),
+                buf_byte(image, off + 1),
+                buf_byte(image, off + 2),
+                buf_byte(image, off + 3),
+            ) else {
+                continue;
+            };
+            if a == 0 {
+                continue;
+            }
+            let dst =
+                phys_to_virt(s.base + (sy as usize * s.pitch as usize + sx as usize * 4) as u64);
+            unsafe {
+                if s.rgb {
+                    blend_byte(dst, r, a);
+                    blend_byte(dst.add(1), g, a);
+                    blend_byte(dst.add(2), b, a);
+                } else {
+                    blend_byte(dst, b, a);
+                    blend_byte(dst.add(1), g, a);
+                    blend_byte(dst.add(2), r, a);
+                }
+            }
+        }
+    }
+}
+
+/// Redraws the current picture and cursor after a cursor change.
+fn redraw() {
+    let sc = SCANOUT.lock();
+    if let Some((_, fb)) = sc.as_ref() {
+        show(fb);
+        blend_cursor();
+    }
+}
+
+/// Installs a new cursor image/position and repaints the screen.
+fn set_cursor_state(
+    file: u64,
+    image: Option<Arc<Buffer>>,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    hot_x: i32,
+    hot_y: i32,
+) {
+    {
+        let mut cur = CURSOR.lock();
+        cur.file = file;
+        cur.image = image;
+        cur.width = width;
+        cur.height = height;
+        cur.x = x;
+        cur.y = y;
+        cur.hot_x = hot_x;
+        cur.hot_y = hot_y;
+    }
+    redraw();
+}
+
 fn set_scanout(file: u64, fb: Option<Arc<Fb>>) {
     let mut sc = SCANOUT.lock();
     match fb {
         Some(fb) => {
             crate::console::set_graphics(true);
             show(&fb);
+            blend_cursor();
             *sc = Some((file, fb));
         }
         None => {
@@ -218,12 +346,14 @@ struct State {
     blobs: BTreeMap<u32, Vec<u8>>,
     next_handle: u32,
     universal: bool,
-    /// The current atomic state of the CRTC, connector and primary plane.
+    /// The current atomic state of the CRTC, connector and planes.
     crtc_active: bool,
     crtc_mode: u32,
     connector_crtc: u32,
     plane_fb: u32,
     plane_crtc: u32,
+    cursor_fb: u32,
+    cursor_crtc: u32,
 }
 
 /// One open file of the card: its buffers, framebuffers and events.
@@ -240,6 +370,9 @@ impl Drop for DrmFile {
         let mine = SCANOUT.lock().as_ref().is_some_and(|(f, _)| *f == self.id);
         if mine {
             set_scanout(self.id, None);
+        }
+        if CURSOR.lock().file == self.id {
+            set_cursor_state(self.id, None, 0, 0, 0, 0, 0, 0);
         }
     }
 }
@@ -369,7 +502,7 @@ fn prop_meta(id: u32) -> KResult<PropMeta> {
 }
 
 /// Properties attached to each mode object, with their current values.
-fn object_props(st: &State, obj_type: u32) -> KResult<(Vec<u32>, Vec<u64>)> {
+fn object_props(st: &State, obj_type: u32, obj_id: u32) -> KResult<(Vec<u32>, Vec<u64>)> {
     Ok(match obj_type {
         OBJ_CRTC => (
             alloc::vec![PROP_ACTIVE, PROP_MODE_ID],
@@ -379,7 +512,7 @@ fn object_props(st: &State, obj_type: u32) -> KResult<(Vec<u32>, Vec<u64>)> {
             alloc::vec![PROP_CRTC_ID, PROP_DPMS],
             alloc::vec![st.connector_crtc as u64, 0],
         ),
-        OBJ_PLANE => (
+        OBJ_PLANE if obj_id == PLANE => (
             alloc::vec![
                 PROP_TYPE,
                 PROP_FB_ID,
@@ -407,6 +540,25 @@ fn object_props(st: &State, obj_type: u32) -> KResult<(Vec<u32>, Vec<u64>)> {
                 0,
             ],
         ),
+        OBJ_PLANE if obj_id == CURSOR_PLANE => {
+            let cur = CURSOR.lock();
+            (
+                alloc::vec![
+                    PROP_TYPE,
+                    PROP_FB_ID,
+                    PROP_CRTC_ID,
+                    PROP_CRTC_X,
+                    PROP_CRTC_Y,
+                ],
+                alloc::vec![
+                    2, // cursor plane
+                    st.cursor_fb as u64,
+                    st.cursor_crtc as u64,
+                    (cur.x as i64 as u64) & 0xffff_ffff,
+                    (cur.y as i64 as u64) & 0xffff_ffff,
+                ],
+            )
+        }
         _ => return Err(Errno::ENOENT),
     })
 }
@@ -467,6 +619,75 @@ impl DrmFile {
         Ok(id)
     }
 
+    /// Handles MODE_CURSOR (0xa3) and MODE_CURSOR2 (0xbb). CURSOR_BO sets
+    /// the image (a dumb-buffer handle) and position; CURSOR_MOVE only
+    /// moves it; a zero handle hides it.
+    fn set_cursor(&self, b: &[u8], cursor2: bool) -> KResult<()> {
+        if r32(b, 4) != CRTC {
+            return Err(Errno::ENOENT);
+        }
+        let (flags, x, y) = (r32(b, 0), r32(b, 8) as i32, r32(b, 12) as i32);
+        if flags & !(CURSOR_BO | CURSOR_MOVE) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flags & CURSOR_MOVE != 0 && flags & CURSOR_BO == 0 {
+            // Move only: keep the current image, but it must be ours. Copy
+            // the state out before repainting (set_cursor_state relocks).
+            let (image, width, height, hot_x, hot_y) = {
+                let cur = CURSOR.lock();
+                if cur.file != self.id || cur.image.is_none() {
+                    return Err(Errno::EINVAL);
+                }
+                (
+                    cur.image.clone(),
+                    cur.width,
+                    cur.height,
+                    cur.hot_x,
+                    cur.hot_y,
+                )
+            };
+            set_cursor_state(self.id, image, width, height, x, y, hot_x, hot_y);
+            return Ok(());
+        }
+        let (width, height, handle) = (r32(b, 16), r32(b, 20), r32(b, 24));
+        let (hot_x, hot_y) = if cursor2 {
+            (r32(b, 28) as i32, r32(b, 32) as i32)
+        } else {
+            (0, 0)
+        };
+        let image = if handle == 0 {
+            None
+        } else {
+            if width == 0 || height == 0 || width > 256 || height > 256 {
+                return Err(Errno::EINVAL);
+            }
+            let buf = self
+                .st
+                .lock()
+                .buffers
+                .get(&handle)
+                .cloned()
+                .ok_or(Errno::ENOENT)?;
+            if width * 4 > buf.pitch
+                || height as u64 * buf.pitch as u64 > buf.frames.len() as u64 * PAGE_SIZE
+            {
+                return Err(Errno::EINVAL);
+            }
+            Some(buf)
+        };
+        set_cursor_state(
+            self.id,
+            image,
+            if handle == 0 { 0 } else { width },
+            if handle == 0 { 0 } else { height },
+            x,
+            y,
+            hot_x,
+            hot_y,
+        );
+        Ok(())
+    }
+
     /// Applies one `DRM_MODE_ATOMIC` transaction: read the property arrays,
     /// validate the whole state, then install it at once (or only validate
     /// it for TEST_ONLY). The geometry is fixed to one full-screen plane,
@@ -518,6 +739,12 @@ impl DrmFile {
             st.plane_fb,
             st.plane_crtc,
         );
+        let (mut cursor_fb, mut cursor_crtc) = (st.cursor_fb, st.cursor_crtc);
+        let (mut cursor_x, mut cursor_y) = {
+            let cur = CURSOR.lock();
+            (cur.x, cur.y)
+        };
+        let mut cursor_updated = false;
         let mut i = 0;
         for (j, &obj) in objs.iter().enumerate() {
             for _ in 0..counts[j] {
@@ -537,22 +764,32 @@ impl DrmFile {
                         }
                         mode = id;
                     }
-                    (CONNECTOR, PROP_CRTC_ID) | (PLANE, PROP_CRTC_ID) => {
+                    (CONNECTOR, PROP_CRTC_ID)
+                    | (PLANE, PROP_CRTC_ID)
+                    | (CURSOR_PLANE, PROP_CRTC_ID) => {
                         if val != 0 && val != CRTC as u64 {
                             return Err(Errno::EINVAL);
                         }
-                        if obj == CONNECTOR {
-                            conn_crtc = val as u32;
-                        } else {
-                            plane_crtc = val as u32;
+                        match obj {
+                            CONNECTOR => conn_crtc = val as u32,
+                            PLANE => plane_crtc = val as u32,
+                            _ => {
+                                cursor_crtc = val as u32;
+                                cursor_updated = true;
+                            }
                         }
                     }
-                    (PLANE, PROP_FB_ID) => {
+                    (PLANE, PROP_FB_ID) | (CURSOR_PLANE, PROP_FB_ID) => {
                         let id = u32::try_from(val).map_err(|_| Errno::EINVAL)?;
                         if id != 0 && !st.fbs.contains_key(&id) {
                             return Err(Errno::ENOENT);
                         }
-                        plane_fb = id;
+                        if obj == PLANE {
+                            plane_fb = id;
+                        } else {
+                            cursor_fb = id;
+                            cursor_updated = true;
+                        }
                     }
                     (
                         PLANE,
@@ -563,6 +800,14 @@ impl DrmFile {
                             return Err(Errno::EINVAL);
                         }
                     }
+                    (CURSOR_PLANE, PROP_CRTC_X) => {
+                        cursor_x = val as i32;
+                        cursor_updated = true;
+                    }
+                    (CURSOR_PLANE, PROP_CRTC_Y) => {
+                        cursor_y = val as i32;
+                        cursor_updated = true;
+                    }
                     _ => return Err(Errno::EINVAL),
                 }
             }
@@ -572,17 +817,34 @@ impl DrmFile {
         }
         // Legacy and atomic endpoints share the scanout: the atomic state
         // now describes what SETCRTC/PAGE_FLIP report too.
+        let cursor_buffer = st
+            .fbs
+            .get(&cursor_fb)
+            .map(|fb| (fb.buffer.clone(), fb.width.min(256), fb.height.min(256)));
         st.crtc_active = active;
         st.crtc_mode = mode;
         st.connector_crtc = conn_crtc;
         st.plane_fb = plane_fb;
         st.plane_crtc = plane_crtc;
+        st.cursor_fb = cursor_fb;
+        st.cursor_crtc = cursor_crtc;
         drop(st);
         if active && plane_fb != 0 {
             let fb = self.fb(plane_fb)?;
             set_scanout(self.id, Some(fb));
         } else if !active {
             set_scanout(self.id, None);
+        }
+        if cursor_updated {
+            if let Some((image, w, h)) = cursor_buffer {
+                let (hot_x, hot_y) = {
+                    let cur = CURSOR.lock();
+                    (cur.hot_x, cur.hot_y)
+                };
+                set_cursor_state(self.id, Some(image), w, h, cursor_x, cursor_y, hot_x, hot_y);
+            } else {
+                set_cursor_state(self.id, None, 0, 0, cursor_x, cursor_y, 0, 0);
+            }
         }
         if flags & PAGE_FLIP_EVENT != 0 {
             self.queue_event(2, user_data);
@@ -723,8 +985,9 @@ impl DrmFile {
                     set_scanout(self.id, Some(fb));
                 }
             }
-            0xa3 | 0xbb => return Err(Errno::ENXIO), // no cursor plane
-            0xa4 | 0xa5 => {}                        // gamma: size 0
+            0xa3 => self.set_cursor(b, false)?, // MODE_CURSOR
+            0xbb => self.set_cursor(b, true)?,  // MODE_CURSOR2 (hotspot)
+            0xa4 | 0xa5 => {}                   // gamma: size 0
             0xa6 => {
                 if r32(b, 0) != ENCODER {
                     return Err(Errno::ENOENT);
@@ -801,22 +1064,36 @@ impl DrmFile {
                         }
                         st.crtc_mode = id;
                     }
-                    (CONNECTOR, PROP_CRTC_ID) | (PLANE, PROP_CRTC_ID) => {
+                    (CONNECTOR, PROP_CRTC_ID)
+                    | (PLANE, PROP_CRTC_ID)
+                    | (CURSOR_PLANE, PROP_CRTC_ID) => {
                         if value != 0 && value != CRTC as u64 {
                             return Err(Errno::EINVAL);
                         }
-                        if obj == CONNECTOR {
-                            st.connector_crtc = value as u32;
-                        } else {
-                            st.plane_crtc = value as u32;
+                        match obj {
+                            CONNECTOR => st.connector_crtc = value as u32,
+                            PLANE => st.plane_crtc = value as u32,
+                            _ => st.cursor_crtc = value as u32,
                         }
                     }
-                    (PLANE, PROP_FB_ID) => {
+                    (PLANE, PROP_FB_ID) | (CURSOR_PLANE, PROP_FB_ID) => {
                         let id = u32::try_from(value).map_err(|_| Errno::EINVAL)?;
                         if id != 0 && !st.fbs.contains_key(&id) {
                             return Err(Errno::ENOENT);
                         }
-                        st.plane_fb = id;
+                        if obj == PLANE {
+                            st.plane_fb = id;
+                        } else {
+                            st.cursor_fb = id;
+                        }
+                    }
+                    (CURSOR_PLANE, PROP_CRTC_X) => {
+                        let mut cur = CURSOR.lock();
+                        cur.x = value as i32;
+                    }
+                    (CURSOR_PLANE, PROP_CRTC_Y) => {
+                        let mut cur = CURSOR.lock();
+                        cur.y = value as i32;
                     }
                     _ if prop == PROP_DPMS && value <= 3 => {}
                     _ => return Err(Errno::EINVAL),
@@ -924,7 +1201,7 @@ impl DrmFile {
             0xb5 => {
                 // GETPLANERESOURCES
                 let planes: &[u32] = if self.st.lock().universal {
-                    &[PLANE]
+                    &[PLANE, CURSOR_PLANE]
                 } else {
                     &[]
                 };
@@ -933,15 +1210,30 @@ impl DrmFile {
             }
             0xb6 => {
                 // GETPLANE
-                if r32(b, 0) != PLANE {
+                let plane = r32(b, 0);
+                if plane != PLANE && plane != CURSOR_PLANE {
                     return Err(Errno::ENOENT);
                 }
                 let showing = SCANOUT.lock().as_ref().is_some_and(|(f, _)| *f == self.id);
+                let cur_showing = CURSOR.lock().file == self.id && CURSOR.lock().image.is_some();
                 w32(b, 4, if showing { CRTC } else { 0 });
-                w32(b, 8, 0);
+                w32(
+                    b,
+                    8,
+                    if plane == CURSOR_PLANE && cur_showing {
+                        1
+                    } else {
+                        0
+                    },
+                );
                 w32(b, 12, 1);
                 w32(b, 16, 0);
-                let n = put_ids(mm, r64(b, 24), r32(b, 20), &[XR24, AR24])?;
+                let formats: &[u32] = if plane == PLANE {
+                    &[XR24, AR24]
+                } else {
+                    &[AR24]
+                };
+                let n = put_ids(mm, r64(b, 24), r32(b, 20), formats)?;
                 w32(b, 20, n);
             }
             0xb7 => {
@@ -975,7 +1267,8 @@ impl DrmFile {
             }
             0xb9 => {
                 // OBJ_GETPROPERTIES
-                let (ids, vals) = object_props(&self.st.lock(), r32(b, 24))?;
+                let (obj_id, obj_type) = (r32(b, 20), r32(b, 24));
+                let (ids, vals) = object_props(&self.st.lock(), obj_type, obj_id)?;
                 let n = put_ids(mm, r64(b, 0), r32(b, 16), &ids)?;
                 put_u64s(mm, r64(b, 8), r32(b, 16), &vals)?;
                 w32(b, 16, n);

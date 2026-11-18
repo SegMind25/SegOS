@@ -800,6 +800,25 @@ fn shell_session(img: &Path) -> Result<(), String> {
     check_screen("SETCRTC", &["red", "blue", "blue"], &mut child)?;
     let cmd = "kill -USR1 %1";
     send(cmd);
+    let Some(end) = wait_for("DRMTEST-CURSOR", at, 60) else {
+        return fail(
+            format!("`{cmd}` did not print `DRMTEST-CURSOR`"),
+            &mut child,
+        );
+    };
+    let log = text();
+    for line in log[at..end].lines() {
+        if let Some(i) = line.find("drm: ") {
+            println!("xtask: shell session:   {}", line[i..].trim_end());
+        }
+    }
+    at = end;
+    println!("xtask: shell session: `{cmd}` -> DRMTEST-CURSOR");
+    // The cursor is an opaque red 64x64 image centred on the screen, so
+    // only the middle sample point is covered.
+    check_screen("CURSOR", &["green", "red", "green"], &mut child)?;
+    let cmd = "kill -USR1 %1";
+    send(cmd);
     let Some(end) = wait_for("DRMTEST-OK ", at, 60) else {
         return fail(format!("`{cmd}` did not print `DRMTEST-OK`"), &mut child);
     };
@@ -815,7 +834,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
         .take_while(|c| c.is_ascii_alphanumeric())
         .collect();
     println!("xtask: shell session: `{cmd}` -> DRMTEST-OK {size}");
-    check_screen("PAGE_FLIP", &["green", "green", "green"], &mut child)?;
+    check_screen("cursor hidden", &["green", "green", "green"], &mut child)?;
     let cmd = "kill %1; wait; echo KILLED-$((40 + 2))";
     send(cmd);
     if wait_for("KILLED-42", at, 60).is_none() {

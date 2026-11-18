@@ -387,7 +387,15 @@ reaching the client, and the console back after weston exits.
   `MODE_ATOMIC` ioctl validates a whole transaction (including TEST_ONLY)
   before applying it and queueing a flip event; legacy and atomic paths
   share one scanout state. `drmtest` checks the properties, a mode blob,
-  TEST_ONLY, COMMIT and GETCRTC after the commit.
+  TEST_ONLY, COMMIT and GETCRTC after the commit. **Hardware cursors**:
+  a cursor plane with `CRTC_X`/`CRTC_Y` properties and the `MODE_CURSOR`
+  and `MODE_CURSOR2` ioctls (with a hotspot); a 64x64 ARGB8888 image is
+  alpha-blended onto the scanout in software (the firmware framebuffer
+  has no hardware cursor), move and hide clear it, and the plane is
+  cleared when its owner closes the device. `drmtest` checks the plane
+  metadata and the set/move/hide ioctls; the QEMU session checks the red
+  cursor appears over the green screen at the centre sample point and
+  disappears after it is hidden.
 - **Input** (`input.rs`): evdev `/dev/input/event0` (keyboard, Linux key
   codes) and `event1` (a new PS/2 mouse driver with wheel), the evdev
   ioctls, EVIOCGRAB; terminal KD/VT ioctls (graphics mode, keyboard off).
@@ -397,8 +405,8 @@ reaching the client, and the console back after weston exits.
   `mremap` (grow, shrink, move; wl_shm pools), `flock`, `fallocate`,
   `O_PATH` on symbolic links, `statx` mount ids, SYSFS_MAGIC.
 
-Not yet: GPU acceleration (virtio-gpu, then AMD/Intel), hardware cursors,
-USB (xHCI) keyboards and mice, dma-buf.
+Not yet: GPU acceleration (virtio-gpu, then AMD/Intel), USB (xHCI)
+keyboards and mice, dma-buf.
 
 ## 14. Next concrete steps (Phase 8: desktop applications)
 
