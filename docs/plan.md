@@ -405,8 +405,7 @@ reaching the client, and the console back after weston exits.
   `mremap` (grow, shrink, move; wl_shm pools), `flock`, `fallocate`,
   `O_PATH` on symbolic links, `statx` mount ids, SYSFS_MAGIC.
 
-Not yet: GPU acceleration (virtio-gpu, then AMD/Intel), USB (xHCI)
-keyboards and mice, dma-buf.
+Not yet: GPU acceleration (virtio-gpu, then AMD/Intel), dma-buf.
 
 ## 14. Next concrete steps (Phase 8: desktop applications)
 
@@ -461,4 +460,13 @@ The demo: Firefox and Chromium run on the Wayland desktop.
    tone in it. Not yet: capture, mmap transfers, mixer controls,
    interrupts (the position is followed by a kernel thread), dmix (no
    SysV shared memory).
-4. **USB**: xHCI with HID keyboards and mice, for real PCs.
+4. **USB** (`drivers/xhci.rs`, done): the xHCI controller is taken from
+   the firmware, reset, and given a device context array, scratchpads, a
+   command ring and an event ring; connected root ports are reset, their
+   devices addressed and descriptors read, and HID boot interfaces get
+   their interrupt-IN endpoints configured. A polling thread handles the
+   reports: keyboard usages become set-1 scan codes for the PS/2 path
+   (evdev and the console), mouse motion goes to the evdev mouse. No
+   hubs or other device classes yet. The QEMU test machine has no i8042
+   (as on most new PCs) and types a shell command on the USB keyboard and
+   moves the USB mouse through QMP.

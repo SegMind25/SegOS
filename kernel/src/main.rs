@@ -131,6 +131,7 @@ fn kernel_init(boot: &'static BootInfo) {
     drivers::nvme::init();
     drivers::ahci::init();
     drivers::hda::init();
+    drivers::xhci::init();
     sound::populate(&fs::dev_dir());
     net::init();
     block::start_flusher();

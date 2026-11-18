@@ -310,7 +310,9 @@ fn root_disk(u: &userland::Userland) -> Result<PathBuf, String> {
 fn qemu(img: &Path) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     let ovmf = std::env::var("OVMF").unwrap_or_else(|_| "/usr/share/ovmf/OVMF.fd".into());
-    cmd.args(["-M", "q35", "-m", "2G", "-smp", "4", "-no-reboot"])
+    // No PS/2 controller (as on most new PCs): keys and the mouse come
+    // through USB.
+    cmd.args(["-M", "q35,i8042=off", "-m", "2G", "-smp", "4", "-no-reboot"])
         .args(["-serial", "stdio"])
         .args(["-bios", &ovmf])
         .arg("-drive")
@@ -335,6 +337,11 @@ fn qemu(img: &Path) -> Command {
             "-device",
             "hda-output,audiodev=snd0",
         ]);
+    // A USB controller with a keyboard and a mouse (the shell session
+    // types on the keyboard through QMP).
+    cmd.args(["-device", "qemu-xhci,id=xhci"])
+        .args(["-device", "usb-kbd,bus=xhci.0,id=ukbd"])
+        .args(["-device", "usb-mouse,bus=xhci.0,id=umouse"]);
     // A QMP socket, for screendumps of what SegOS shows.
     let qmp = qmp_socket();
     let _ = std::fs::remove_file(&qmp);
@@ -524,6 +531,35 @@ fn screen_colours() -> Result<(usize, usize, usize, f64), String> {
     }
     let top = counts.values().copied().max().unwrap_or(0);
     Ok((w, h, counts.len(), top as f64 / (w * h).max(1) as f64))
+}
+
+/// Types `text` on the keyboard (the machine's only one is USB), key by key.
+fn type_usb(text: &str) -> Result<(), String> {
+    for c in text.chars() {
+        let (key, shift) = match c {
+            'a'..='z' | '0'..='9' => (c.to_string(), false),
+            'A'..='Z' => (c.to_ascii_lowercase().to_string(), true),
+            ' ' => ("spc".into(), false),
+            '-' => ("minus".into(), false),
+            '\n' => ("ret".into(), false),
+            '$' => ("4".into(), true),
+            '(' => ("9".into(), true),
+            ')' => ("0".into(), true),
+            '*' => ("8".into(), true),
+            _ => return Err(format!("cannot type {c:?}")),
+        };
+        let q = |k: &str| format!("{{\"type\":\"qcode\",\"data\":\"{k}\"}}");
+        let keys = if shift {
+            format!("{},{}", q("shift"), q(&key))
+        } else {
+            q(&key)
+        };
+        qmp(&format!(
+            "{{\"execute\":\"send-key\",\"arguments\":{{\"keys\":[{keys}]}}}}"
+        ))?;
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    Ok(())
 }
 
 /// Presses and releases a key (a QEMU "qcode", e.g. "esc") over QMP.
@@ -765,6 +801,36 @@ fn shell_session(img: &Path) -> Result<(), String> {
         let _ = w.write_all(format!("{cmd}\n").as_bytes());
         let _ = w.flush();
     };
+    // Phase 8: USB. A command typed on the USB keyboard (xHCI, HID boot
+    // protocol) reaches the shell; the USB mouse's motion reaches evdev.
+    if let Err(e) = type_usb("echo USB-$((6*7))\n") {
+        return fail(format!("usb: {e}"), &mut child);
+    }
+    let Some(end) = wait_for("USB-42", at, 60) else {
+        return fail(
+            "usb: the line typed on the USB keyboard did not run".into(),
+            &mut child,
+        );
+    };
+    at = end;
+    println!("xtask: shell session: USB keyboard: `echo USB-$((6*7))` -> USB-42");
+    send(
+        "(dd if=/dev/input/event1 bs=24 count=1 2>/dev/null | wc -c | sed 's/^/MOUSE-BYTES=/') & sleep 1; echo MOVE-$((3+3))",
+    );
+    let Some(end) = wait_for("MOVE-6", at, 30) else {
+        return fail("usb: the mouse reader did not start".into(), &mut child);
+    };
+    at = end;
+    if let Err(e) = qmp(
+        "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"rel\",\"data\":{\"axis\":\"x\",\"value\":20}}]}}",
+    ) {
+        return fail(format!("usb: {e}"), &mut child);
+    }
+    let Some(end) = wait_for("MOUSE-BYTES=24", at, 30) else {
+        return fail("usb: no evdev event from the USB mouse".into(), &mut child);
+    };
+    at = end;
+    println!("xtask: shell session: USB mouse: motion -> one evdev event (24 bytes)");
     let check_screen = |what: &str, want: &[&str], child: &mut std::process::Child| {
         // The kernel copies to the screen at once; give QEMU's display a moment.
         std::thread::sleep(Duration::from_millis(500));
@@ -798,7 +864,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
     println!("xtask: shell session: `{cmd}` -> DRMTEST-SHOWN");
     // The centre column is the first of the right half.
     check_screen("SETCRTC", &["red", "blue", "blue"], &mut child)?;
-    let cmd = "kill -USR1 %1";
+    let cmd = "kill -USR1 %2";
     send(cmd);
     let Some(end) = wait_for("DRMTEST-CURSOR", at, 60) else {
         return fail(
@@ -817,7 +883,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
     // The cursor is an opaque red 64x64 image centred on the screen, so
     // only the middle sample point is covered.
     check_screen("CURSOR", &["green", "red", "green"], &mut child)?;
-    let cmd = "kill -USR1 %1";
+    let cmd = "kill -USR1 %2";
     send(cmd);
     let Some(end) = wait_for("DRMTEST-OK ", at, 60) else {
         return fail(format!("`{cmd}` did not print `DRMTEST-OK`"), &mut child);
@@ -835,7 +901,7 @@ fn shell_session(img: &Path) -> Result<(), String> {
         .collect();
     println!("xtask: shell session: `{cmd}` -> DRMTEST-OK {size}");
     check_screen("cursor hidden", &["green", "green", "green"], &mut child)?;
-    let cmd = "kill %1; wait; echo KILLED-$((40 + 2))";
+    let cmd = "kill %2; wait; echo KILLED-$((40 + 2))";
     send(cmd);
     if wait_for("KILLED-42", at, 60).is_none() {
         return fail(format!("`{cmd}` did not print `KILLED-42`"), &mut child);
