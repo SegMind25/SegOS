@@ -64,6 +64,22 @@ const TESTS: &[(&str, fn())] = &[
         "user: a process's memory is freed when it exits",
         user_memory_freed,
     ),
+    (
+        "virtio-gpu: RESOURCE_CREATE_2D layout",
+        crate::drivers::virtio_gpu::tests::create_2d_layout,
+    ),
+    (
+        "virtio-gpu: SET_SCANOUT layout",
+        crate::drivers::virtio_gpu::tests::set_scanout_layout,
+    ),
+    (
+        "virtio-gpu: RESOURCE_FLUSH and ATTACH_BACKING layouts",
+        crate::drivers::virtio_gpu::tests::flush_and_attach_layout,
+    ),
+    (
+        "virtio-gpu: MEM_ENTRY layout",
+        crate::drivers::virtio_gpu::tests::mem_entry_layout,
+    ),
 ];
 
 pub fn run(boot: &'static BootInfo) -> ! {

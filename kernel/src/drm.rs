@@ -11,7 +11,8 @@
 //! stays off the screen; when its last file closes, the console returns.
 //! Atomic modesetting (properties, blobs and the ATOMIC ioctl) is offered
 //! alongside the legacy ioctls, and dumb buffers can be shared as dma-buf
-//! fds through DRM PRIME. There is no GPU rendering yet.
+//! fds through DRM PRIME. Presentation uses virtio-gpu when the device is
+//! present, otherwise the firmware framebuffer; there is no 3D rendering.
 
 use crate::abi::{Errno, KResult};
 use crate::fs::{FileType, Inode, new_ino, poll};
@@ -205,8 +206,22 @@ pub fn present() -> bool {
     SCREEN.get().is_some()
 }
 
-/// Copies `fb` to the screen.
+/// The virtio-gpu device, registered after PCI discovery. When present it
+/// replaces the firmware framebuffer as the scanout backend.
+static GPU: Once<crate::drivers::virtio_gpu::Gpu> = Once::new();
+
+pub fn register_gpu(gpu: crate::drivers::virtio_gpu::Gpu) {
+    GPU.call_once(|| gpu);
+}
+
+/// Copies `fb` to the screen (virtio-gpu scanout if available, otherwise
+/// the firmware framebuffer).
 fn show(fb: &Fb) {
+    if let Some(gpu) = GPU.get() {
+        let key = fb.buffer.frames.first().copied().unwrap_or(0);
+        let _ = gpu.present(key, fb.width, fb.height, &fb.buffer.frames);
+        return;
+    }
     let Some(s) = SCREEN.get() else { return };
     let w = fb.width.min(s.width) as usize;
     let h = fb.height.min(s.height) as usize;

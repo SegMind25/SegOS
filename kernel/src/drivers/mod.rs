@@ -8,6 +8,7 @@ pub mod nvme;
 pub mod pci;
 pub mod ps2kbd;
 pub mod virtio_blk;
+pub mod virtio_gpu;
 pub mod virtio_net;
 pub mod xhci;
 

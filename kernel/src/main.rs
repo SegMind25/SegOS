@@ -132,6 +132,7 @@ fn kernel_init(boot: &'static BootInfo) {
     drivers::ahci::init();
     drivers::hda::init();
     drivers::xhci::init();
+    drivers::virtio_gpu::init();
     sound::populate(&fs::dev_dir());
     net::init();
     block::start_flusher();

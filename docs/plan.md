@@ -405,14 +405,23 @@ reaching the client, and the console back after weston exits.
   `mremap` (grow, shrink, move; wl_shm pools), `flock`, `fallocate`,
   `O_PATH` on symbolic links, `statx` mount ids, SYSFS_MAGIC.
 
-Not yet: GPU acceleration (virtio-gpu, then AMD/Intel).
+Not yet: GPU acceleration beyond virtio-gpu 2D (virgl/3D, AMD/Intel).
 
 ## 14. Next concrete steps (Phase 8: desktop applications)
 
 The demo: Firefox and Chromium run on the Wayland desktop.
 
-1. **GPU**: virtio-gpu with 3D (virgl) or a Mesa software path (llvmpipe)
-   over shared memory; atomic KMS (done, above).
+1. **GPU** (`drivers/virtio_gpu.rs` + `drm.rs`, partly done): 2D scanout on
+   virtio-gpu — the driver takes the device through the virtio 1.x PCI
+   handshake, sets up the control queue, and turns a dumb buffer into a
+   resource with its physical frames as backing (`RESOURCE_CREATE_2D`,
+   `RESOURCE_ATTACH_BACKING`, `SET_SCANOUT`, `RESOURCE_FLUSH`). `drm.rs` uses
+   it as the present backend when the device exists, falling back to the
+   firmware framebuffer otherwise. Atomic KMS and dma-buf are done (above).
+   Not yet: 3D (virgl), hardware cursors over the virtio-gpu cursor queue,
+   and real AMD/Intel GPUs. Local QEMU has no virtio-gpu device, so only the
+   command layouts are covered by kernel tests; the device path is not
+   exercised here.
 2. **What browsers need**: seccomp-BPF, `inotify`, user, PID, network and
    mount namespaces, `/dev/shm`, fontconfig, a D-Bus session bus, `chroot`
    and CLONE_FS (all done, below).
