@@ -4,6 +4,7 @@ ok   read_file("/proc/self/gid_map") > 0 && is_map(0, 0, 4294967295u)
 ok   read_file("/proc/self/setgroups") > 0 && strcmp(buf, "allow\n") == 0
 ok   write_file("/proc/self/uid_map", "0 0 1") == -1 && errno == EPERM
 ok   syscall(SYS_clone, CLONE_NEWUSER | CLONE_FS | SIGCHLD, 0, 0, 0, 0) == -1 && errno == EINVAL
+ok   syscall(SYS_clone, CLONE_NEWNS | CLONE_FS | SIGCHLD, 0, 0, 0, 0) == -1 && errno == EINVAL
 ok   syscall(SYS_clone, CLONE_NEWPID | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM, 0, 0, 0, 0) == -1 && errno == EINVAL
 # user namespace
 ok   unshare(CLONE_NEWUSER) == 0
@@ -76,6 +77,21 @@ ok   bind(u, (struct sockaddr *)&lo, sizeof lo) == 0 && getsockname(u, (struct s
 ok   unix_socket_at(connect) == -1 && errno == ECONNREFUSED
 ok   mine >= 0 && listen(mine, 1) == 0
 ok   c >= 0
+ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
+# mount namespace
+ok   pipe(ready) == 0 && pipe(go) == 0
+ok   strncmp(before, "mnt:[", 5) == 0
+ok   unshare(CLONE_NEWUSER | CLONE_NEWNS) == 0
+ok   strncmp(after, "mnt:[", 5) == 0 && strcmp(before, after) != 0
+ok   mount("tmpfs", mnt_dir, "tmpfs", 0, NULL) == 0
+ok   read_all("/proc/self/mounts") > 0 && strstr(bigbuf, mnt_dir) != NULL
+ok   write(ready, &c, 1) == 1
+ok   pid > 0 && read(ready[0], &c, 1) == 1
+ok   read_all("/proc/self/mounts") > 0 && strstr(bigbuf, mnt_dir) == NULL
+ok   read_all(path) > 0 && strstr(bigbuf, mnt_dir) != NULL
+ok   write(go[1], &c, 1) == 1
+ok   read(go, &c, 1) == 1
+ok   waitpid(pid, &status, 0) == pid
 ok   WIFEXITED(status) && WEXITSTATUS(status) == 0
 # chroot and CLONE_FS
 ok   unshare(CLONE_NEWUSER) == 0

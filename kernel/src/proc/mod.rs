@@ -78,6 +78,8 @@ pub struct Process {
     /// Root, working directory and umask (shared after CLONE_FS).
     pub fs: SpinLock<Arc<FsState>>,
     pub net_ns: SpinLock<Arc<ns::NetNs>>,
+    /// The mount table this process sees (a private copy after CLONE_NEWNS).
+    pub mnt_ns: SpinLock<Arc<ns::MntNs>>,
     pub sigactions: SpinLock<[SigAction; signal::NSIG]>,
     pub children: SpinLock<Vec<Arc<Process>>>,
     /// Bumped and woken whenever a child changes state.
@@ -389,6 +391,7 @@ fn new_process(
         files: Mutex::new(files),
         fs: SpinLock::new(FsState::new(cwd)),
         net_ns: SpinLock::new(ns::NetNs::initial()),
+        mnt_ns: SpinLock::new(ns::MntNs::initial()),
         sigactions: SpinLock::new([SigAction::default(); signal::NSIG]),
         children: SpinLock::new(Vec::new()),
         child_events: AtomicU64::new(0),
@@ -506,6 +509,7 @@ pub mod clone_flags {
     pub const CSIGNAL: u64 = 0xff;
     pub const CLONE_VM: u64 = 0x100;
     pub const CLONE_FS: u64 = 0x200;
+    pub const CLONE_NEWNS: u64 = 0x2_0000;
     pub const CLONE_FILES: u64 = 0x400;
     pub const CLONE_SIGHAND: u64 = 0x800;
     pub const CLONE_VFORK: u64 = 0x4000;
@@ -519,8 +523,8 @@ pub mod clone_flags {
     pub const CLONE_NEWUSER: u64 = 0x1000_0000;
     pub const CLONE_NEWPID: u64 = 0x2000_0000;
     pub const CLONE_NEWNET: u64 = 0x4000_0000;
-    /// Mount, UTS, IPC and cgroup namespaces: not yet.
-    pub const UNSUPPORTED: u64 = 0x0e02_0000;
+    /// UTS, IPC and cgroup namespaces: not yet.
+    pub const UNSUPPORTED: u64 = 0x0e00_0000;
 }
 
 /// `fork`, `vfork` and `clone`. `frame` is the parent's saved user state;
@@ -539,12 +543,12 @@ pub fn clone(
     if flags & UNSUPPORTED != 0 || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0) {
         return Err(Errno::EINVAL);
     }
-    // A new namespace cannot share the caller's thread group (nor, for a
-    // user namespace, its filesystem state); the init of a PID namespace
-    // cannot give itself siblings.
+    // A new namespace cannot share the caller's thread group, and a new
+    // user or mount namespace cannot share its filesystem state; the init
+    // of a PID namespace cannot give itself siblings.
     let me = &t.process;
-    if (flags & (CLONE_NEWUSER | CLONE_NEWPID) != 0 && flags & CLONE_THREAD != 0)
-        || (flags & CLONE_NEWUSER != 0 && flags & CLONE_FS != 0)
+    if (flags & (CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS) != 0 && flags & CLONE_THREAD != 0)
+        || (flags & (CLONE_NEWUSER | CLONE_NEWNS) != 0 && flags & CLONE_FS != 0)
         || (flags & CLONE_PARENT != 0 && me.pid_ns.level > 0 && me.pid_ns.reaper() == me.pid)
     {
         return Err(Errno::EINVAL);
@@ -617,6 +621,11 @@ pub fn clone(
         ns::NetNs::new()
     } else {
         parent.net_ns.lock().clone()
+    };
+    *child.mnt_ns.get_mut() = if flags & CLONE_NEWNS != 0 {
+        ns::MntNs::copy_of(&parent.mnt_ns.lock())
+    } else {
+        parent.mnt_ns.lock().clone()
     };
     child.trace = AtomicU32::new(parent.trace.load(Ordering::Relaxed));
     *child.sigactions.get_mut() = *parent.sigactions.lock();

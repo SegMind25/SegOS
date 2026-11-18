@@ -172,6 +172,10 @@ fn ns_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
                 "net:[{}]",
                 p.net_ns.lock().ino
             ))),
+            entry("mnt", 0x28, |p| Ok(format!(
+                "mnt:[{}]",
+                p.mnt_ns.lock().ino
+            ))),
             entry("user", 0x26, |p| Ok(format!(
                 "user:[{}]",
                 p.user_ns.lock().ino
@@ -386,8 +390,17 @@ fn loadavg() -> String {
     format!("0.00 0.00 0.00 1/{} {last}\n", all.len())
 }
 
+/// `/proc/mounts`: the reading process's mount table.
 fn mounts() -> String {
-    let mounts = super::mount::all();
+    mount_list(super::mount::all())
+}
+
+/// `/proc/<pid>/mounts`: that process's mount table.
+fn process_mounts(p: &Process) -> String {
+    mount_list(super::mount::all_in(&p.mnt_ns.lock()))
+}
+
+fn mount_list(mounts: Vec<Arc<super::mount::Mount>>) -> String {
     let mut s = String::new();
     if !mounts.iter().any(|m| m.path == "/") {
         s.push_str("rootfs / rootfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n");
@@ -635,6 +648,10 @@ fn pid_dir(pid: u32, parent: &Arc<dyn Inode>) -> Arc<dyn Inode> {
             ("fd".into(), fd_dir(pid, me)),
             ("task".into(), task_dir(pid, me)),
             ("maps".into(), file(ino_of(pid, 0x10), me, with(pid_maps))),
+            (
+                "mounts".into(),
+                file(ino_of(pid, 0x29), me, with(process_mounts))
+            ),
             (
                 "uid_map".into(),
                 id_map(pid, Ids::Uid, ino_of(pid, 0x20), me)

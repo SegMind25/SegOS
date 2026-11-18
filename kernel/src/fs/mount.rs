@@ -4,10 +4,14 @@
 //! file system. Path lookup crosses down into the mounted root when it
 //! reaches a mount point, and back up to the mount point on "..".
 //! Inodes are told apart by (st_dev, st_ino), as on Linux.
+//!
+//! Every process has a mount namespace with its own table (see
+//! `proc::ns::MntNs`); calls made without a current process — booting, for
+//! instance — use the initial namespace.
 
 use super::{FileType, Inode};
 use crate::abi::{Errno, KResult};
-use crate::sync::SpinLock;
+use crate::proc::ns::{MntNs, current_mnt};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -41,7 +45,7 @@ pub struct Mount {
     pub info: Option<Arc<dyn FsInfo>>,
 }
 
-static MOUNTS: SpinLock<Vec<Arc<Mount>>> = SpinLock::new(Vec::new());
+/// Mount ids are unique across namespaces, as Linux's are.
 static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 fn same(a: &Arc<dyn Inode>, b: &Arc<dyn Inode>) -> bool {
@@ -54,7 +58,8 @@ pub fn cross_down(inode: Arc<dyn Inode>) -> Arc<dyn Inode> {
     if inode.file_type() != FileType::Directory {
         return inode;
     }
-    let mounts = MOUNTS.lock();
+    let ns = current_mnt();
+    let mounts = ns.mounts.lock();
     let mut cur = inode;
     for _ in 0..16 {
         match mounts.iter().rev().find(|m| same(&m.point, &cur)) {
@@ -68,7 +73,8 @@ pub fn cross_down(inode: Arc<dyn Inode>) -> Arc<dyn Inode> {
 /// If `inode` is the root of a mounted file system, the directory it
 /// covers (repeatedly, for stacked mounts); otherwise `inode` itself.
 pub fn cross_up(inode: Arc<dyn Inode>) -> Arc<dyn Inode> {
-    let mounts = MOUNTS.lock();
+    let ns = current_mnt();
+    let mounts = ns.mounts.lock();
     let mut cur = inode;
     for _ in 0..16 {
         match mounts.iter().rev().find(|m| same(&m.root, &cur)) {
@@ -79,9 +85,10 @@ pub fn cross_up(inode: Arc<dyn Inode>) -> Arc<dyn Inode> {
     cur
 }
 
-/// The mount whose root is `inode`.
+/// The mount whose root is `inode`, in the caller's namespace.
 pub fn mount_at(inode: &Arc<dyn Inode>) -> Option<Arc<Mount>> {
-    MOUNTS
+    let ns = current_mnt();
+    ns.mounts
         .lock()
         .iter()
         .rev()
@@ -91,7 +98,8 @@ pub fn mount_at(inode: &Arc<dyn Inode>) -> Option<Arc<Mount>> {
 
 /// The innermost mount `inode` belongs to (by st_dev), for statfs.
 pub fn mount_of_dev(dev: u64) -> Option<Arc<Mount>> {
-    MOUNTS
+    let ns = current_mnt();
+    ns.mounts
         .lock()
         .iter()
         .rev()
@@ -111,7 +119,8 @@ pub fn add(
     if point.file_type() != FileType::Directory || root.file_type() != FileType::Directory {
         return Err(Errno::ENOTDIR);
     }
-    MOUNTS.lock().push(Arc::new(Mount {
+    let ns = current_mnt();
+    ns.mounts.lock().push(Arc::new(Mount {
         id: NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
         point,
         root,
@@ -127,7 +136,8 @@ pub fn add(
 /// Detaches the mount whose root is `root`; EBUSY if another mount sits
 /// inside it.
 pub fn remove(root: &Arc<dyn Inode>) -> KResult<Arc<Mount>> {
-    let mut mounts = MOUNTS.lock();
+    let ns = current_mnt();
+    let mut mounts = ns.mounts.lock();
     let i = mounts
         .iter()
         .rposition(|m| same(&m.root, root))
@@ -148,7 +158,8 @@ pub fn remove(root: &Arc<dyn Inode>) -> KResult<Arc<Mount>> {
 
 /// Moves the mount whose root is `root` onto `point` (`mount --move`).
 pub fn move_to(root: &Arc<dyn Inode>, point: Arc<dyn Inode>, path: &str) -> KResult<()> {
-    let mut mounts = MOUNTS.lock();
+    let ns = current_mnt();
+    let mut mounts = ns.mounts.lock();
     let i = mounts
         .iter()
         .rposition(|m| same(&m.root, root))
@@ -168,7 +179,8 @@ pub fn move_to(root: &Arc<dyn Inode>, point: Arc<dyn Inode>, path: &str) -> KRes
 }
 
 pub fn set_read_only(root: &Arc<dyn Inode>, ro: bool) -> KResult<()> {
-    let mut mounts = MOUNTS.lock();
+    let ns = current_mnt();
+    let mut mounts = ns.mounts.lock();
     let i = mounts
         .iter()
         .rposition(|m| same(&m.root, root))
@@ -190,7 +202,8 @@ pub fn set_read_only(root: &Arc<dyn Inode>, ro: bool) -> KResult<()> {
 
 /// Whether the file system with this st_dev is mounted read-only.
 pub fn is_read_only(dev: u64) -> bool {
-    MOUNTS
+    let ns = current_mnt();
+    ns.mounts
         .lock()
         .iter()
         .rev()
@@ -198,6 +211,13 @@ pub fn is_read_only(dev: u64) -> bool {
         .is_some_and(|m| m.read_only)
 }
 
+/// The caller's mount table, for `/proc/mounts`.
 pub fn all() -> Vec<Arc<Mount>> {
-    MOUNTS.lock().clone()
+    let ns = current_mnt();
+    ns.mounts.lock().clone()
+}
+
+/// A particular process's mount table, for `/proc/<pid>/mounts`.
+pub fn all_in(ns: &Arc<MntNs>) -> Vec<Arc<Mount>> {
+    ns.mounts.lock().clone()
 }

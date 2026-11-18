@@ -398,9 +398,9 @@ The demo: Firefox and Chromium run on the Wayland desktop.
 
 1. **GPU**: virtio-gpu with 3D (virgl) or a Mesa software path (llvmpipe)
    over shared memory; atomic KMS.
-2. **What browsers need**: seccomp-BPF, `inotify`, user and PID
-   namespaces, `/dev/shm`, fontconfig and a D-Bus session bus (all done,
-   below), network namespaces, `chroot` and CLONE_FS; mount namespaces.
+2. **What browsers need**: seccomp-BPF, `inotify`, user, PID, network and
+   mount namespaces, `/dev/shm`, fontconfig, a D-Bus session bus, `chroot`
+   and CLONE_FS (all done, below).
 
    *Done so far.* Firefox renders a page headless (a screenshot), and
    the shell session has a step that runs it on weston (it runs where
@@ -417,9 +417,15 @@ The demo: Firefox and Chromium run on the Wayland desktop.
    kill/tkill/tgkill, process groups and sessions, SIGCHLD and the
    `set_tid_address`/`CLONE_*SETTID` values are translated.
    `userland/tests/namespaces.c` prints the same on Linux, as root or
-   not, and on SegOS. Not yet: mount, UTS, IPC and cgroup
-   namespaces (EINVAL), `setns`, `/proc` mounted per PID namespace,
-   capabilities (everything is root). **`/dev/shm`**, **fontconfig**
+   not, and on SegOS. **Mount namespaces** (`proc/ns.rs`, `fs/mount.rs`):
+   `clone` and `unshare` with CLONE_NEWNS give the caller a private copy
+   of the mount table, so mounts and unmounts there do not affect other
+   namespaces (CLONE_NEWNS with CLONE_FS or CLONE_THREAD is EINVAL, as on
+   Linux); `/proc/<pid>/ns/mnt`, the caller's `/proc/mounts` and
+   `/proc/<pid>/mounts` show the right table. `tests/namespaces` mounts a
+   tmpfs in one namespace and checks it is invisible in the parent's. Not
+   yet: UTS, IPC and cgroup namespaces (EINVAL), `setns`, `/proc` mounted
+   per PID namespace, capabilities (everything is root). **`/dev/shm`**, **fontconfig**
    and **D-Bus**: the shell session creates POSIX shared memory from
    Python, `fc-match` finds DejaVu Sans, and `dbus-run-session` starts
    Ubuntu's `dbus-daemon`, which answers `dbus-send`. **Network

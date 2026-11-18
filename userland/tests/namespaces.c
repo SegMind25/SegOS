@@ -6,11 +6,12 @@
  * numbering of its children, the reaping of orphans and the signals init
  * ignores in a new PID namespace; and the end of the namespace with its
  * init; network namespaces (nothing reachable, abstract unix names of
- * their own); chroot, and CLONE_FS sharing the root, working directory
- * and umask (Chromium chroots its sandbox into a dead process's
- * /proc/<pid>/fdinfo that way). `cargo xtask test` runs it on Linux and on SegOS; both must print
- * exactly namespaces.expected and exit with 0. It never prints an id, so
- * the output is the same whoever runs it.
+ * their own); mount namespaces (a private mount table, a tmpfs mount
+ * invisible outside it); chroot, and CLONE_FS sharing the root, working
+ * directory and umask (Chromium chroots its sandbox into a dead process's
+ * /proc/<pid>/fdinfo that way). `cargo xtask test` runs it on Linux and on
+ * SegOS; both must print exactly namespaces.expected and exit with 0. It
+ * never prints an id, so the output is the same whoever runs it.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -27,6 +28,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/syscall.h>
@@ -129,9 +131,11 @@ static void initial(void)
 	CHECK(read_file("/proc/self/gid_map") > 0 && is_map(0, 0, 4294967295u));
 	CHECK(read_file("/proc/self/setgroups") > 0 && strcmp(buf, "allow\n") == 0);
 	CHECK(write_file("/proc/self/uid_map", "0 0 1") == -1 && errno == EPERM);
-	/* A user namespace cannot share filesystem state, a new namespace
-	 * cannot share the thread group. */
+	/* A user or mount namespace cannot share filesystem state, a new
+	 * namespace cannot share the thread group. */
 	CHECK(syscall(SYS_clone, CLONE_NEWUSER | CLONE_FS | SIGCHLD, 0, 0, 0, 0) == -1 &&
+	      errno == EINVAL);
+	CHECK(syscall(SYS_clone, CLONE_NEWNS | CLONE_FS | SIGCHLD, 0, 0, 0, 0) == -1 &&
 	      errno == EINVAL);
 	CHECK(syscall(SYS_clone, CLONE_NEWPID | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM, 0, 0, 0, 0) == -1 &&
 	      errno == EINVAL);
@@ -438,12 +442,78 @@ static void chromium_chroot(void)
 	CHECK(open("/etc/passwd", O_RDONLY) == -1 && errno == ESRCH);
 }
 
+/* --- mount namespaces ------------------------------------------------- */
+
+static char mnt_dir[] = "/tmp/nsmntXXXXXX";
+/* /proc/mounts has many lines on Linux: read all of it, not just a
+ * screenful, before looking for our mount point. */
+static char bigbuf[65536];
+
+static int read_all(const char *path)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	size_t n = 0;
+	ssize_t r;
+	while (n < sizeof bigbuf - 1 && (r = read(fd, bigbuf + n, sizeof bigbuf - 1 - n)) > 0)
+		n += (size_t)r;
+	close(fd);
+	bigbuf[n] = 0;
+	return (int)n;
+}
+
+static void mnt_ns_child(int ready, int go)
+{
+	char before[64], after[64], c = 0;
+	ns_link("mnt", before, sizeof before);
+	CHECK(strncmp(before, "mnt:[", 5) == 0);
+	CHECK(unshare(CLONE_NEWUSER | CLONE_NEWNS) == 0);
+	ns_link("mnt", after, sizeof after);
+	CHECK(strncmp(after, "mnt:[", 5) == 0 && strcmp(before, after) != 0);
+	CHECK(mount("tmpfs", mnt_dir, "tmpfs", 0, NULL) == 0);
+	CHECK(read_all("/proc/self/mounts") > 0 && strstr(bigbuf, mnt_dir) != NULL);
+	/* Hold the mount in place until the parent has looked at its own
+	 * table and at ours through /proc/<pid>/mounts. */
+	CHECK(write(ready, &c, 1) == 1);
+	CHECK(read(go, &c, 1) == 1);
+}
+
+static void mount_ns(void)
+{
+	int ready[2], go[2];
+	char c = 0, path[64];
+
+	CHECK(pipe(ready) == 0 && pipe(go) == 0);
+	fflush(stdout);
+	pid_t pid = fork();
+	if (pid == 0) {
+		close(ready[0]);
+		close(go[1]);
+		mnt_ns_child(ready[1], go[0]);
+		fflush(stdout);
+		_exit(failures ? 1 : 0);
+	}
+	close(ready[1]);
+	close(go[0]);
+	CHECK(pid > 0 && read(ready[0], &c, 1) == 1);
+	/* The parent keeps the initial namespace: the child's mount is
+	 * invisible in its own /proc/mounts, but visible through its pid. */
+	CHECK(read_all("/proc/self/mounts") > 0 && strstr(bigbuf, mnt_dir) == NULL);
+	snprintf(path, sizeof path, "/proc/%d/mounts", pid);
+	CHECK(read_all(path) > 0 && strstr(bigbuf, mnt_dir) != NULL);
+	CHECK(write(go[1], &c, 1) == 1);
+	int status = 0;
+	CHECK(waitpid(pid, &status, 0) == pid);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 int main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	outer_uid = getuid();
 	outer_gid = getgid();
-	if (!mkdtemp(dir))
+	if (!mkdtemp(dir) || !mkdtemp(mnt_dir))
 		return 2;
 	snprintf(file, sizeof file, "%s/f", dir);
 	close(open(file, O_CREAT | O_WRONLY, 0644));
@@ -463,6 +533,8 @@ int main(void)
 	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	section("network namespace");
 	net();
+	section("mount namespace");
+	mount_ns();
 	section("chroot and CLONE_FS");
 	status = in_child(chroot_fs);
 	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -470,6 +542,7 @@ int main(void)
 	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	unlink(file);
 	rmdir(dir);
+	rmdir(mnt_dir);
 	printf("%s\n", failures ? "FAILED" : "PASSED");
 	return failures ? 1 : 0;
 }

@@ -277,17 +277,18 @@ pub fn sigaltstack(ctx: &Ctx, frame: &TrapFrame, new: u64, old: u64) -> KResult<
     Ok(0)
 }
 
-/// `unshare(flags)`: a new user namespace for the caller, or a new PID
-/// namespace for its children, a new network namespace; CLONE_FS stops
+/// `unshare(flags)`: a new user, mount or network namespace for the
+/// caller, or a new PID namespace for its children; CLONE_FS stops
 /// sharing the filesystem state; CLONE_FILES and CLONE_SYSVSEM change
 /// nothing (descriptor tables are never shared); CLONE_THREAD,
 /// CLONE_SIGHAND and CLONE_VM only for a single-threaded caller.
 pub fn unshare(ctx: &Ctx, flags: u64) -> KResult<u64> {
     use proc::clone_flags::*;
-    use proc::ns::{PidNs, UserNs};
+    use proc::ns::{MntNs, PidNs, UserNs};
     let known = CLONE_NEWUSER
         | CLONE_NEWPID
         | CLONE_NEWNET
+        | CLONE_NEWNS
         | CLONE_FILES
         | CLONE_FS
         | CLONE_SYSVSEM
@@ -329,6 +330,13 @@ pub fn unshare(ctx: &Ctx, flags: u64) -> KResult<u64> {
     }
     if flags & CLONE_NEWNET != 0 {
         *p.net_ns.lock() = proc::ns::NetNs::new();
+    }
+    if flags & CLONE_NEWNS != 0 {
+        let own = {
+            let current = p.mnt_ns.lock();
+            MntNs::copy_of(&current)
+        };
+        *p.mnt_ns.lock() = own;
     }
     if let Some(n) = pid {
         *p.child_pid_ns.lock() = n;

@@ -1309,8 +1309,8 @@ fn make_fs(
 
 /// `mount(source, target, fstype, flags, data)`: new mounts of tmpfs,
 /// proc, devtmpfs and ext2/3/4 (read-only for now), bind mounts,
-/// read-only remounts. Propagation changes are accepted and mean nothing
-/// (there is one mount namespace).
+/// read-only remounts. Propagation changes are accepted and mean nothing;
+/// mounts affect only the calling process's mount namespace.
 pub fn mount(ctx: &Ctx, source: u64, target: u64, fstype: u64, flags: u64) -> KResult<u64> {
     const MS_RDONLY: u64 = 1;
     const MS_REMOUNT: u64 = 32;

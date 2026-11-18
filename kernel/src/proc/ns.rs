@@ -1,5 +1,5 @@
-//! User and PID namespaces (`clone`/`unshare` with CLONE_NEWUSER and
-//! CLONE_NEWPID), as browser sandboxes use them.
+//! Namespaces (`clone`/`unshare` with CLONE_NEWUSER, CLONE_NEWPID,
+//! CLONE_NEWNET and CLONE_NEWNS), as browser sandboxes use them.
 //!
 //! Every process runs as root (kernel uid and gid 0). A user namespace
 //! only changes how ids look from inside it: through its `uid_map` and
@@ -11,6 +11,7 @@
 //! namespace is killed and no process can be created in it any more.
 
 use crate::abi::{Errno, KResult};
+use crate::fs::mount::Mount;
 use crate::sync::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -333,6 +334,48 @@ pub fn current_net() -> Arc<NetNs> {
         .user()
         .map(|u| u.process.net_ns.lock().clone())
         .unwrap_or_else(NetNs::initial)
+}
+
+/// A mount namespace: a private mount table. A new one starts with a copy
+/// of its parent's mounts, which can then be changed independently — the
+/// isolation `unshare(CLONE_NEWNS)` gives a browser sandbox.
+pub struct MntNs {
+    pub ino: u64,
+    pub(crate) mounts: SpinLock<Vec<Arc<Mount>>>,
+}
+
+static INIT_MNT: SpinLock<Option<Arc<MntNs>>> = SpinLock::new(None);
+
+impl MntNs {
+    pub fn initial() -> Arc<MntNs> {
+        INIT_MNT
+            .lock()
+            .get_or_insert_with(|| {
+                Arc::new(MntNs {
+                    ino: new_ino(),
+                    mounts: SpinLock::new(Vec::new()),
+                })
+            })
+            .clone()
+    }
+
+    /// A new namespace with a copy of `from`'s mount table. `Mount`s are
+    /// immutable: later additions and removals only touch this namespace's
+    /// vector, so the two views diverge from here.
+    pub fn copy_of(from: &Arc<MntNs>) -> Arc<MntNs> {
+        Arc::new(MntNs {
+            ino: new_ino(),
+            mounts: SpinLock::new(from.mounts.lock().clone()),
+        })
+    }
+}
+
+/// The mount namespace of the calling process (the initial one for the
+/// kernel's own work, where there is no current process).
+pub fn current_mnt() -> Arc<MntNs> {
+    crate::task::try_current()
+        .and_then(|t| t.user().map(|u| u.process.mnt_ns.lock().clone()))
+        .unwrap_or_else(MntNs::initial)
 }
 
 /// Whether `a..a+n` and `b..b+m` share an id.
