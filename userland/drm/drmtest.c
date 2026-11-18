@@ -97,8 +97,50 @@ struct drm_event_vblank {
 	uint32_t tv_sec, tv_usec, sequence, crtc_id;
 };
 
+struct drm_set_client_cap {
+	uint64_t capability, value;
+};
+
+struct drm_mode_get_property {
+	uint64_t values_ptr, enum_blob_ptr;
+	uint32_t prop_id, flags;
+	char name[32];
+	uint32_t count_values, count_enum_blobs;
+};
+
+struct drm_mode_obj_get_properties {
+	uint64_t props_ptr, prop_values_ptr;
+	uint32_t count_props, obj_id, obj_type;
+};
+
+struct drm_mode_get_plane_res {
+	uint64_t plane_id_ptr;
+	uint32_t count_planes;
+};
+
+struct drm_mode_atomic {
+	uint32_t flags, count_objs;
+	uint64_t objs_ptr, count_props_ptr, props_ptr, prop_values_ptr;
+	uint64_t reserved, user_data;
+};
+
+struct drm_mode_create_blob {
+	uint64_t data;
+	uint32_t length, blob_id;
+};
+
+struct drm_mode_get_blob {
+	uint32_t blob_id, length;
+	uint64_t data;
+};
+
+struct drm_mode_destroy_blob {
+	uint32_t blob_id;
+};
+
 #define D(nr, t) _IOWR('d', nr, struct t)
 #define DRM_IOCTL_VERSION D(0x00, drm_version)
+#define DRM_IOCTL_SET_CLIENT_CAP D(0x0d, drm_set_client_cap)
 #define DRM_IOCTL_GET_CAP D(0x0c, drm_get_cap)
 #define DRM_IOCTL_MODE_GETRESOURCES D(0xa0, drm_mode_card_res)
 #define DRM_IOCTL_MODE_GETCRTC D(0xa1, drm_mode_crtc)
@@ -109,11 +151,27 @@ struct drm_event_vblank {
 #define DRM_IOCTL_MODE_CREATE_DUMB D(0xb2, drm_mode_create_dumb)
 #define DRM_IOCTL_MODE_MAP_DUMB D(0xb3, drm_mode_map_dumb)
 #define DRM_IOCTL_MODE_ADDFB2 D(0xb8, drm_mode_fb_cmd2)
+#define DRM_IOCTL_MODE_OBJ_GETPROPERTIES D(0xb9, drm_mode_obj_get_properties)
+#define DRM_IOCTL_MODE_GETPROPBLOB D(0xac, drm_mode_get_blob)
+#define DRM_IOCTL_MODE_GETPROPERTY D(0xaa, drm_mode_get_property)
+#define DRM_IOCTL_MODE_GETPLANERESOURCES D(0xb5, drm_mode_get_plane_res)
+#define DRM_IOCTL_MODE_ATOMIC D(0xbc, drm_mode_atomic)
+#define DRM_IOCTL_MODE_CREATEPROPBLOB D(0xbd, drm_mode_create_blob)
+#define DRM_IOCTL_MODE_DESTROYPROPBLOB D(0xbe, drm_mode_destroy_blob)
 
 #define DRM_CAP_DUMB_BUFFER 0x1
+#define DRM_CLIENT_CAP_UNIVERSAL_PLANES 2
+#define DRM_CLIENT_CAP_ATOMIC 3
 #define DRM_MODE_PAGE_FLIP_EVENT 0x01
 #define DRM_EVENT_FLIP_COMPLETE 0x02
 #define DRM_FORMAT_XRGB8888 0x34325258 /* 'XR24' */
+#define DRM_MODE_OBJECT_CRTC 0xcccccccc
+#define DRM_MODE_OBJECT_CONNECTOR 0xc0c0c0c0
+#define DRM_MODE_OBJECT_PLANE 0xeeeeeeee
+#define DRM_MODE_PROP_BLOB (1 << 4)
+#define DRM_MODE_PROP_ATOMIC 0x80000000
+#define DRM_MODE_ATOMIC_TEST_ONLY 0x0100
+#define DRM_MODE_ATOMIC_ALLOW_MODESET 0x0400
 
 #define EVIOCGVERSION _IOR('E', 0x01, int)
 #define EVIOCGNAME(len) _IOC(_IOC_READ, 'E', 0x06, len)
@@ -228,6 +286,125 @@ static void evdev(void)
 	close(fd);
 }
 
+/* --- atomic modesetting ------------------------------------------------ */
+
+/* Finds a named property on a mode object and returns its current value. */
+static uint32_t find_prop(uint32_t obj_type, uint32_t obj_id, const char *name,
+			  uint64_t *value)
+{
+	struct drm_mode_obj_get_properties p = {
+	    .obj_id = obj_id,
+	    .obj_type = obj_type,
+	};
+	io(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &p, "OBJ_GETPROPERTIES (counts)");
+	check(p.count_props > 0 && p.count_props <= 32,
+	      "OBJ_GETPROPERTIES: odd count");
+	uint32_t ids[32];
+	uint64_t vals[32];
+	p.props_ptr = (uintptr_t)ids;
+	p.prop_values_ptr = (uintptr_t)vals;
+	io(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &p, "OBJ_GETPROPERTIES");
+	for (uint32_t i = 0; i < p.count_props; i++) {
+		struct drm_mode_get_property q = {.prop_id = ids[i]};
+		io(DRM_IOCTL_MODE_GETPROPERTY, &q, "GETPROPERTY");
+		if (strcmp(q.name, name) == 0) {
+			*value = vals[i];
+			return ids[i];
+		}
+	}
+	return 0;
+}
+
+static void atomic_kms(uint32_t crtc, uint32_t conn, uint32_t fb,
+		       const struct drm_mode_modeinfo *mode)
+{
+	struct drm_set_client_cap cap = {
+	    .capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+	    .value = 1,
+	};
+	io(DRM_IOCTL_SET_CLIENT_CAP, &cap, "SET_CLIENT_CAP(UNIVERSAL_PLANES)");
+	cap.capability = DRM_CLIENT_CAP_ATOMIC;
+	io(DRM_IOCTL_SET_CLIENT_CAP, &cap, "SET_CLIENT_CAP(ATOMIC)");
+
+	struct drm_mode_get_plane_res pres = {0};
+	io(DRM_IOCTL_MODE_GETPLANERESOURCES, &pres,
+	   "GETPLANERESOURCES (counts)");
+	check(pres.count_planes == 1, "no primary plane");
+	uint32_t planes[4] = {0};
+	pres.plane_id_ptr = (uintptr_t)planes;
+	io(DRM_IOCTL_MODE_GETPLANERESOURCES, &pres, "GETPLANERESOURCES");
+	uint32_t plane = planes[0];
+
+	uint64_t active = 2;
+	uint32_t p_active =
+	    find_prop(DRM_MODE_OBJECT_CRTC, crtc, "ACTIVE", &active);
+	uint32_t p_mode =
+	    find_prop(DRM_MODE_OBJECT_CRTC, crtc, "MODE_ID", &active);
+	uint32_t p_crtc_conn =
+	    find_prop(DRM_MODE_OBJECT_CONNECTOR, conn, "CRTC_ID", &active);
+	uint32_t p_fb =
+	    find_prop(DRM_MODE_OBJECT_PLANE, plane, "FB_ID", &active);
+	uint32_t p_crtc_plane =
+	    find_prop(DRM_MODE_OBJECT_PLANE, plane, "CRTC_ID", &active);
+	check(p_active && p_mode && p_crtc_conn && p_fb && p_crtc_plane,
+	      "missing atomic properties");
+	check(active <= 1, "CRTC_ID out of range");
+
+	struct drm_mode_get_property q = {.prop_id = p_mode};
+	io(DRM_IOCTL_MODE_GETPROPERTY, &q, "GETPROPERTY(MODE_ID)");
+	check((q.flags & DRM_MODE_PROP_BLOB) && (q.flags & DRM_MODE_PROP_ATOMIC),
+	      "MODE_ID is not an atomic blob property");
+	check(strcmp(q.name, "MODE_ID") == 0, "MODE_ID has the wrong name");
+
+	struct drm_mode_create_blob blob = {
+	    .data = (uintptr_t)mode,
+	    .length = sizeof *mode,
+	};
+	io(DRM_IOCTL_MODE_CREATEPROPBLOB, &blob, "CREATEPROPBLOB");
+	check(blob.blob_id != 0, "CREATEPROPBLOB gave no id");
+	uint8_t mode_copy[sizeof *mode];
+	struct drm_mode_get_blob got_blob = {
+	    .blob_id = blob.blob_id,
+	    .length = sizeof *mode,
+	    .data = (uintptr_t)mode_copy,
+	};
+	io(DRM_IOCTL_MODE_GETPROPBLOB, &got_blob, "GETPROPBLOB");
+	check(got_blob.length == sizeof *mode &&
+		  memcmp(mode_copy, mode, sizeof *mode) == 0,
+	      "GETPROPBLOB returned the wrong data");
+
+	uint32_t objects[3] = {crtc, conn, plane};
+	uint32_t counts[3] = {2, 1, 2};
+	uint32_t props[5] = {p_active, p_mode, p_crtc_conn, p_fb, p_crtc_plane};
+	uint64_t values[5] = {1, blob.blob_id, crtc, fb, crtc};
+	struct drm_mode_atomic a = {
+	    .flags = DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET,
+	    .count_objs = 3,
+	    .objs_ptr = (uintptr_t)objects,
+	    .count_props_ptr = (uintptr_t)counts,
+	    .props_ptr = (uintptr_t)props,
+	    .prop_values_ptr = (uintptr_t)values,
+	    .user_data = 0xa70c0001,
+	};
+	io(DRM_IOCTL_MODE_ATOMIC, &a, "ATOMIC(TEST_ONLY)");
+
+	a.flags = DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT;
+	io(DRM_IOCTL_MODE_ATOMIC, &a, "ATOMIC(COMMIT)");
+	struct drm_event_vblank ev;
+	ssize_t n = read(card, &ev, sizeof ev);
+	check(n == 32 && ev.type == DRM_EVENT_FLIP_COMPLETE &&
+		  ev.user_data == 0xa70c0001,
+	      "atomic flip event");
+
+	struct drm_mode_crtc got = {.crtc_id = crtc};
+	io(DRM_IOCTL_MODE_GETCRTC, &got, "GETCRTC after atomic");
+	check(got.fb_id == fb, "GETCRTC: atomic framebuffer not visible");
+
+	struct drm_mode_destroy_blob del = {.blob_id = blob.blob_id};
+	io(DRM_IOCTL_MODE_DESTROYPROPBLOB, &del, "DESTROYPROPBLOB");
+	printf("drm: atomic KMS: properties, blob, TEST_ONLY and COMMIT ok\n");
+}
+
 int main(int argc, char **argv)
 {
 	int pause_first = argc > 1 && strcmp(argv[1], "--pause") == 0;
@@ -336,6 +513,7 @@ int main(int argc, char **argv)
 	check(ev.length == 32 && ev.user_data == 0x5e605e60,
 	      "flip event length or user_data wrong");
 
+	atomic_kms(crtc, conn.connector_id, b.fb, &mode);
 	printf("DRMTEST-OK %ux%u\n", w, h);
 	for (;;)
 		pause();

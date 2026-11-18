@@ -379,7 +379,15 @@ reaching the client, and the console back after weston exits.
   firmware framebuffer, one CRTC, primary plane, encoder and connector;
   dumb buffers mapped with `mmap`, ADDFB/ADDFB2, SETCRTC, PAGE_FLIP with
   events, DIRTYFB. The console steps aside while a program shows a
-  picture. `userland/drm/drmtest.c` checks it pixel by pixel.
+  picture. `userland/drm/drmtest.c` checks it pixel by pixel. **Atomic
+  KMS**: `SET_CLIENT_CAP(ATOMIC)` is accepted, CRTC/connector/plane have
+  `ACTIVE`, `MODE_ID`, `CRTC_ID`, `FB_ID` and the source/destination
+  rectangle properties (with `DRM_MODE_PROP_ATOMIC`), blob properties can
+  be created/read/destroyed, `OBJ_SETPROPERTY` stores values, and the
+  `MODE_ATOMIC` ioctl validates a whole transaction (including TEST_ONLY)
+  before applying it and queueing a flip event; legacy and atomic paths
+  share one scanout state. `drmtest` checks the properties, a mode blob,
+  TEST_ONLY, COMMIT and GETCRTC after the commit.
 - **Input** (`input.rs`): evdev `/dev/input/event0` (keyboard, Linux key
   codes) and `event1` (a new PS/2 mouse driver with wheel), the evdev
   ioctls, EVIOCGRAB; terminal KD/VT ioctls (graphics mode, keyboard off).
@@ -389,15 +397,15 @@ reaching the client, and the console back after weston exits.
   `mremap` (grow, shrink, move; wl_shm pools), `flock`, `fallocate`,
   `O_PATH` on symbolic links, `statx` mount ids, SYSFS_MAGIC.
 
-Not yet: GPU acceleration (virtio-gpu, then AMD/Intel), atomic KMS,
-hardware cursors, USB (xHCI) keyboards and mice, dma-buf.
+Not yet: GPU acceleration (virtio-gpu, then AMD/Intel), hardware cursors,
+USB (xHCI) keyboards and mice, dma-buf.
 
 ## 14. Next concrete steps (Phase 8: desktop applications)
 
 The demo: Firefox and Chromium run on the Wayland desktop.
 
 1. **GPU**: virtio-gpu with 3D (virgl) or a Mesa software path (llvmpipe)
-   over shared memory; atomic KMS.
+   over shared memory; atomic KMS (done, above).
 2. **What browsers need**: seccomp-BPF, `inotify`, user, PID, network and
    mount namespaces, `/dev/shm`, fontconfig, a D-Bus session bus, `chroot`
    and CLONE_FS (all done, below).

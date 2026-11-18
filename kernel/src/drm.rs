@@ -9,7 +9,8 @@
 //! screen (and again on DIRTYFB). Page flips complete at once and send
 //! their event. While a program shows its own picture the text console
 //! stays off the screen; when its last file closes, the console returns.
-//! Legacy KMS only (no atomic), no GPU rendering, no PRIME.
+//! Atomic modesetting (properties, blobs and the ATOMIC ioctl) is offered
+//! alongside the legacy ioctls; there is no GPU rendering or PRIME.
 
 use crate::abi::{Errno, KResult};
 use crate::fs::{FileType, Inode, new_ino, poll};
@@ -29,6 +30,31 @@ const CONNECTOR: u32 = 0x22;
 const PLANE: u32 = 0x23;
 const PROP_TYPE: u32 = 0x30;
 const PROP_DPMS: u32 = 0x31;
+// Atomic properties (DRM_MODE_PROP_* flags in get_property).
+const PROP_ACTIVE: u32 = 0x32;
+const PROP_MODE_ID: u32 = 0x33;
+const PROP_CRTC_ID: u32 = 0x34;
+const PROP_FB_ID: u32 = 0x35;
+const PROP_SRC_X: u32 = 0x36;
+const PROP_SRC_Y: u32 = 0x37;
+const PROP_SRC_W: u32 = 0x38;
+const PROP_SRC_H: u32 = 0x39;
+const PROP_CRTC_X: u32 = 0x3a;
+const PROP_CRTC_Y: u32 = 0x3b;
+const PROP_CRTC_W: u32 = 0x3c;
+const PROP_CRTC_H: u32 = 0x3d;
+// DRM_MODE_PROP_* type bits and the hidden-from-legacy atomic bit.
+const PROP_RANGE: u32 = 1 << 1;
+const PROP_ENUM: u32 = 1 << 3;
+const PROP_BLOB: u32 = 1 << 4;
+const PROP_OBJECT: u32 = 1 << 6;
+const PROP_IMMUTABLE: u32 = 1 << 2;
+const PROP_ATOMIC: u32 = 0x8000_0000;
+// DRM_MODE_ATOMIC_* flags.
+const ATOMIC_TEST_ONLY: u32 = 0x100;
+const ATOMIC_NONBLOCK: u32 = 0x200;
+const ATOMIC_ALLOW_MODESET: u32 = 0x400;
+const PAGE_FLIP_EVENT: u32 = 0x01;
 const OBJ_CRTC: u32 = 0xcccc_cccc;
 const OBJ_CONNECTOR: u32 = 0xc0c0_c0c0;
 const OBJ_PLANE: u32 = 0xeeee_eeee;
@@ -188,8 +214,16 @@ impl Inode for CardNode {
 struct State {
     buffers: BTreeMap<u32, Arc<Buffer>>,
     fbs: BTreeMap<u32, Arc<Fb>>,
+    /// Blob properties (notably MODE_ID), keyed by their object id.
+    blobs: BTreeMap<u32, Vec<u8>>,
     next_handle: u32,
     universal: bool,
+    /// The current atomic state of the CRTC, connector and primary plane.
+    crtc_active: bool,
+    crtc_mode: u32,
+    connector_crtc: u32,
+    plane_fb: u32,
+    plane_crtc: u32,
 }
 
 /// One open file of the card: its buffers, framebuffers and events.
@@ -261,6 +295,122 @@ fn put_u64s(mm: &AddressSpace, ptr: u64, cap: u32, v: &[u64]) -> KResult<u32> {
     Ok(v.len() as u32)
 }
 
+/// What `GETPROPERTY` reports about a property.
+struct PropMeta {
+    name: &'static str,
+    flags: u32,
+    values: &'static [u64],
+    enums: &'static [(u64, &'static str)],
+}
+
+fn prop_meta(id: u32) -> KResult<PropMeta> {
+    Ok(match id {
+        PROP_TYPE => PropMeta {
+            name: "type",
+            flags: PROP_ENUM | PROP_IMMUTABLE,
+            values: &[],
+            enums: &[(0, "Overlay"), (1, "Primary"), (2, "Cursor")],
+        },
+        PROP_DPMS => PropMeta {
+            name: "DPMS",
+            flags: PROP_ENUM,
+            values: &[],
+            enums: &[(0, "On"), (1, "Standby"), (2, "Suspend"), (3, "Off")],
+        },
+        PROP_ACTIVE => PropMeta {
+            name: "ACTIVE",
+            flags: PROP_RANGE | PROP_ATOMIC,
+            values: &[0, 1],
+            enums: &[],
+        },
+        PROP_MODE_ID => PropMeta {
+            name: "MODE_ID",
+            flags: PROP_BLOB | PROP_ATOMIC,
+            values: &[],
+            enums: &[],
+        },
+        PROP_CRTC_ID => PropMeta {
+            name: "CRTC_ID",
+            flags: PROP_OBJECT | PROP_ATOMIC,
+            values: &[],
+            enums: &[],
+        },
+        PROP_FB_ID => PropMeta {
+            name: "FB_ID",
+            flags: PROP_OBJECT | PROP_ATOMIC,
+            values: &[],
+            enums: &[],
+        },
+        PROP_SRC_X | PROP_SRC_Y | PROP_CRTC_X | PROP_CRTC_Y => PropMeta {
+            name: match id {
+                PROP_SRC_X => "SRC_X",
+                PROP_SRC_Y => "SRC_Y",
+                PROP_CRTC_X => "CRTC_X",
+                _ => "CRTC_Y",
+            },
+            flags: PROP_RANGE | PROP_ATOMIC,
+            values: &[0, 16384],
+            enums: &[],
+        },
+        PROP_SRC_W | PROP_SRC_H | PROP_CRTC_W | PROP_CRTC_H => PropMeta {
+            name: match id {
+                PROP_SRC_W => "SRC_W",
+                PROP_SRC_H => "SRC_H",
+                PROP_CRTC_W => "CRTC_W",
+                _ => "CRTC_H",
+            },
+            flags: PROP_RANGE | PROP_ATOMIC,
+            // Widths and heights are 16.16 fixed point.
+            values: &[0, (16384u64) << 16],
+            enums: &[],
+        },
+        _ => return Err(Errno::ENOENT),
+    })
+}
+
+/// Properties attached to each mode object, with their current values.
+fn object_props(st: &State, obj_type: u32) -> KResult<(Vec<u32>, Vec<u64>)> {
+    Ok(match obj_type {
+        OBJ_CRTC => (
+            alloc::vec![PROP_ACTIVE, PROP_MODE_ID],
+            alloc::vec![st.crtc_active as u64, st.crtc_mode as u64],
+        ),
+        OBJ_CONNECTOR => (
+            alloc::vec![PROP_CRTC_ID, PROP_DPMS],
+            alloc::vec![st.connector_crtc as u64, 0],
+        ),
+        OBJ_PLANE => (
+            alloc::vec![
+                PROP_TYPE,
+                PROP_FB_ID,
+                PROP_CRTC_ID,
+                PROP_SRC_X,
+                PROP_SRC_Y,
+                PROP_SRC_W,
+                PROP_SRC_H,
+                PROP_CRTC_X,
+                PROP_CRTC_Y,
+                PROP_CRTC_W,
+                PROP_CRTC_H,
+            ],
+            alloc::vec![
+                1, // primary plane
+                st.plane_fb as u64,
+                st.plane_crtc as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        _ => return Err(Errno::ENOENT),
+    })
+}
+
 impl DrmFile {
     fn queue_event(&self, ty: u32, user_data: u64) {
         let now = crate::time::monotonic_ns();
@@ -315,6 +465,129 @@ impl DrmFile {
             }),
         );
         Ok(id)
+    }
+
+    /// Applies one `DRM_MODE_ATOMIC` transaction: read the property arrays,
+    /// validate the whole state, then install it at once (or only validate
+    /// it for TEST_ONLY). The geometry is fixed to one full-screen plane,
+    /// so those properties are checked but do not change the blit.
+    fn atomic(&self, b: &[u8], mm: &AddressSpace) -> KResult<()> {
+        let flags = r32(b, 0);
+        if flags & !(ATOMIC_TEST_ONLY | ATOMIC_NONBLOCK | ATOMIC_ALLOW_MODESET | PAGE_FLIP_EVENT)
+            != 0
+        {
+            return Err(Errno::EINVAL);
+        }
+        let nobj = r32(b, 4) as usize;
+        if nobj > 64 {
+            return Err(Errno::EINVAL);
+        }
+        let (objs_ptr, counts_ptr) = (r64(b, 8), r64(b, 16));
+        let (props_ptr, vals_ptr) = (r64(b, 24), r64(b, 32));
+        let user_data = r64(b, 48);
+
+        let mut objs = Vec::with_capacity(nobj);
+        let mut counts = Vec::with_capacity(nobj);
+        for i in 0..nobj {
+            let mut x = [0u8; 4];
+            mm.copy_from(objs_ptr + i as u64 * 4, &mut x)?;
+            objs.push(u32::from_le_bytes(x));
+            mm.copy_from(counts_ptr + i as u64 * 4, &mut x)?;
+            counts.push(u32::from_le_bytes(x));
+        }
+        let total: usize = counts.iter().map(|&c| c as usize).sum();
+        if total > 256 {
+            return Err(Errno::EINVAL);
+        }
+        let mut props = Vec::with_capacity(total);
+        let mut values = Vec::with_capacity(total);
+        for i in 0..total {
+            let mut p = [0u8; 4];
+            mm.copy_from(props_ptr + i as u64 * 4, &mut p)?;
+            props.push(u32::from_le_bytes(p));
+            let mut v = [0u8; 8];
+            mm.copy_from(vals_ptr + i as u64 * 8, &mut v)?;
+            values.push(u64::from_le_bytes(v));
+        }
+
+        let mut st = self.st.lock();
+        let (mut active, mut mode, mut conn_crtc, mut plane_fb, mut plane_crtc) = (
+            st.crtc_active,
+            st.crtc_mode,
+            st.connector_crtc,
+            st.plane_fb,
+            st.plane_crtc,
+        );
+        let mut i = 0;
+        for (j, &obj) in objs.iter().enumerate() {
+            for _ in 0..counts[j] {
+                let (prop, val) = (props[i], values[i]);
+                i += 1;
+                match (obj, prop) {
+                    (CRTC, PROP_ACTIVE) => {
+                        if val > 1 {
+                            return Err(Errno::EINVAL);
+                        }
+                        active = val != 0;
+                    }
+                    (CRTC, PROP_MODE_ID) => {
+                        let id = u32::try_from(val).map_err(|_| Errno::EINVAL)?;
+                        if id != 0 && !st.blobs.contains_key(&id) {
+                            return Err(Errno::ENOENT);
+                        }
+                        mode = id;
+                    }
+                    (CONNECTOR, PROP_CRTC_ID) | (PLANE, PROP_CRTC_ID) => {
+                        if val != 0 && val != CRTC as u64 {
+                            return Err(Errno::EINVAL);
+                        }
+                        if obj == CONNECTOR {
+                            conn_crtc = val as u32;
+                        } else {
+                            plane_crtc = val as u32;
+                        }
+                    }
+                    (PLANE, PROP_FB_ID) => {
+                        let id = u32::try_from(val).map_err(|_| Errno::EINVAL)?;
+                        if id != 0 && !st.fbs.contains_key(&id) {
+                            return Err(Errno::ENOENT);
+                        }
+                        plane_fb = id;
+                    }
+                    (
+                        PLANE,
+                        PROP_SRC_X | PROP_SRC_Y | PROP_SRC_W | PROP_SRC_H | PROP_CRTC_X
+                        | PROP_CRTC_Y | PROP_CRTC_W | PROP_CRTC_H,
+                    ) => {
+                        if val > (16384u64) << 16 {
+                            return Err(Errno::EINVAL);
+                        }
+                    }
+                    _ => return Err(Errno::EINVAL),
+                }
+            }
+        }
+        if flags & ATOMIC_TEST_ONLY != 0 {
+            return Ok(());
+        }
+        // Legacy and atomic endpoints share the scanout: the atomic state
+        // now describes what SETCRTC/PAGE_FLIP report too.
+        st.crtc_active = active;
+        st.crtc_mode = mode;
+        st.connector_crtc = conn_crtc;
+        st.plane_fb = plane_fb;
+        st.plane_crtc = plane_crtc;
+        drop(st);
+        if active && plane_fb != 0 {
+            let fb = self.fb(plane_fb)?;
+            set_scanout(self.id, Some(fb));
+        } else if !active {
+            set_scanout(self.id, None);
+        }
+        if flags & PAGE_FLIP_EVENT != 0 {
+            self.queue_event(2, user_data);
+        }
+        Ok(())
     }
 
     fn handle(&self, nr: u32, b: &mut [u8], mm: &AddressSpace) -> KResult<()> {
@@ -373,7 +646,12 @@ impl DrmFile {
             0x0d => match r64(b, 0) {
                 1 | 4 => {}
                 2 => self.st.lock().universal = r64(b, 8) != 0,
-                3 => return Err(Errno::EOPNOTSUPP), // atomic: not offered
+                3 => {
+                    // DRM_CLIENT_CAP_ATOMIC
+                    if r64(b, 8) > 1 {
+                        return Err(Errno::EINVAL);
+                    }
+                }
                 _ => return Err(Errno::EINVAL),
             },
             0x11 | 0x1e | 0x1f => {} // AUTH_MAGIC, SET_MASTER, DROP_MASTER
@@ -480,38 +758,70 @@ impl DrmFile {
             }
             0xaa => {
                 // GETPROPERTY
-                let (name, flags, enums): (&str, u32, &[(u64, &str)]) = match r32(b, 16) {
-                    PROP_TYPE => (
-                        "type",
-                        (1 << 3) | (1 << 2),
-                        &[(0, "Overlay"), (1, "Primary"), (2, "Cursor")],
-                    ),
-                    PROP_DPMS => (
-                        "DPMS",
-                        1 << 3,
-                        &[(0, "On"), (1, "Standby"), (2, "Suspend"), (3, "Off")],
-                    ),
-                    _ => return Err(Errno::ENOENT),
-                };
-                w32(b, 20, flags);
+                let meta = prop_meta(r32(b, 16))?;
+                w32(b, 20, meta.flags);
                 b[24..56].fill(0);
-                b[24..24 + name.len()].copy_from_slice(name.as_bytes());
-                let values: Vec<u64> = enums.iter().map(|e| e.0).collect();
-                let n = put_u64s(mm, r64(b, 0), r32(b, 56), &values)?;
+                b[24..24 + meta.name.len()].copy_from_slice(meta.name.as_bytes());
+                let n = put_u64s(mm, r64(b, 0), r32(b, 56), meta.values)?;
                 w32(b, 56, n);
-                if r64(b, 8) != 0 && r32(b, 60) as usize >= enums.len() {
+                if !meta.enums.is_empty()
+                    && r64(b, 8) != 0
+                    && r32(b, 60) as usize >= meta.enums.len()
+                {
                     let mut blob = Vec::new();
-                    for (v, n) in enums {
+                    for (v, name) in meta.enums {
                         blob.extend_from_slice(&v.to_le_bytes());
                         let mut nm = [0u8; 32];
-                        nm[..n.len()].copy_from_slice(n.as_bytes());
+                        nm[..name.len()].copy_from_slice(name.as_bytes());
                         blob.extend_from_slice(&nm);
                     }
                     mm.copy_to(r64(b, 8), &blob)?;
                 }
-                w32(b, 60, enums.len() as u32);
+                w32(b, 60, meta.enums.len() as u32);
             }
-            0xab | 0xba => {} // SETPROPERTY, OBJ_SETPROPERTY
+            0xab => {} // legacy SETPROPERTY: ignore
+            0xba => {
+                // OBJ_SETPROPERTY: legacy single-property setter, kept in
+                // sync with the atomic state.
+                let value = r64(b, 0);
+                let prop = r32(b, 8);
+                let obj = r32(b, 12);
+                let mut st = self.st.lock();
+                match (obj, prop) {
+                    (CRTC, PROP_ACTIVE) => {
+                        if value > 1 {
+                            return Err(Errno::EINVAL);
+                        }
+                        st.crtc_active = value != 0;
+                    }
+                    (CRTC, PROP_MODE_ID) => {
+                        let id = u32::try_from(value).map_err(|_| Errno::EINVAL)?;
+                        if id != 0 && !st.blobs.contains_key(&id) {
+                            return Err(Errno::ENOENT);
+                        }
+                        st.crtc_mode = id;
+                    }
+                    (CONNECTOR, PROP_CRTC_ID) | (PLANE, PROP_CRTC_ID) => {
+                        if value != 0 && value != CRTC as u64 {
+                            return Err(Errno::EINVAL);
+                        }
+                        if obj == CONNECTOR {
+                            st.connector_crtc = value as u32;
+                        } else {
+                            st.plane_crtc = value as u32;
+                        }
+                    }
+                    (PLANE, PROP_FB_ID) => {
+                        let id = u32::try_from(value).map_err(|_| Errno::EINVAL)?;
+                        if id != 0 && !st.fbs.contains_key(&id) {
+                            return Err(Errno::ENOENT);
+                        }
+                        st.plane_fb = id;
+                    }
+                    _ if prop == PROP_DPMS && value <= 3 => {}
+                    _ => return Err(Errno::EINVAL),
+                }
+            }
             0xad => {
                 // GETFB
                 let fb = self.fb(r32(b, 0))?;
@@ -665,15 +975,38 @@ impl DrmFile {
             }
             0xb9 => {
                 // OBJ_GETPROPERTIES
-                let (ids, vals): (&[u32], &[u64]) = match r32(b, 24) {
-                    OBJ_PLANE => (&[PROP_TYPE], &[1]),
-                    OBJ_CONNECTOR => (&[PROP_DPMS], &[0]),
-                    OBJ_CRTC => (&[], &[]),
-                    _ => return Err(Errno::ENOENT),
-                };
-                let n = put_ids(mm, r64(b, 0), r32(b, 16), ids)?;
-                put_u64s(mm, r64(b, 8), r32(b, 16), vals)?;
+                let (ids, vals) = object_props(&self.st.lock(), r32(b, 24))?;
+                let n = put_ids(mm, r64(b, 0), r32(b, 16), &ids)?;
+                put_u64s(mm, r64(b, 8), r32(b, 16), &vals)?;
                 w32(b, 16, n);
+            }
+            0xac => {
+                // GETPROPBLOB
+                let st = self.st.lock();
+                let blob = st.blobs.get(&r32(b, 0)).ok_or(Errno::ENOENT)?;
+                let cap = r32(b, 4) as usize;
+                w32(b, 4, blob.len() as u32);
+                if r64(b, 8) != 0 && cap >= blob.len() {
+                    mm.copy_to(r64(b, 8), blob)?;
+                }
+            }
+            0xbc => self.atomic(b, mm)?,
+            0xbd => {
+                // CREATEPROPBLOB
+                let len = r32(b, 8) as usize;
+                if len > 65536 {
+                    return Err(Errno::EINVAL);
+                }
+                let mut data = vec![0u8; len];
+                mm.copy_from(r64(b, 0), &mut data)?;
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                self.st.lock().blobs.insert(id, data);
+                w32(b, 12, id);
+            }
+            0xbe => {
+                // DESTROYPROPBLOB
+                let id = r32(b, 0);
+                self.st.lock().blobs.remove(&id).ok_or(Errno::ENOENT)?;
             }
             0xce => {
                 // GETFB2
