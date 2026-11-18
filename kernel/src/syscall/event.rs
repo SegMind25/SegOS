@@ -1,11 +1,11 @@
 //! Event descriptor system calls: eventfd, timerfd, signalfd, epoll,
-//! inotify (see `fs::event`).
+//! inotify and fanotify (see `fs::event`).
 
 use super::Ctx;
 use crate::abi::open::{O_CLOEXEC, O_NONBLOCK, O_RDONLY, O_RDWR};
 use crate::abi::{Errno, KResult, Timespec};
-use crate::fs::event::{self, Epoll, EventFd, Inotify, SignalFd, TimerFd};
-use crate::fs::{self, File, Inode};
+use crate::fs::event::{self, Epoll, EventFd, Fanotify, Inotify, SignalFd, TimerFd};
+use crate::fs::{self, File, FileType, Inode};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -210,5 +210,81 @@ pub fn inotify_add_watch(ctx: &Ctx, fd: i32, path: u64, mask: u32) -> KResult<u6
 pub fn inotify_rm_watch(ctx: &Ctx, fd: i32, wd: i32) -> KResult<u64> {
     let f = file(ctx, fd)?;
     object::<Inotify>(&f)?.rm_watch(wd)?;
+    Ok(0)
+}
+
+/// `fanotify_init`: creates a notification group. Only FAN_CLASS_NOTIF is
+/// meaningful here — permission events are never generated, so a CONTENT or
+/// PRE_CONTENT group behaves exactly like a NOTIF one.
+pub fn fanotify_init(ctx: &Ctx, flags: u32, event_f_flags: u32) -> KResult<u64> {
+    use event::fan_init::*;
+    if flags & !ALL != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // The two class bits are mutually exclusive; NOTIF is zero.
+    if flags & CLASS_MASK == CLASS_MASK {
+        return Err(Errno::EINVAL);
+    }
+    let access = event_f_flags & 3;
+    if access > 2 {
+        return Err(Errno::EINVAL);
+    }
+    let mut oflags = if flags & FAN_NONBLOCK != 0 {
+        O_NONBLOCK
+    } else {
+        0
+    };
+    if flags & FAN_CLOEXEC != 0 || event_f_flags & O_CLOEXEC != 0 {
+        oflags |= O_CLOEXEC;
+    }
+    install(ctx, Fanotify::create(), access, oflags)
+}
+
+/// `fanotify_mark`: adds or removes a mark on the file at `dirfd`/`path`.
+pub fn fanotify_mark(
+    ctx: &Ctx,
+    fd: i32,
+    flags: u32,
+    mask: u64,
+    dirfd: i32,
+    path: u64,
+) -> KResult<u64> {
+    use event::fan_mark::*;
+    let f = file(ctx, fd)?;
+    let fan = object::<Fanotify>(&f)?;
+    if flags & !ALL != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & FLUSH != 0 {
+        // A flush needs no path; the type bits are the only other flags
+        // Linux accepts with it.
+        if flags & !(FLUSH | MOUNT | FILESYSTEM) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if mask != 0 {
+            return Err(Errno::EINVAL);
+        }
+        fan.flush();
+        return Ok(0);
+    }
+    let add = flags & ADD != 0;
+    let remove = flags & REMOVE != 0;
+    if add == remove {
+        return Err(Errno::EINVAL);
+    }
+    if mask == 0 || mask & !event::fan_mask::FAN_ALL != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let path = super::path_arg(ctx, path)?;
+    let base = super::fs::dir_of(ctx, dirfd, &path)?;
+    let (target, _) = fs::resolve(&base, &path, flags & DONT_FOLLOW == 0)?;
+    if flags & ONLYDIR != 0 && target.file_type() != FileType::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+    if add {
+        fan.add_mark(&target, flags, mask)?;
+    } else {
+        fan.rm_mark(&target, flags, mask)?;
+    }
     Ok(0)
 }

@@ -215,7 +215,7 @@ fn cwd(ctx: &Ctx) -> Arc<dyn Inode> {
 }
 
 /// The directory a `*at` call's relative path starts from.
-fn dir_of(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<Arc<dyn Inode>> {
+pub(crate) fn dir_of(ctx: &Ctx, dirfd: i32, path: &str) -> KResult<Arc<dyn Inode>> {
     if path.starts_with('/') {
         return Ok(fs::root());
     }

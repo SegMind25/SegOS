@@ -80,6 +80,18 @@ const TESTS: &[(&str, fn())] = &[
         "virtio-gpu: MEM_ENTRY layout",
         crate::drivers::virtio_gpu::tests::mem_entry_layout,
     ),
+    (
+        "fanotify: mark add, replace, remove and flush",
+        crate::fs::event::fan_tests::mark_add_remove_flush,
+    ),
+    (
+        "fanotify: event metadata layout",
+        crate::fs::event::fan_tests::event_metadata_layout,
+    ),
+    (
+        "fanotify: child and ignored masks",
+        crate::fs::event::fan_tests::child_and_ignored_masks,
+    ),
 ];
 
 pub fn run(boot: &'static BootInfo) -> ! {

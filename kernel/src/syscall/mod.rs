@@ -409,6 +409,8 @@ fn dispatch(ctx: &Ctx, frame: &mut TrapFrame, nr: u64, a: [u64; 6]) -> KResult<u
         294 => event::inotify_init(ctx, a[0] as u32),
         254 => event::inotify_add_watch(ctx, fd, a[1], a[2] as u32),
         255 => event::inotify_rm_watch(ctx, fd, a[1] as i32),
+        300 => event::fanotify_init(ctx, a[0] as u32, a[1] as u32),
+        301 => event::fanotify_mark(ctx, fd, a[1] as u32, a[2], a[3] as i32, a[4]),
         309 => info::getcpu(ctx, a[0], a[1]),
         292 => fs::dup3(ctx, fd, a[1] as i32, a[2] as u32, false),
         293 => fs::pipe2(ctx, a[0], a[1] as u32),

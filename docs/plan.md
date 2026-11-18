@@ -458,7 +458,15 @@ The demo: Firefox and Chromium run on the Wayland desktop.
    **`chroot`** and **CLONE_FS** (root, working directory and umask
    shared), and `/proc/<pid>/fdinfo`, whose lookups fail with ESRCH once
    the process is gone: Chromium's way to chroot its sandbox into an
-   empty directory, which `tests/namespaces` repeats.
+   empty directory, which `tests/namespaces` repeats. **fanotify**
+   (`fs/event.rs`, `syscall/event.rs`): `fanotify_init` and `fanotify_mark`
+   (ADD/REMOVE/FLUSH, DONT_FOLLOW, ONLYDIR and ignored masks) on
+   FAN_CLASS_NOTIF groups. File-system events reuse inotify's mask bits,
+   and reads return `struct fanotify_event_metadata` (24 bytes,
+   `fd = FAN_NOFD`). CONTENT/PRE_CONTENT groups are accepted but permission
+   events are never generated. Kernel tests cover marks, event encoding,
+   and child/ignored masks; Linux conformance was not run here because
+   `fanotify_init` needs CAP_SYS_ADMIN.
 3. **Sound** (done): an Intel HD Audio driver (`drivers/hda.rs`:
    CORB/RIRB, codecs set up for playback, one output stream with a
    buffer descriptor list) behind Linux's ALSA interface (`sound.rs`:

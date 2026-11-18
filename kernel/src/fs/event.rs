@@ -900,22 +900,35 @@ pub fn notify(
     cookie: u32,
     self_gone: bool,
 ) {
-    if WATCHES.load(Ordering::Relaxed) == 0 {
+    if WATCHES.load(Ordering::Relaxed) == 0 && FAN_MARKS.load(Ordering::Relaxed) == 0 {
         return;
     }
     let isdir = inode.is_some_and(|i| i.file_type() == FileType::Directory);
     let mask = if isdir { mask | IN_ISDIR } else { mask };
-    let all: Vec<Arc<Inotify>> = INSTANCES
-        .lock()
-        .iter()
-        .filter_map(|w| w.upgrade())
-        .collect();
-    for ino in all {
-        if let Some((d, name)) = dir {
-            ino.deliver((d.dev(), d.ino()), mask, cookie, name, false);
+    if WATCHES.load(Ordering::Relaxed) != 0 {
+        let all: Vec<Arc<Inotify>> = INSTANCES
+            .lock()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .collect();
+        for ino in all {
+            if let Some((d, name)) = dir {
+                ino.deliver((d.dev(), d.ino()), mask, cookie, name, false);
+            }
+            if let Some(i) = inode {
+                ino.deliver((i.dev(), i.ino()), mask, cookie, "", self_gone);
+            }
+        }
+    }
+    if FAN_MARKS.load(Ordering::Relaxed) != 0 {
+        // IN_ISDIR and FAN_ONDIR are the same bit, so the inotify mask is
+        // also a valid fanotify mask for these events.
+        let fan = mask as u64;
+        if let Some((d, _)) = dir {
+            fanotify_notify((d.dev(), d.ino()), fan, true);
         }
         if let Some(i) = inode {
-            ino.deliver((i.dev(), i.ino()), mask, cookie, "", self_gone);
+            fanotify_notify((i.dev(), i.ino()), fan, false);
         }
     }
 }
@@ -923,23 +936,29 @@ pub fn notify(
 /// Reports `mask` (IN_CREATE, IN_DELETE, IN_MOVED_*) about the entry
 /// `name` of `dir` to the watches on `dir` only.
 pub fn notify_entry(dir: &Arc<dyn Inode>, name: &str, is_dir: bool, mask: u32, cookie: u32) {
-    if WATCHES.load(Ordering::Relaxed) == 0 {
+    if WATCHES.load(Ordering::Relaxed) == 0 && FAN_MARKS.load(Ordering::Relaxed) == 0 {
         return;
     }
     let mask = if is_dir { mask | IN_ISDIR } else { mask };
-    let all: Vec<Arc<Inotify>> = INSTANCES
-        .lock()
-        .iter()
-        .filter_map(|w| w.upgrade())
-        .collect();
-    for ino in all {
-        ino.deliver((dir.dev(), dir.ino()), mask, cookie, name, false);
+    if WATCHES.load(Ordering::Relaxed) != 0 {
+        let all: Vec<Arc<Inotify>> = INSTANCES
+            .lock()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .collect();
+        for ino in all {
+            ino.deliver((dir.dev(), dir.ino()), mask, cookie, name, false);
+        }
+    }
+    if FAN_MARKS.load(Ordering::Relaxed) != 0 {
+        fanotify_notify((dir.dev(), dir.ino()), mask as u64, true);
     }
 }
 
-/// Whether any inotify watch exists (callers skip finding names if not).
+/// Whether any inotify watch or fanotify mark exists (callers skip the
+/// work of finding names if not).
 pub fn watching() -> bool {
-    WATCHES.load(Ordering::Relaxed) != 0
+    WATCHES.load(Ordering::Relaxed) != 0 || FAN_MARKS.load(Ordering::Relaxed) != 0
 }
 
 /// A fresh cookie for a rename's pair of events.
@@ -1021,5 +1040,400 @@ impl Inode for Inotify {
             }
             _ => Err(Errno::ENOTTY),
         }
+    }
+}
+
+// ---------------------------------------------------------------- fanotify
+
+/// fanotify event bits (`linux/fanotify.h`). The low bits deliberately line
+/// up with inotify's, so the file-system hooks can reuse the mask they
+/// already compute (`FAN_ONDIR` is the same bit as `IN_ISDIR`).
+pub mod fan_mask {
+    pub const FAN_ACCESS: u64 = 0x0000_0001;
+    pub const FAN_MODIFY: u64 = 0x0000_0002;
+    pub const FAN_ATTRIB: u64 = 0x0000_0004;
+    pub const FAN_CLOSE_WRITE: u64 = 0x0000_0008;
+    pub const FAN_CLOSE_NOWRITE: u64 = 0x0000_0010;
+    pub const FAN_OPEN: u64 = 0x0000_0020;
+    pub const FAN_MOVED_FROM: u64 = 0x0000_0040;
+    pub const FAN_MOVED_TO: u64 = 0x0000_0080;
+    pub const FAN_CREATE: u64 = 0x0000_0100;
+    pub const FAN_DELETE: u64 = 0x0000_0200;
+    pub const FAN_DELETE_SELF: u64 = 0x0000_0400;
+    pub const FAN_MOVE_SELF: u64 = 0x0000_0800;
+    pub const FAN_OPEN_EXEC: u64 = 0x0000_1000;
+    pub const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
+    pub const FAN_OPEN_PERM: u64 = 0x0001_0000;
+    pub const FAN_ACCESS_PERM: u64 = 0x0002_0000;
+    pub const FAN_EVENT_ON_CHILD: u64 = 0x0800_0000;
+    pub const FAN_ONDIR: u64 = 0x4000_0000;
+
+    /// Everything a user may put in a mark's mask.
+    pub const FAN_ALL: u64 = 0x0000_1fff
+        | FAN_Q_OVERFLOW
+        | FAN_OPEN_PERM
+        | FAN_ACCESS_PERM
+        | FAN_EVENT_ON_CHILD
+        | FAN_ONDIR;
+    /// Bits reported back in an event (the flags above are not events).
+    pub const FAN_OUT: u64 = FAN_ALL & !(FAN_EVENT_ON_CHILD | FAN_ONDIR);
+}
+use fan_mask::*;
+
+/// `fanotify_init` flags (`linux/fanotify.h`).
+pub mod fan_init {
+    pub const FAN_CLOEXEC: u32 = 0x0000_0001;
+    pub const FAN_NONBLOCK: u32 = 0x0000_0002;
+    pub const FAN_CLASS_NOTIF: u32 = 0x0000_0000;
+    pub const FAN_CLASS_CONTENT: u32 = 0x0000_0004;
+    pub const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
+    pub const FAN_UNLIMITED_QUEUE: u32 = 0x0000_0010;
+    pub const FAN_UNLIMITED_MARKS: u32 = 0x0000_0020;
+    pub const FAN_ENABLE_AUDIT: u32 = 0x0000_0040;
+    /// All the bits Linux accepts.
+    pub const ALL: u32 = 0x0000_007f;
+    pub const CLASS_MASK: u32 = FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT;
+}
+
+/// `fanotify_mark` flags (`linux/fanotify.h`).
+pub mod fan_mark {
+    pub const ADD: u32 = 0x0000_0001;
+    pub const REMOVE: u32 = 0x0000_0002;
+    pub const DONT_FOLLOW: u32 = 0x0000_0004;
+    pub const ONLYDIR: u32 = 0x0000_0008;
+    pub const MOUNT: u32 = 0x0000_0010;
+    pub const IGNORED_MASK: u32 = 0x0000_0020;
+    pub const IGNORED_SURV_MODIFY: u32 = 0x0000_0040;
+    pub const FLUSH: u32 = 0x0000_0080;
+    pub const FILESYSTEM: u32 = 0x0000_0100;
+    pub const ALL: u32 = 0x0000_01ff;
+}
+
+/// `sizeof(struct fanotify_event_metadata)`, and its version field.
+const FAN_EVENT_METADATA_LEN: usize = 24;
+const FANOTIFY_METADATA_VERSION: u8 = 3;
+const FANOTIFY_MAX_EVENTS: usize = 16384;
+
+struct FanMark {
+    key: (u64, u64),
+    mask: u64,
+    /// Entries in this mask are filtered out (FAN_MARK_IGNORED_MASK).
+    ignored: u64,
+    ignored_surv: bool,
+    /// A mount/file-system mark applies to every object.
+    global: bool,
+}
+
+struct FanEvent {
+    mask: u64,
+}
+
+#[derive(Default)]
+struct FanotifyState {
+    marks: Vec<FanMark>,
+    queue: alloc::collections::VecDeque<FanEvent>,
+}
+
+/// A fanotify group: marks selected with `fanotify_mark` and a queue read
+/// as `struct fanotify_event_metadata` records. Notifications are always
+/// FAN_CLASS_NOTIF, so `fd` is FAN_NOFD and no permission response is
+/// needed (FAN_OPEN_PERM/FAN_ACCESS_PERM marks are accepted but never fired).
+pub struct Fanotify {
+    ino: u64,
+    state: SpinLock<FanotifyState>,
+    wait: WaitQueue,
+    generation: AtomicU64,
+}
+
+static FAN_INSTANCES: SpinLock<Vec<Weak<Fanotify>>> = SpinLock::new(Vec::new());
+static FAN_MARKS: AtomicU64 = AtomicU64::new(0);
+
+impl Fanotify {
+    pub fn create() -> Arc<dyn Inode> {
+        let me = Arc::new(Self {
+            ino: new_ino(),
+            state: SpinLock::default(),
+            wait: WaitQueue::new(),
+            generation: AtomicU64::new(0),
+        });
+        let mut all = FAN_INSTANCES.lock();
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Arc::downgrade(&me));
+        me
+    }
+
+    /// Adds a mark for `key`. Only one mark per inode is kept: as on Linux,
+    /// a later FAN_MARK_ADD replaces the mask of an existing mark.
+    fn add_mark_key(&self, key: (u64, u64), flags: u32, mask: u64) -> KResult<()> {
+        let global = flags & (fan_mark::MOUNT | fan_mark::FILESYSTEM) != 0;
+        let ignored = if flags & fan_mark::IGNORED_MASK != 0 {
+            mask
+        } else {
+            0
+        };
+        let mut st = self.state.lock();
+        if let Some(m) = st
+            .marks
+            .iter_mut()
+            .find(|m| m.key == key && m.global == global)
+        {
+            m.mask = mask;
+            m.ignored = ignored;
+            m.ignored_surv = flags & fan_mark::IGNORED_SURV_MODIFY != 0;
+        } else {
+            st.marks.push(FanMark {
+                key,
+                mask,
+                ignored,
+                ignored_surv: flags & fan_mark::IGNORED_SURV_MODIFY != 0,
+                global,
+            });
+            FAN_MARKS.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn rm_mark_key(&self, key: (u64, u64), flags: u32, mask: u64) -> KResult<()> {
+        let global = flags & (fan_mark::MOUNT | fan_mark::FILESYSTEM) != 0;
+        let mut st = self.state.lock();
+        let Some(pos) = st
+            .marks
+            .iter()
+            .position(|m| m.key == key && m.global == global)
+        else {
+            return Err(Errno::ENOENT);
+        };
+        if flags & fan_mark::IGNORED_MASK != 0 {
+            st.marks[pos].ignored &= !mask;
+        } else {
+            st.marks[pos].mask &= !mask;
+            if st.marks[pos].mask == 0 && st.marks[pos].ignored == 0 {
+                st.marks.remove(pos);
+                FAN_MARKS.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn add_mark(&self, target: &Arc<dyn Inode>, flags: u32, mask: u64) -> KResult<()> {
+        self.add_mark_key((target.dev(), target.ino()), flags, mask)
+    }
+
+    pub fn rm_mark(&self, target: &Arc<dyn Inode>, flags: u32, mask: u64) -> KResult<()> {
+        self.rm_mark_key((target.dev(), target.ino()), flags, mask)
+    }
+
+    pub fn flush(&self) {
+        let n = self.state.lock().marks.len() as u64;
+        self.state.lock().marks.clear();
+        FAN_MARKS.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// Reports `mask` about the object `key` (`child` means the event is
+    /// about a child of it, which needs FAN_EVENT_ON_CHILD).
+    fn deliver(&self, key: (u64, u64), mask: u64, child: bool) {
+        let mut events = Vec::new();
+        {
+            let mut st = self.state.lock();
+            for m in st.marks.iter_mut() {
+                if !m.global && m.key != key {
+                    continue;
+                }
+                if child && m.mask & FAN_EVENT_ON_CHILD == 0 {
+                    continue;
+                }
+                let mut report = mask & m.mask & FAN_OUT;
+                // Without FAN_MARK_IGNORED_SURV_MODIFY an ignored mask is
+                // cleared when the object is next modified.
+                if !m.ignored_surv && report & FAN_MODIFY != 0 {
+                    m.ignored = 0;
+                }
+                report &= !m.ignored;
+                if report != 0 {
+                    events.push(report);
+                }
+            }
+            let added = !events.is_empty();
+            for mut report in events {
+                if st.queue.len() >= FANOTIFY_MAX_EVENTS {
+                    report = FAN_Q_OVERFLOW;
+                    if st.queue.back().is_some_and(|e| e.mask == FAN_Q_OVERFLOW) {
+                        continue;
+                    }
+                }
+                st.queue.push_back(FanEvent { mask: report });
+            }
+            if !added {
+                return;
+            }
+        }
+        self.changed();
+    }
+
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.wait.wake_all();
+        poll_notify();
+    }
+
+    fn pending_bytes(&self) -> usize {
+        self.state.lock().queue.len() * FAN_EVENT_METADATA_LEN
+    }
+}
+
+impl Drop for Fanotify {
+    fn drop(&mut self) {
+        let n = self.state.get_mut().marks.len() as u64;
+        FAN_MARKS.fetch_sub(n, Ordering::Relaxed);
+    }
+}
+
+impl Inode for Fanotify {
+    anon_inode!("fanotify");
+
+    fn read_stream(&self, buf: &mut [u8], nonblock: bool) -> KResult<usize> {
+        loop {
+            {
+                let mut st = self.state.lock();
+                if !st.queue.is_empty() {
+                    if FAN_EVENT_METADATA_LEN > buf.len() {
+                        return Err(Errno::EINVAL);
+                    }
+                    let mut at = 0;
+                    while st.queue.front().is_some() {
+                        if at + FAN_EVENT_METADATA_LEN > buf.len() {
+                            break;
+                        }
+                        let e = st.queue.pop_front().unwrap();
+                        buf[at..at + 4]
+                            .copy_from_slice(&(FAN_EVENT_METADATA_LEN as u32).to_le_bytes());
+                        buf[at + 4] = FANOTIFY_METADATA_VERSION;
+                        buf[at + 5] = 0;
+                        buf[at + 6..at + 8]
+                            .copy_from_slice(&(FAN_EVENT_METADATA_LEN as u16).to_le_bytes());
+                        buf[at + 8..at + 16].copy_from_slice(&e.mask.to_le_bytes());
+                        buf[at + 16..at + 20].copy_from_slice(&(-1i32).to_le_bytes()); // FAN_NOFD
+                        buf[at + 20..at + 24].copy_from_slice(&(-1i32).to_le_bytes()); // pid unknown
+                        at += FAN_EVENT_METADATA_LEN;
+                    }
+                    drop(st);
+                    self.changed();
+                    return Ok(at);
+                }
+            }
+            if nonblock {
+                return Err(Errno::EAGAIN);
+            }
+            self.wait
+                .wait_interruptible(|| !self.state.lock().queue.is_empty())?;
+        }
+    }
+
+    fn write_stream(&self, _data: &[u8], _nonblock: bool) -> KResult<usize> {
+        Err(Errno::EINVAL)
+    }
+
+    fn poll(&self) -> u16 {
+        if self.state.lock().queue.is_empty() {
+            0
+        } else {
+            poll::POLLIN
+        }
+    }
+
+    fn poll_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn ioctl(&self, req: u32, arg: u64, mm: &crate::mm::vm::AddressSpace) -> KResult<u64> {
+        const FIONREAD: u32 = 0x541b;
+        match req {
+            FIONREAD => {
+                mm.write(arg, &(self.pending_bytes() as i32))?;
+                Ok(0)
+            }
+            _ => Err(Errno::ENOTTY),
+        }
+    }
+}
+
+/// Reports `mask` about `key` to all fanotify groups with a matching mark.
+fn fanotify_notify(key: (u64, u64), mask: u64, child: bool) {
+    if FAN_MARKS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let all: Vec<Arc<Fanotify>> = FAN_INSTANCES
+        .lock()
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .collect();
+    for f in all {
+        f.deliver(key, mask, child);
+    }
+}
+
+#[cfg(feature = "ktest")]
+pub(crate) mod fan_tests {
+    use super::*;
+
+    fn instance() -> Fanotify {
+        Fanotify {
+            ino: 0,
+            state: SpinLock::default(),
+            wait: WaitQueue::new(),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn mark_add_remove_flush() {
+        let f = instance();
+        f.add_mark_key((7, 8), fan_mark::ADD, FAN_OPEN).unwrap();
+        assert_eq!(f.state.lock().marks.len(), 1);
+        // A second add on the same inode replaces the mask, not the mark.
+        f.add_mark_key((7, 8), fan_mark::ADD, FAN_ACCESS).unwrap();
+        assert_eq!(f.state.lock().marks.len(), 1);
+        assert_eq!(f.state.lock().marks[0].mask, FAN_ACCESS);
+        f.rm_mark_key((7, 8), fan_mark::REMOVE, FAN_ACCESS).unwrap();
+        assert!(f.state.lock().marks.is_empty());
+        f.add_mark_key((7, 8), fan_mark::ADD, FAN_OPEN).unwrap();
+        f.flush();
+        assert!(f.state.lock().marks.is_empty());
+    }
+
+    pub(crate) fn event_metadata_layout() {
+        let f = instance();
+        f.add_mark_key((1, 2), fan_mark::ADD, FAN_OPEN).unwrap();
+        f.deliver((1, 2), FAN_OPEN, false);
+        let mut buf = [0u8; 24];
+        assert_eq!(f.read_stream(&mut buf, true).unwrap(), 24);
+        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 24);
+        assert_eq!(buf[4], FANOTIFY_METADATA_VERSION);
+        assert_eq!(u16::from_le_bytes(buf[6..8].try_into().unwrap()), 24);
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), FAN_OPEN);
+        assert_eq!(i32::from_le_bytes(buf[16..20].try_into().unwrap()), -1);
+        // No event left: a nonblocking read would return EAGAIN.
+        assert!(f.read_stream(&mut buf, true).is_err());
+    }
+
+    pub(crate) fn child_and_ignored_masks() {
+        let f = instance();
+        // Without FAN_EVENT_ON_CHILD the directory mark sees nothing.
+        f.add_mark_key((3, 4), fan_mark::ADD, FAN_OPEN).unwrap();
+        f.deliver((3, 4), FAN_OPEN, true);
+        assert!(f.state.lock().queue.is_empty());
+        // Re-mark with the child bit: now it is delivered.
+        f.add_mark_key((3, 4), fan_mark::ADD, FAN_OPEN | FAN_EVENT_ON_CHILD)
+            .unwrap();
+        f.deliver((3, 4), FAN_OPEN, true);
+        assert_eq!(f.state.lock().queue.len(), 1);
+        // An ignored mask filters the next event.
+        f.add_mark_key(
+            (3, 4),
+            fan_mark::ADD | fan_mark::IGNORED_MASK,
+            FAN_ACCESS | FAN_EVENT_ON_CHILD,
+        )
+        .unwrap();
+        f.deliver((3, 4), FAN_ACCESS, true);
+        assert_eq!(f.state.lock().queue.len(), 1);
     }
 }
