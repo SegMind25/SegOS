@@ -405,7 +405,7 @@ reaching the client, and the console back after weston exits.
   `mremap` (grow, shrink, move; wl_shm pools), `flock`, `fallocate`,
   `O_PATH` on symbolic links, `statx` mount ids, SYSFS_MAGIC.
 
-Not yet: GPU acceleration (virtio-gpu, then AMD/Intel), dma-buf.
+Not yet: GPU acceleration (virtio-gpu, then AMD/Intel).
 
 ## 14. Next concrete steps (Phase 8: desktop applications)
 
@@ -470,3 +470,8 @@ The demo: Firefox and Chromium run on the Wayland desktop.
    hubs or other device classes yet. The QEMU test machine has no i8042
    (as on most new PCs) and types a shell command on the USB keyboard and
    moves the USB mouse through QMP.
+ 5. **dma-buf** (`drm.rs`, done): DRM PRIME exports a dumb buffer as an
+    anonymous fd (`PRIME_HANDLE_TO_FD`) whose mmap aliases the same pages,
+    and imports it back as a new GEM handle (`PRIME_FD_TO_HANDLE`). The fd
+    accepts `DMA_BUF_IOCTL_SYNC` as a no-op on coherent x86. This is the
+    buffer-sharing path Wayland compositors and GPU drivers use.

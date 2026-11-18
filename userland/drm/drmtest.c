@@ -160,10 +160,21 @@ struct drm_mode_destroy_blob {
 	uint32_t blob_id;
 };
 
+struct drm_prime_handle {
+	uint32_t handle, flags;
+	int32_t fd;
+};
+
+struct dma_buf_sync {
+	uint64_t flags;
+};
+
 #define D(nr, t) _IOWR('d', nr, struct t)
 #define DRM_IOCTL_VERSION D(0x00, drm_version)
 #define DRM_IOCTL_SET_CLIENT_CAP D(0x0d, drm_set_client_cap)
 #define DRM_IOCTL_GET_CAP D(0x0c, drm_get_cap)
+#define DRM_IOCTL_PRIME_HANDLE_TO_FD D(0x2d, drm_prime_handle)
+#define DRM_IOCTL_PRIME_FD_TO_HANDLE D(0x2e, drm_prime_handle)
 #define DRM_IOCTL_MODE_GETRESOURCES D(0xa0, drm_mode_card_res)
 #define DRM_IOCTL_MODE_GETCRTC D(0xa1, drm_mode_crtc)
 #define DRM_IOCTL_MODE_SETCRTC D(0xa2, drm_mode_crtc)
@@ -201,6 +212,7 @@ struct drm_mode_destroy_blob {
 #define DRM_MODE_CURSOR_BO 0x01
 #define DRM_MODE_CURSOR_MOVE 0x02
 #define DRM_FORMAT_ARGB8888 0x34325241 /* 'AR24' */
+#define DMA_BUF_IOCTL_SYNC 0x40086200
 
 #define EVIOCGVERSION _IOR('E', 0x01, int)
 #define EVIOCGNAME(len) _IOC(_IOC_READ, 'E', 0x06, len)
@@ -501,6 +513,41 @@ static void test_cursor(uint32_t crtc, uint32_t cursor_plane, uint32_t w,
 	printf("drm: hardware cursor: set, move and hide ok\n");
 }
 
+/* Exports a dumb buffer as a dma-buf fd, checks its mmap aliases the
+ * original pages, then imports the fd back as a new GEM handle. */
+static void test_prime(const struct buffer *a)
+{
+	struct drm_prime_handle prime = {.handle = a->handle};
+	io(DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime, "PRIME_HANDLE_TO_FD");
+	check(prime.fd >= 0, "PRIME_HANDLE_TO_FD gave a bad fd");
+	struct dma_buf_sync sync = {0};
+	check(ioctl(prime.fd, DMA_BUF_IOCTL_SYNC, &sync) == 0,
+	      "DMA_BUF_IOCTL_SYNC");
+
+	uint32_t *shared = mmap(0, a->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+				prime.fd, 0);
+	check(shared != MAP_FAILED, "mmap of dma-buf fd");
+	uint32_t old = a->pixels[0];
+	shared[0] = 0x12345678;
+	check(a->pixels[0] == 0x12345678, "dma-buf mmap is not shared");
+	a->pixels[0] = old;
+	munmap(shared, a->size);
+
+	struct drm_prime_handle imp = {.fd = prime.fd};
+	io(DRM_IOCTL_PRIME_FD_TO_HANDLE, &imp, "PRIME_FD_TO_HANDLE");
+	check(imp.handle != 0, "PRIME_FD_TO_HANDLE gave no handle");
+	struct drm_mode_map_dumb m = {.handle = imp.handle};
+	io(DRM_IOCTL_MODE_MAP_DUMB, &m, "MAP_DUMB (imported)");
+	uint32_t *again = mmap(0, a->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			       card, m.offset);
+	check(again != MAP_FAILED, "mmap of imported handle");
+	again[1] = 0xabcdef01;
+	check(a->pixels[1] == 0xabcdef01, "imported handle is not shared");
+	munmap(again, a->size);
+	close(prime.fd);
+	printf("drm: dma-buf PRIME: export, mmap, sync and import ok\n");
+}
+
 int main(int argc, char **argv)
 {
 	int pause_first = argc > 1 && strcmp(argv[1], "--pause") == 0;
@@ -611,6 +658,7 @@ int main(int argc, char **argv)
 
 	uint32_t cursor = atomic_kms(crtc, conn.connector_id, b.fb, &mode);
 	test_cursor(crtc, cursor, w, h, pause_first);
+	test_prime(&a);
 	printf("DRMTEST-OK %ux%u\n", w, h);
 	for (;;)
 		pause();

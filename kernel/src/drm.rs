@@ -10,7 +10,8 @@
 //! their event. While a program shows its own picture the text console
 //! stays off the screen; when its last file closes, the console returns.
 //! Atomic modesetting (properties, blobs and the ATOMIC ioctl) is offered
-//! alongside the legacy ioctls; there is no GPU rendering or PRIME.
+//! alongside the legacy ioctls, and dumb buffers can be shared as dma-buf
+//! fds through DRM PRIME. There is no GPU rendering yet.
 
 use crate::abi::{Errno, KResult};
 use crate::fs::{FileType, Inode, new_ino, poll};
@@ -93,6 +94,54 @@ impl Drop for Buffer {
         for &f in &self.frames {
             frame::free(f);
         }
+    }
+}
+
+/// A dma-buf: an fd that shares a dumb buffer's pages with another process
+/// or device (DRM PRIME). mmap maps the frames directly; SYNC is a no-op
+/// on x86, where DMA is coherent.
+struct DmaBufFile {
+    ino: u64,
+    buf: Arc<Buffer>,
+}
+
+impl Inode for DmaBufFile {
+    fn file_type(&self) -> FileType {
+        FileType::CharDevice
+    }
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn perm(&self) -> u32 {
+        0o644
+    }
+    fn size(&self) -> u64 {
+        self.buf.frames.len() as u64 * PAGE_SIZE
+    }
+    fn seekable(&self) -> bool {
+        false
+    }
+    fn anon_name(&self) -> Option<&'static str> {
+        Some("anon_inode:[dmabuf]")
+    }
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+    fn ioctl(&self, req: u32, _arg: u64, _mm: &AddressSpace) -> KResult<u64> {
+        // DMA_BUF_IOCTL_SYNC: nothing to flush on coherent x86.
+        if req == 0x4008_6200 {
+            Ok(0)
+        } else {
+            Err(Errno::ENOTTY)
+        }
+    }
+    fn mmap_frames(&self, off: u64, pages: u64) -> Option<KResult<Vec<u64>>> {
+        let first = (off / PAGE_SIZE) as usize;
+        let end = first.checked_add(pages as usize)?;
+        if end > self.buf.frames.len() {
+            return Some(Err(Errno::EINVAL));
+        }
+        Some(Ok(self.buf.frames[first..end].to_vec()))
     }
 }
 
@@ -917,6 +966,47 @@ impl DrmFile {
                 _ => return Err(Errno::EINVAL),
             },
             0x11 | 0x1e | 0x1f => {} // AUTH_MAGIC, SET_MASTER, DROP_MASTER
+            0x2d => {
+                // PRIME_HANDLE_TO_FD: export a dumb buffer as a dma-buf fd.
+                let handle = r32(b, 0);
+                if r32(b, 4) != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let buf = self
+                    .st
+                    .lock()
+                    .buffers
+                    .get(&handle)
+                    .cloned()
+                    .ok_or(Errno::ENOENT)?;
+                let inode: Arc<dyn Inode> = Arc::new(DmaBufFile {
+                    ino: new_ino(),
+                    buf,
+                });
+                let file = crate::fs::File::new(inode, crate::abi::open::O_RDWR);
+                let task = crate::task::current();
+                let process = task.user().ok_or(Errno::EPERM)?.process.clone();
+                let mut files = process.files.lock();
+                let fd = files.alloc(3, file, false)?;
+                w32(b, 8, fd as u32);
+            }
+            0x2e => {
+                // PRIME_FD_TO_HANDLE: import a dma-buf fd as a dumb buffer.
+                let fd = r32(b, 8) as i32;
+                let task = crate::task::current();
+                let process = task.user().ok_or(Errno::EPERM)?.process.clone();
+                let file = process.files.lock().get(fd)?;
+                let dma = file
+                    .inode
+                    .as_any()
+                    .and_then(|a| a.downcast_ref::<DmaBufFile>())
+                    .ok_or(Errno::EINVAL)?;
+                let mut st = self.st.lock();
+                st.next_handle += 1;
+                let handle = st.next_handle;
+                st.buffers.insert(handle, dma.buf.clone());
+                w32(b, 0, handle);
+            }
             0x3a => {
                 // WAIT_VBLANK: answer with the current count and time.
                 let ty = r32(b, 0);
